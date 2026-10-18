@@ -5,7 +5,10 @@
 //! the terminal's background. It is drawn at a fixed pixel size, so a resize
 //! only places it again.
 
-use latex_rust::{Color, Dim, MathFont, PngBackground, PngOptions, latex_to_png};
+use latex_rust::{
+    Color, Dim, MathFont, MathStyle, PngBackground, PngOptions, layout_with_em_size_pt, parse,
+    render_png,
+};
 
 use crate::images::Png;
 
@@ -13,6 +16,11 @@ use crate::images::Png;
 /// terminal with 17x34 px cells.
 const FONT_SIZE_PT: i64 = 12;
 const DPI: i64 = 168;
+const EM_PX: i64 = FONT_SIZE_PT * DPI / 72;
+
+/// The largest width or height drawn, in pixels. Anything bigger, such as
+/// `\rule{1em}{3000em}`, stays as text rather than taking gigabytes.
+const MAX_SIDE: u32 = 4096;
 
 /// Whether the terminal's background is dark.
 ///
@@ -43,8 +51,16 @@ fn png(source: &str, dark: bool) -> Result<Vec<u8>, String> {
     options.dpi = Dim::from_i64(DPI);
     options.color = ink(dark);
     options.background = PngBackground::Transparent;
-    options.display = true;
-    latex_to_png(source, &font, &options).map_err(|e| e.to_string())
+    let ast = parse(source).map_err(|e| e.to_string())?;
+    let tree = layout_with_em_size_pt(&ast, &font, MathStyle::Display, &options.font_size_pt)
+        .map_err(|e| e.to_string())?;
+    let em = Dim::from_i64(EM_PX);
+    let px = |d: Dim| (d * &em).ceil_to_u32().map_err(|e| e.to_string());
+    let (w, h) = (px(tree.width.clone())?, px(&tree.height + &tree.depth)?);
+    if w > MAX_SIDE || h > MAX_SIDE {
+        return Err(format!("maths too large: {w}x{h} px"));
+    }
+    render_png(&tree, &font, &options).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -76,6 +92,12 @@ mod tests {
     fn broken_maths_is_an_error() {
         assert!(render(r"\frac{1}{", true).is_err());
         assert!(render(r"\notacommand{x}", true).is_err());
+    }
+
+    #[test]
+    fn huge_maths_is_an_error_not_a_huge_image() {
+        assert!(render(r"\hspace{3000em}\rule{1em}{3000em}", true).is_err());
+        assert!(render(r"\rule{1em}{200em}", true).is_err());
     }
 
     #[test]

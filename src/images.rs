@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::doc::{Block, BlockKind, FigureKind};
-use crate::{kitty, maths};
+use crate::{kitty, maths, mermaid, theme};
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,7 +76,8 @@ enum State {
         png: Option<Vec<u8>>,
         px: (u32, u32),
     },
-    Failed,
+    /// Making it failed, for this reason.
+    Failed(String),
 }
 
 struct Entry {
@@ -148,7 +149,7 @@ impl Images {
         let keep: HashSet<&Key> = wanted.iter().map(|(k, _)| k).collect();
         let deleted = &mut self.deleted;
         self.entries.retain(|key, entry| {
-            if matches!(entry.state, State::Failed) {
+            if matches!(entry.state, State::Failed(_)) {
                 return false;
             }
             let kept = keep.contains(key);
@@ -176,7 +177,7 @@ impl Images {
                     px: (png.width, png.height),
                     png: Some(png.data),
                 },
-                Err(_) => State::Failed,
+                Err(e) => State::Failed(e),
             };
             changed = true;
         }
@@ -191,6 +192,14 @@ impl Images {
                 state: State::Ready { px, .. },
                 ..
             } => Some(Ready { id: *id, px: *px }),
+            _ => None,
+        }
+    }
+
+    /// Why making the image `key` failed, if it did.
+    pub fn error(&self, key: &Key) -> Option<&str> {
+        match &self.entries.get(key)?.state {
+            State::Failed(e) => Some(e),
             _ => None,
         }
     }
@@ -243,6 +252,13 @@ pub fn key(block: &Block) -> Option<Key> {
             kind: FigureKind::Math,
             source,
         } => Some(Key(format!("math:{}:{source}", maths::dark_background()))),
+        BlockKind::Figure {
+            kind: FigureKind::Mermaid,
+            source,
+        } => Some(Key(format!(
+            "mermaid:{}",
+            mermaid::name(source, theme::current())
+        ))),
         _ => None,
     }
 }
@@ -268,6 +284,10 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
             let (source, dark) = (source.clone(), maths::dark_background());
             Box::new(move || maths::render(&source, dark))
         }
+        BlockKind::Figure {
+            kind: FigureKind::Mermaid,
+            source,
+        } => mermaid::job(source.clone(), theme::current()),
         _ => return None,
     };
     Some((key, job))

@@ -11,6 +11,7 @@ use latex_rust::{
 };
 
 use crate::images::Png;
+use crate::theme::{self, Theme};
 
 /// Em size in points; with [`DPI`] this is 28 px, close to the text in a
 /// terminal with 17x34 px cells.
@@ -23,11 +24,8 @@ const EM_PX: i64 = FONT_SIZE_PT * DPI / 72;
 const MAX_SIDE: u32 = 4096;
 
 /// Whether the terminal's background is dark.
-///
-/// Always dark for now; this is the one place to read the background from
-/// once start-up detection lands.
 pub fn dark_background() -> bool {
-    true
+    theme::current() == Theme::Dark
 }
 
 /// The glyph colour for a dark or a light background.

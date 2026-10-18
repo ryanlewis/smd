@@ -2,6 +2,7 @@ mod app;
 mod doc;
 mod images;
 mod kitty;
+mod maths;
 mod render;
 mod watch;
 

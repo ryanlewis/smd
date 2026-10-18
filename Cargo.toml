@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+latex-rust = { version = "=2.1.1", default-features = false, features = ["png"] }
 libc = "=0.2.191"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }

@@ -4,7 +4,9 @@ mod images;
 mod kitty;
 mod maths;
 mod mermaid;
+mod raster;
 mod render;
+mod table;
 mod theme;
 mod watch;
 

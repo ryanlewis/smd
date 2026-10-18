@@ -214,8 +214,13 @@ struct Plan<'a> {
     height: u32,
 }
 
-fn plan(level: u8, runs: &[Run], cell: (u16, u16), theme: Theme) -> Result<Plan<'static>, String> {
-    let (sans, mono) = fonts().ok_or("no font")?;
+fn plan<'a>(
+    (sans, mono): (&'a FontVec, &'a FontVec),
+    level: u8,
+    runs: &[Run],
+    cell: (u16, u16),
+    theme: Theme,
+) -> Result<Plan<'a>, String> {
     let pieces = pieces(runs, sans, mono, colours(level, theme)).ok_or("missing glyph")?;
     let (cw, ch) = (u32::from(cell.0.max(1)), u32::from(cell.1.max(1)));
     let (rows, size) = SIZES[usize::from(level.clamp(1, 6)) - 1];
@@ -270,7 +275,7 @@ fn measure(pieces: &[Piece], size: f32) -> (f32, [f32; 4]) {
 
 /// Draw `runs` on a clear background, a whole number of cells wide and tall.
 fn draw(level: u8, runs: &[Run], cell: (u16, u16), theme: Theme) -> Result<Canvas, String> {
-    let plan = plan(level, runs, cell, theme)?;
+    let plan = plan(fonts().ok_or("no font")?, level, runs, cell, theme)?;
     let mut canvas = Canvas::new(plan.width, plan.height);
     let mut x = plan.left;
     for p in &plan.pieces {
@@ -350,26 +355,28 @@ mod tests {
 
     #[test]
     fn levels_get_whole_rows_and_smaller_type() {
-        if fonts().is_none() {
-            return;
-        }
-        let sizes: Vec<(u32, u32)> = (1..=6)
-            .map(|n| {
-                drawn(
-                    &format!("{} Heading\n", "#".repeat(n)),
-                    (10, 20),
-                    Theme::Dark,
-                )
-                .size()
-            })
-            .collect();
-        let heights: Vec<u32> = sizes.iter().map(|s| s.1).collect();
-        assert_eq!(heights, vec![60, 40, 40, 20, 20, 20]);
-        for (w, _) in &sizes {
-            assert_eq!(w % 10, 0, "{sizes:?}");
-        }
-        for pair in sizes.windows(2) {
-            assert!(pair[0].0 > pair[1].0, "{sizes:?}");
+        // Every font the code could pick here, as their widths differ.
+        let fonts = raster::sans_bold_all();
+        let mono = raster::fonts().ok().map(|f| f.bold());
+        for sans in &fonts {
+            let plans: Vec<Plan> = (1..=6)
+                .map(|level| {
+                    let runs = [("Heading".to_string(), false)];
+                    let fonts = (sans, mono.unwrap_or(sans));
+                    plan(fonts, level, &runs, (10, 20), Theme::Dark).unwrap()
+                })
+                .collect();
+            let heights: Vec<u32> = plans.iter().map(|p| p.height).collect();
+            assert_eq!(heights, vec![60, 40, 40, 20, 20, 20]);
+            // The type gets smaller every level. The image is whole cells
+            // wide, so two levels can round up to the same width.
+            for pair in plans.windows(2) {
+                assert!(pair[0].size > pair[1].size);
+                assert!(pair[0].width >= pair[1].width);
+            }
+            for p in &plans {
+                assert_eq!(p.width % 10, 0);
+            }
         }
     }
 
@@ -381,7 +388,14 @@ mod tests {
         for level in 1..=6 {
             for text in ["Évolution", "Å jÄ fÉ", "j`ÉÅ`f"] {
                 let (_, content) = heading(&format!("# {text}\n"));
-                let plan = plan(level, &runs(&content), (17, 34), Theme::Dark).unwrap();
+                let plan = plan(
+                    fonts().unwrap(),
+                    level,
+                    &runs(&content),
+                    (17, 34),
+                    Theme::Dark,
+                )
+                .unwrap();
                 let (_, [l, t, r, b]) = measure(&plan.pieces, plan.size);
                 let case = format!("h{level} {text}");
                 assert!(l + plan.left >= 0.0, "{case}");

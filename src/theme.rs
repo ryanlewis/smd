@@ -32,20 +32,26 @@ impl Theme {
 
 /// Find the reply to `OSC 11 ; ?`, `OSC 11 ; rgb:R/G/B` ended by BEL or ST,
 /// in what the terminal sent back, and say whether that colour is light.
-/// Each part is one to four hex digits.
+/// Each part is one to four hex digits. Some terminals answer `rgba:R/G/B/A`.
 pub fn parse_background_reply(buf: &[u8]) -> Option<Theme> {
     let text = String::from_utf8_lossy(buf);
     for reply in text.split("\x1b]11;").skip(1) {
         let Some(end) = reply.find(['\x07', '\x1b']) else {
             continue;
         };
-        let Some(rgb) = reply[..end].strip_prefix("rgb:") else {
-            continue;
+        let reply = &reply[..end];
+        let (rgb, count) = match reply.strip_prefix("rgba:") {
+            Some(rgba) => (rgba, 4),
+            None => match reply.strip_prefix("rgb:") {
+                Some(rgb) => (rgb, 3),
+                None => continue,
+            },
         };
         let parts: Vec<f64> = rgb.split('/').filter_map(fraction).collect();
-        let [r, g, b] = parts[..] else {
+        if parts.len() != count {
             continue;
-        };
+        }
+        let [r, g, b] = [parts[0], parts[1], parts[2]];
         // Relative luminance, near enough for telling dark from light.
         let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         return Some(if luma > 0.5 {
@@ -80,12 +86,17 @@ mod tests {
             parse_background_reply(b"\x1b]11;rgb:f/f/f\x07"),
             Some(Theme::Light)
         );
+        assert_eq!(
+            parse_background_reply(b"\x1b]11;rgba:ffff/ffff/ffff/ffff\x1b\\"),
+            Some(Theme::Light)
+        );
     }
 
     #[test]
     fn missing_or_broken_background_reply_is_none() {
         assert_eq!(parse_background_reply(b"\x1b[0n"), None);
         assert_eq!(parse_background_reply(b"\x1b]11;rgb:ff/ff\x07"), None);
+        assert_eq!(parse_background_reply(b"\x1b]11;rgba:ff/ff/ff\x07"), None);
         assert_eq!(parse_background_reply(b"\x1b]11;rgb:zz/00/00\x07"), None);
         assert_eq!(parse_background_reply(b"\x1b]11;rgb:ffff/ffff/ffff"), None);
     }

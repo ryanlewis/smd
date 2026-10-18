@@ -1,6 +1,7 @@
 mod app;
 mod doc;
 mod render;
+mod watch;
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -38,7 +39,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = app::run(&mut terminal, view);
+    let result = app::run(&mut terminal, view, Path::new(path));
     ratatui::restore();
     match result {
         Ok(()) => ExitCode::SUCCESS,

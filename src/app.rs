@@ -1,14 +1,22 @@
 //! The full-screen view: a scrollable window onto the laid-out document.
 
 use std::io;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::doc::Document;
+use crate::doc::{self, Document};
 use crate::render::render;
+use crate::watch::{Change, Watcher};
+
+/// How often to look at the file on disk.
+const CHECK_EVERY: Duration = Duration::from_millis(250);
 
 pub struct View {
     doc: Document,
@@ -17,6 +25,8 @@ pub struct View {
     width: u16,
     height: u16,
     scroll: usize,
+    /// A message shown on the bottom row, such as the file being deleted.
+    notice: Option<String>,
 }
 
 impl View {
@@ -27,7 +37,21 @@ impl View {
             width: 0,
             height: 0,
             scroll: 0,
+            notice: None,
         }
+    }
+
+    /// Show a new version of the document, keeping the same top line in view.
+    pub fn reload(&mut self, doc: Document) {
+        self.doc = doc;
+        if self.width > 0 {
+            self.lines = render(&self.doc, self.width);
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
     }
 
     /// Lay the document out again when the size changes, keeping roughly the
@@ -55,7 +79,15 @@ impl View {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+        let mut area = frame.area();
+        if let Some(notice) = &self.notice
+            && area.height > 0
+        {
+            area.height -= 1;
+            let row = Rect::new(area.x, area.y + area.height, area.width, 1);
+            let style = Style::new().add_modifier(Modifier::REVERSED);
+            frame.render_widget(Paragraph::new(notice.as_str()).style(style), row);
+        }
         self.resize(area.width, area.height);
         let end = (self.scroll + area.height as usize).min(self.lines.len());
         let visible = Text::from(self.lines[self.scroll..end].to_vec());
@@ -80,17 +112,52 @@ impl View {
     }
 }
 
-/// Run the view until the reader quits. Mouse capture stays off so the
-/// terminal's own selection keeps working.
-pub fn run(terminal: &mut DefaultTerminal, mut view: View) -> io::Result<()> {
+/// Apply what the watcher saw to the view.
+fn apply(view: &mut View, path: &Path, change: Change) {
+    match change {
+        Change::Changed(source) => {
+            view.reload(doc::parse(&source));
+            view.set_notice(None);
+        }
+        // The path goes last so a narrow pane cuts it rather than the message.
+        Change::Deleted => view.set_notice(Some(format!(
+            "file deleted, showing the last version: {}",
+            path.display()
+        ))),
+        Change::Unreadable(err) => {
+            view.set_notice(Some(format!("cannot read file: {err}: {}", path.display())))
+        }
+    }
+}
+
+/// Run the view until the reader quits, reloading it when the file at `path`
+/// changes. Mouse capture stays off so the terminal's own selection keeps
+/// working.
+pub fn run(terminal: &mut DefaultTerminal, mut view: View, path: &Path) -> io::Result<()> {
+    let mut watcher = Watcher::new(path.to_path_buf());
+    let mut last_check = Instant::now();
+    let mut redraw = true;
     loop {
-        terminal.draw(|frame| view.draw(frame))?;
-        // A resize needs no handling beyond the redraw at the top of the loop.
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && view.key(key)
-        {
-            return Ok(());
+        if redraw {
+            terminal.draw(|frame| view.draw(frame))?;
+            redraw = false;
+        }
+        if event::poll(CHECK_EVERY.saturating_sub(last_check.elapsed()))? {
+            // A resize needs no handling beyond the redraw.
+            redraw = true;
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+                && view.key(key)
+            {
+                return Ok(());
+            }
+        }
+        if last_check.elapsed() >= CHECK_EVERY {
+            last_check = Instant::now();
+            if let Some(change) = watcher.check() {
+                apply(&mut view, path, change);
+                redraw = true;
+            }
         }
     }
 }
@@ -161,5 +228,40 @@ mod tests {
         terminal
             .backend()
             .assert_buffer_lines(["alpha ", "beta  ", "gamma "]);
+    }
+
+    #[test]
+    fn reload_keeps_the_scroll_position() {
+        let mut v = view(10);
+        press(&mut v, KeyCode::PageDown);
+        assert_eq!(v.scroll, 5);
+        // Appending keeps the same top line.
+        v.reload(parse(
+            &(0..12).map(|n| format!("line {n}\n\n")).collect::<String>(),
+        ));
+        assert_eq!(v.scroll, 5);
+        assert_eq!(v.lines.len(), 23);
+        // A shorter document pulls the view back to its end.
+        v.reload(parse("one\n\ntwo\n\nthree\n\nfour\n"));
+        assert_eq!(v.scroll, 2);
+    }
+
+    #[test]
+    fn notice_takes_the_bottom_row_and_clears() {
+        let mut v = View::new(parse("one\n\ntwo\n"));
+        let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        let path = Path::new("a.md");
+        apply(&mut v, path, Change::Deleted);
+        terminal.draw(|f| v.draw(f)).unwrap();
+        assert_eq!(v.height, 2);
+        let buf = terminal.backend().buffer();
+        let row: String = (0..8).map(|x| buf[(x, 2)].symbol()).collect();
+        assert_eq!(row, "file del");
+        assert_eq!(buf[(0, 0)].symbol(), "o");
+        apply(&mut v, path, Change::Changed("back\n".into()));
+        terminal.draw(|f| v.draw(f)).unwrap();
+        terminal
+            .backend()
+            .assert_buffer_lines(["back    ", "        ", "        "]);
     }
 }

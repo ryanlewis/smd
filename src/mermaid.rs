@@ -24,6 +24,9 @@ const SCALE: &str = "2";
 /// changes, so old files are not used.
 const VERSION: &str = "1";
 
+/// Default size cap of the disk cache.
+const CACHE_CAP: u64 = 100 * 1024 * 1024;
+
 /// How long one diagram may take before `mmdc` is stopped.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -49,6 +52,10 @@ pub fn job(source: String, theme: Theme) -> Job {
 
 fn draw(program: &str, source: &str, theme: Theme, cache: Option<&Path>) -> Result<Png, String> {
     if let Some(png) = cache.and_then(|path| Png::new(std::fs::read(path).ok()?).ok()) {
+        // Reading is a use: keep the file ahead of eviction.
+        if let Some(path) = cache {
+            touch(path);
+        }
         return Ok(png);
     }
     let data = {
@@ -58,9 +65,59 @@ fn draw(program: &str, source: &str, theme: Theme, cache: Option<&Path>) -> Resu
     let png = Png::new(data.clone()).map_err(|e| format!("mermaid: mmdc gave {e}"))?;
     if let Some(path) = cache {
         // A diagram that cannot be cached is still shown.
-        let _ = store(path, &data);
+        if store(path, &data).is_ok()
+            && let Some(dir) = path.parent()
+        {
+            evict(dir, cache_cap());
+        }
     }
     Ok(png)
+}
+
+/// Set the file's modified time to now, so it counts as recently used.
+fn touch(path: &Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+}
+
+/// The most the cache may hold, in bytes. `SMD_MERMAID_CACHE_MAX` overrides it.
+fn cache_cap() -> u64 {
+    std::env::var("SMD_MERMAID_CACHE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CACHE_CAP)
+}
+
+/// Delete the least recently used `.png` files in `dir` until the rest fit in
+/// `cap` bytes. Temporary files are another write in progress and are left
+/// alone. The jobs run off the UI thread, so this does too.
+fn evict(dir: &Path, cap: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? != "png" {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            Some((meta.modified().ok()?, path, meta.len()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.2).sum();
+    files.sort();
+    for (_, path, len) in files {
+        if total <= cap {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+        }
+    }
 }
 
 /// Run `mmdc`, reading the diagram from stdin and the PNG from stdout. It is
@@ -375,6 +432,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Err("mermaid: mmdc took over 2s".into()));
         assert!(gone, "the child outlived the timeout");
+    }
+
+    /// Write `len` bytes to `dir/name` with a modified time `age` seconds ago.
+    fn aged(dir: &Path, name: &str, len: usize, age: u64) {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0; len]).unwrap();
+        let when = std::time::SystemTime::now() - Duration::from_secs(age);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut found: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn eviction_removes_the_oldest_files_first_until_under_the_cap() {
+        let dir = scratch("evict");
+        aged(&dir, "old.png", 10, 300);
+        aged(&dir, "mid.png", 10, 200);
+        aged(&dir, "new.png", 10, 100);
+        evict(&dir, 25);
+        assert_eq!(names(&dir), ["mid.png", "new.png"]);
+        evict(&dir, 10);
+        assert_eq!(names(&dir), ["new.png"]);
+        evict(&dir, 10);
+        assert_eq!(names(&dir), ["new.png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eviction_leaves_temporary_files_alone() {
+        let dir = scratch("evict-tmp");
+        aged(&dir, "a.png.1.0.tmp", 100, 500);
+        aged(&dir, "b.png", 10, 100);
+        evict(&dir, 0);
+        assert_eq!(names(&dir), ["a.png.1.0.tmp"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cache_hit_keeps_the_file_ahead_of_eviction() {
+        let dir = scratch("evict-hit");
+        let used = dir.join("used.png");
+        aged(&dir, "other.png", 10, 100);
+        std::fs::write(&used, png(30, 10)).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(1000);
+        std::fs::File::options()
+            .write(true)
+            .open(&used)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let got = draw("smd-no-such-program", "g", Theme::Dark, Some(&used));
+        assert!(got.is_ok());
+        evict(&dir, std::fs::metadata(&used).unwrap().len());
+        let left = names(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(left, ["used.png"]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
 
+use crate::theme::{self, Theme};
 use diacritics::DIACRITICS;
 
 /// The character every placeholder cell starts with.
@@ -95,22 +96,34 @@ fn base64(data: &[u8]) -> String {
     s
 }
 
-/// How long to wait for the terminal to answer the cell size query.
+/// How long to wait for the terminal to answer the start-up queries.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Cell size used when the terminal reports none.
 const FALLBACK_CELL: (u16, u16) = (8, 16);
 
-/// The size of one cell in pixels, width then height.
-///
-/// Asks the terminal with `CSI 16 t`, then falls back to the pixel size the
-/// tty reports. Call it before the key reader starts: it reads the reply from
-/// the terminal itself. A `CSI 5 n` sent after the query only ends the wait
-/// early when the terminal does not know `CSI 16 t`.
-pub fn cell_size() -> (u16, u16) {
-    query_cell_size()
-        .or_else(window_cell_size)
-        .unwrap_or(FALLBACK_CELL)
+/// What the terminal said about itself at start-up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probe {
+    /// The size of one cell in pixels, width then height.
+    pub cell: (u16, u16),
+    /// Whether the background is dark or light, if the terminal said.
+    pub theme: Option<Theme>,
+}
+
+/// Ask the terminal for its cell size with `CSI 16 t` and its background
+/// colour with `OSC 11`. The cell size falls back to the pixel size the tty
+/// reports. Call it before the key reader starts: it reads the replies from
+/// the terminal itself. A `CSI 5 n` sent after the queries only ends the wait
+/// early when the terminal does not know them.
+pub fn probe() -> Probe {
+    let reply = query().unwrap_or_default();
+    Probe {
+        cell: parse_cell_reply(&reply)
+            .or_else(window_cell_size)
+            .unwrap_or(FALLBACK_CELL),
+        theme: theme::parse_background_reply(&reply),
+    }
 }
 
 fn window_cell_size() -> Option<(u16, u16)> {
@@ -122,8 +135,9 @@ fn window_cell_size() -> Option<(u16, u16)> {
     (cell.0 > 0 && cell.1 > 0).then_some(cell)
 }
 
+/// The terminal's replies to the start-up queries.
 #[cfg(unix)]
-fn query_cell_size() -> Option<(u16, u16)> {
+fn query() -> Option<Vec<u8>> {
     use ratatui::crossterm::terminal;
 
     // SAFETY: isatty only looks at the descriptor.
@@ -136,7 +150,7 @@ fn query_cell_size() -> Option<(u16, u16)> {
     }
     let mut out = io::stdout();
     let sent = out
-        .write_all(b"\x1b[16t\x1b[5n")
+        .write_all(b"\x1b]11;?\x1b\\\x1b[16t\x1b[5n")
         .and_then(|()| out.flush())
         .is_ok();
     let mut buf = Vec::new();
@@ -168,11 +182,11 @@ fn query_cell_size() -> Option<(u16, u16)> {
     if !was_raw {
         let _ = terminal::disable_raw_mode();
     }
-    parse_cell_reply(&buf)
+    Some(buf)
 }
 
 #[cfg(not(unix))]
-fn query_cell_size() -> Option<(u16, u16)> {
+fn query() -> Option<Vec<u8>> {
     None
 }
 

@@ -176,6 +176,17 @@ fn contents(
                 FigureKind::Table => Style::default(),
                 FigureKind::Mermaid | FigureKind::Math => Style::new().fg(Color::Cyan),
             };
+            // A figure that could not be drawn says why above its source.
+            let error = images::key(block).and_then(|key| ctx.images.error(&key));
+            let first = match error {
+                Some(error) => {
+                    let note = format!("{error}; showing the source");
+                    let dim = Style::new().add_modifier(Modifier::DIM);
+                    emit(first, vec![Span::styled(note, dim)], out);
+                    rest
+                }
+                None => first,
+            };
             preformatted(source, style, width, first, rest, out);
         }
         BlockKind::Html(html) => {
@@ -701,5 +712,26 @@ mod tests {
                 assert!(line.width() <= width as usize, "width {width}: {line:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_figure_that_failed_shows_why_above_its_source() {
+        let doc = parse("> ```mermaid\n> graph LR\n> ```\n");
+        let BlockKind::Quote(inner) = &doc.blocks[0].kind else {
+            panic!("not a quote");
+        };
+        let mut images = no_images();
+        let key = images::key(&inner[0]).unwrap();
+        images.request(key, Box::new(|| Err("mermaid: boom".into())));
+        crate::images::tests::settle(&mut images);
+        let lines: Vec<String> = render(&doc, 40, &images)
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["│ mermaid: boom; showing the source", "│ graph LR"]
+        );
     }
 }

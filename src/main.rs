@@ -3,7 +3,9 @@ mod doc;
 mod images;
 mod kitty;
 mod maths;
+mod mermaid;
 mod render;
+mod theme;
 mod watch;
 
 use std::ffi::OsString;
@@ -40,7 +42,10 @@ fn main() -> ExitCode {
         _ => ".".into(),
     };
     // Asked before the terminal is set up, while nothing else reads its replies.
-    let images = images::Images::new(kitty::cell_size());
+    let probe = kitty::probe();
+    // Images are drawn for a dark background unless the terminal says otherwise.
+    theme::set(probe.theme.unwrap_or(theme::Theme::Dark));
+    let images = images::Images::new(probe.cell);
     let view = app::View::new(doc::parse(&source), base, images);
 
     let mut terminal = match ratatui::try_init() {

@@ -41,6 +41,12 @@ pub enum BlockKind {
     },
     Rule,
     Html(String),
+    /// A paragraph holding nothing but one image. Until the image is ready,
+    /// the block is shown as its alt text.
+    Image {
+        src: String,
+        alt: String,
+    },
     /// A block the graphics layer will draw as an image. Until it does, the
     /// block is shown as its source text.
     Figure {
@@ -103,6 +109,9 @@ struct Builder<'a> {
     strikethrough: u32,
     links: Vec<String>,
     in_table: bool,
+    /// The image being read and its alt text so far.
+    image: Option<(String, String)>,
+    image_depth: u32,
 }
 
 struct Frame {
@@ -113,8 +122,10 @@ struct Frame {
     /// item, which pulldown-cmark does not wrap in a paragraph.
     inlines: Vec<Inline>,
     inline_span: Option<Range<usize>>,
-    /// Display maths seen in `inlines`, and whether anything else was.
+    /// Display maths and images (source, alt text) seen in `inlines`, and
+    /// whether anything else was.
     display_math: Vec<String>,
+    images: Vec<(String, String)>,
     other_inline: bool,
 }
 
@@ -147,6 +158,7 @@ impl Frame {
             inlines: Vec::new(),
             inline_span: None,
             display_math: Vec::new(),
+            images: Vec::new(),
             other_inline: false,
         }
     }
@@ -162,12 +174,21 @@ impl Frame {
     }
 }
 
-/// A paragraph that holds nothing but display maths becomes maths figures.
+/// A paragraph that holds nothing but display maths becomes maths figures,
+/// and one that holds nothing but one image becomes an image block.
 fn paragraph_blocks(frame: &mut Frame, span: Range<usize>) -> Vec<Block> {
     let inlines = std::mem::take(&mut frame.inlines);
     let maths = std::mem::take(&mut frame.display_math);
+    let mut images = std::mem::take(&mut frame.images);
     let other = std::mem::replace(&mut frame.other_inline, false);
-    if !maths.is_empty() && !other {
+    if maths.is_empty() && images.len() == 1 && !other {
+        let (src, alt) = images.remove(0);
+        return vec![Block {
+            kind: BlockKind::Image { src, alt },
+            span,
+        }];
+    }
+    if !maths.is_empty() && images.is_empty() && !other {
         return maths
             .into_iter()
             .map(|source| Block {
@@ -195,6 +216,8 @@ impl<'a> Builder<'a> {
             strikethrough: 0,
             links: Vec::new(),
             in_table: false,
+            image: None,
+            image_depth: 0,
         }
     }
 
@@ -341,8 +364,12 @@ impl<'a> Builder<'a> {
                 self.links.push(dest_url.to_string());
                 return;
             }
-            Tag::Image { .. } => {
-                self.text("[image: ", self.style(), range);
+            Tag::Image { dest_url, .. } => {
+                self.push_text("[image: ", self.style(), range);
+                self.image_depth += 1;
+                if self.image_depth == 1 {
+                    self.image = Some((dest_url.to_string(), String::new()));
+                }
                 return;
             }
             // Not enabled, or kept as plain inline text.
@@ -368,8 +395,14 @@ impl<'a> Builder<'a> {
                 self.links.pop();
             }
             TagEnd::Image => {
+                self.image_depth = self.image_depth.saturating_sub(1);
+                if self.image_depth == 0
+                    && let Some(image) = self.image.take()
+                {
+                    self.top().images.push(image);
+                }
                 let end = self.top().inline_span.as_ref().map_or(0, |s| s.end);
-                self.text("]", self.style(), end..end);
+                self.push_text("]", self.style(), end..end);
             }
             _ => {}
         }
@@ -450,13 +483,21 @@ impl<'a> Builder<'a> {
     }
 
     fn text(&mut self, text: &str, style: InlineStyle, range: Range<usize>) {
+        // An image's alt text does not make its paragraph prose.
+        if let Some((_, alt)) = &mut self.image {
+            alt.push_str(text);
+        } else if !text.trim().is_empty() {
+            self.top().other_inline = true;
+        }
+        self.push_text(text, style, range);
+    }
+
+    /// Add inline text without counting it as prose.
+    fn push_text(&mut self, text: &str, style: InlineStyle, range: Range<usize>) {
         if text.is_empty() {
             return;
         }
         let top = self.top();
-        if !text.trim().is_empty() {
-            top.other_inline = true;
-        }
         if let Some(Inline::Text {
             text: last,
             style: s,
@@ -764,6 +805,51 @@ mod tests {
     fn display_maths_with_inline_maths_stays_a_paragraph() {
         let blocks = kinds("$$y$$ $x$\n");
         assert!(matches!(&blocks[0], BlockKind::Paragraph(_)), "{blocks:?}");
+    }
+
+    #[test]
+    fn a_paragraph_of_one_image_is_an_image_block() {
+        let doc = parse("![a *big* cat](cat.png \"title\")\n\n- ![b](b.png)\n");
+        assert_eq!(
+            doc.blocks[0].kind,
+            BlockKind::Image {
+                src: "cat.png".into(),
+                alt: "a big cat".into()
+            }
+        );
+        assert_eq!(
+            &doc.source[doc.blocks[0].span.clone()],
+            "![a *big* cat](cat.png \"title\")\n"
+        );
+        let BlockKind::List { items, .. } = &doc.blocks[1].kind else {
+            panic!("expected a list, got {:?}", doc.blocks[1]);
+        };
+        assert_eq!(
+            items[0].blocks[0].kind,
+            BlockKind::Image {
+                src: "b.png".into(),
+                alt: "b".into()
+            }
+        );
+    }
+
+    #[test]
+    fn images_with_other_content_stay_inline() {
+        for md in [
+            "see ![a](a.png)\n",
+            "![a](a.png) ![b](b.png)\n",
+            "$$x$$ ![a](a.png)\n",
+        ] {
+            let blocks = kinds(md);
+            assert!(
+                matches!(&blocks[0], BlockKind::Paragraph(_)),
+                "{md}: {blocks:?}"
+            );
+        }
+        assert_eq!(
+            kinds("see ![a](a.png)\n"),
+            vec![BlockKind::Paragraph(vec![text("see [image: a]")])]
+        );
     }
 
     #[test]

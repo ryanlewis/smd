@@ -1,18 +1,68 @@
 //! Lays a document out as styled lines for a given width.
 
+use std::collections::HashMap;
+use std::ops::Range;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle};
+use crate::images::{self, Images, Placement};
+use crate::kitty;
 
 const TAB_WIDTH: usize = 4;
 
-/// Lay out the whole document for a view `width` columns wide.
-pub fn render(doc: &Document, width: u16) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    blocks(&doc.blocks, width as usize, &[], &[], false, &mut out);
-    out
+/// A document laid out for one width.
+#[derive(Debug, Default)]
+pub struct Layout {
+    pub lines: Vec<Line<'static>>,
+    /// Where each block landed, in document order. A block that holds others
+    /// comes before them.
+    pub blocks: Vec<BlockRows>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockRows {
+    /// The block's byte range in the source.
+    pub span: Range<usize>,
+    /// The lines the block takes.
+    pub rows: Range<usize>,
+    /// The image drawn on those lines, when the block is drawn as one.
+    pub image: Option<Placement>,
+}
+
+impl Layout {
+    /// Each image in the layout, once, with the size it was laid out at.
+    pub fn placements(&self) -> Vec<Placement> {
+        let mut out: Vec<Placement> = Vec::new();
+        for p in self.blocks.iter().filter_map(|b| b.image) {
+            if !out.iter().any(|q| q.id == p.id) {
+                out.push(p);
+            }
+        }
+        out
+    }
+}
+
+struct Ctx<'a> {
+    images: &'a Images,
+    layout: Layout,
+    /// The size each image was given where it first appeared. One image has
+    /// one placement, so a later block showing it must use the same size.
+    sizes: HashMap<u32, (u16, u16)>,
+}
+
+/// Lay out the whole document for a view `width` columns wide. Blocks whose
+/// image is ready in `images` are drawn as placeholder cells.
+pub fn render(doc: &Document, width: u16, images: &Images) -> Layout {
+    let mut ctx = Ctx {
+        images,
+        layout: Layout::default(),
+        sizes: HashMap::new(),
+    };
+    blocks(&doc.blocks, width as usize, &[], &[], false, &mut ctx);
+    ctx.layout
 }
 
 /// Render blocks one after another. `first` prefixes the first line and
@@ -23,13 +73,13 @@ fn blocks(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     tight: bool,
-    out: &mut Vec<Line<'static>>,
+    ctx: &mut Ctx,
 ) {
     for (i, b) in blocks.iter().enumerate() {
         if i > 0 && !tight {
-            emit(rest, Vec::new(), out);
+            emit(rest, Vec::new(), &mut ctx.layout.lines);
         }
-        block(b, width, if i == 0 { first } else { rest }, rest, out);
+        block(b, width, if i == 0 { first } else { rest }, rest, ctx);
     }
 }
 
@@ -38,8 +88,72 @@ fn block(
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) {
+    let index = ctx.layout.blocks.len();
+    let start = ctx.layout.lines.len();
+    ctx.layout.blocks.push(BlockRows {
+        span: block.span.clone(),
+        rows: start..start,
+        image: None,
+    });
+    let image = placement(block, width, first, rest, ctx);
+    match image {
+        Some(p) => image_rows(p, first, rest, &mut ctx.layout.lines),
+        None => contents(block, width, first, rest, ctx),
+    }
+    let entry = &mut ctx.layout.blocks[index];
+    entry.rows = start..ctx.layout.lines.len();
+    entry.image = image;
+}
+
+/// The size to draw a block's image at, if it has one ready.
+fn placement(
+    block: &Block,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) -> Option<Placement> {
+    let ready = ctx.images.ready(&images::key(block)?)?;
+    let prefix = spans_width(first).max(spans_width(rest));
+    let avail = width.saturating_sub(prefix).clamp(1, u16::MAX as usize) as u16;
+    let fitted = images::fit(ready.px, ctx.images.cell(), avail);
+    let size = *ctx.sizes.entry(ready.id).or_insert(fitted);
+    // Shown at a different size elsewhere: keep this one as text.
+    if size != fitted {
+        return None;
+    }
+    Some(Placement {
+        id: ready.id,
+        cols: size.0,
+        rows: size.1,
+    })
+}
+
+/// One line of placeholder cells per image row.
+fn image_rows(
+    p: Placement,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
+    let style = Style::new().fg(kitty::colour(p.id));
+    for row in 0..p.rows {
+        let cells: String = (0..p.cols).map(|col| kitty::cell(row, col)).collect();
+        let prefix = if row == 0 { first } else { rest };
+        emit(prefix, vec![Span::styled(cells, style)], out);
+    }
+}
+
+fn contents(
+    block: &Block,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) {
+    let out = &mut ctx.layout.lines;
     match &block.kind {
         BlockKind::Paragraph(content) => {
             wrap(content, Style::default(), width, first, rest, out);
@@ -74,6 +188,13 @@ fn block(
                 out,
             );
         }
+        BlockKind::Image { alt, .. } => {
+            let text = Inline::Text {
+                text: format!("[image: {alt}]"),
+                style: InlineStyle::default(),
+            };
+            wrap(&[text], Style::default(), width, first, rest, out);
+        }
         BlockKind::Rule => {
             let avail = width.saturating_sub(spans_width(first)).max(1);
             let rule = Span::styled("─".repeat(avail), Style::new().add_modifier(Modifier::DIM));
@@ -83,7 +204,7 @@ fn block(
             let bar = Span::styled("│ ", Style::new().fg(Color::DarkGray));
             let first = with(first, bar.clone());
             let rest = with(rest, bar);
-            blocks(inner, width, &first, &rest, false, out);
+            blocks(inner, width, &first, &rest, false, ctx);
         }
         BlockKind::List {
             start,
@@ -99,7 +220,7 @@ fn block(
             let marker_width = markers.iter().map(|m| m.width()).max().unwrap_or(0);
             for (i, (item, marker)) in items.iter().zip(markers).enumerate() {
                 if i > 0 && !tight {
-                    emit(rest, Vec::new(), out);
+                    emit(rest, Vec::new(), &mut ctx.layout.lines);
                 }
                 let mut marker = format!("{marker:>marker_width$}");
                 let mut indent = marker_width;
@@ -113,9 +234,9 @@ fn block(
                 );
                 let item_rest = with(rest, Span::raw(" ".repeat(indent)));
                 if item.blocks.is_empty() {
-                    emit(&item_first, Vec::new(), out);
+                    emit(&item_first, Vec::new(), &mut ctx.layout.lines);
                 }
-                blocks(&item.blocks, width, &item_first, &item_rest, *tight, out);
+                blocks(&item.blocks, width, &item_first, &item_rest, *tight, ctx);
             }
         }
     }
@@ -394,8 +515,13 @@ mod tests {
     use super::*;
     use crate::doc::parse;
 
+    fn no_images() -> Images {
+        Images::new((8, 16))
+    }
+
     fn plain(md: &str, width: u16) -> Vec<String> {
-        render(&parse(md), width)
+        render(&parse(md), width, &no_images())
+            .lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
@@ -473,11 +599,105 @@ mod tests {
         );
     }
 
+    /// Images with `src` ready, each `px` pixels, in a store with 10x20 cells.
+    fn ready(images: &[(&str, (u32, u32))]) -> Images {
+        use crate::images::tests::{file_key, job, png, settle};
+        let mut store = Images::new((10, 20));
+        for (src, (w, h)) in images {
+            store.request(file_key(src), job(png(*w, *h)));
+        }
+        settle(&mut store);
+        store
+    }
+
+    fn id(images: &Images, src: &str) -> u32 {
+        images
+            .ready(&crate::images::tests::file_key(src))
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn an_image_not_ready_shows_its_alt_text() {
+        assert_eq!(plain("![a cat](cat.png)\n", 40), vec!["[image: a cat]"]);
+    }
+
+    #[test]
+    fn a_ready_image_reserves_rows_of_placeholder_cells() {
+        let images = ready(&[("cat.png", (30, 40))]);
+        let id = id(&images, "cat.png");
+        let layout = render(&parse("one\n\n![cat](cat.png)\n\ntwo\n"), 40, &images);
+        let text: Vec<String> = layout.lines.iter().map(|l| l.to_string()).collect();
+        // 30x40 px is 3x2 cells; each row is one span coloured with the id.
+        assert_eq!(
+            text,
+            vec![
+                "one".to_string(),
+                String::new(),
+                kitty::cell(0, 0) + &kitty::cell(0, 1) + &kitty::cell(0, 2),
+                kitty::cell(1, 0) + &kitty::cell(1, 1) + &kitty::cell(1, 2),
+                String::new(),
+                "two".to_string(),
+            ]
+        );
+        assert_eq!(layout.lines[2].spans[0].style.fg, Some(kitty::colour(id)));
+        let image = Placement {
+            id,
+            cols: 3,
+            rows: 2,
+        };
+        assert_eq!(
+            layout.blocks,
+            vec![
+                BlockRows {
+                    span: 0..4,
+                    rows: 0..1,
+                    image: None
+                },
+                BlockRows {
+                    span: 5..21,
+                    rows: 2..4,
+                    image: Some(image)
+                },
+                BlockRows {
+                    span: 22..26,
+                    rows: 5..6,
+                    image: None
+                },
+            ]
+        );
+        assert_eq!(layout.placements(), vec![image]);
+    }
+
+    #[test]
+    fn a_wide_image_fits_inside_its_prefix() {
+        let images = ready(&[("wide.png", (1000, 100))]);
+        let layout = render(&parse("> - ![w](wide.png)\n"), 24, &images);
+        // The quote bar and list marker take 4 of the 24 columns.
+        let image = layout.placements()[0];
+        assert_eq!((image.cols, image.rows), (20, 1));
+        assert!(layout.lines[0].to_string().starts_with("│ • \u{10EEEE}"));
+        // Quote, list, then the image inside them.
+        assert_eq!(layout.blocks.len(), 3);
+        assert_eq!(layout.blocks[2].image, Some(image));
+        for line in &layout.lines {
+            assert!(line.width() <= 24, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn one_image_shown_at_two_sizes_keeps_the_second_as_text() {
+        let images = ready(&[("wide.png", (1000, 100))]);
+        let layout = render(&parse("![w](wide.png)\n\n> ![w](wide.png)\n"), 30, &images);
+        assert_eq!(layout.placements().len(), 1);
+        assert_eq!(layout.lines.last().unwrap().to_string(), "│ [image: w]");
+    }
+
     #[test]
     fn no_line_is_wider_than_the_view() {
         let md = "# A heading that is long\n\n> - quoted list item with words\n\n```\na long line of code here\n```\n\n---\n";
         for width in 8..30u16 {
-            for line in render(&parse(md), width) {
+            for line in render(&parse(md), width, &no_images()).lines {
                 assert!(line.width() <= width as usize, "width {width}: {line:?}");
             }
         }

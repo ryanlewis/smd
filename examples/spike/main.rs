@@ -11,6 +11,7 @@
 //! Keys: j/k or arrows scroll a line, space/b a page, g/G top/bottom,
 //! r re-uploads both images, q quits.
 
+#[path = "../../src/kitty/diacritics.rs"]
 mod diacritics;
 
 use std::collections::VecDeque;

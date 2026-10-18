@@ -1,5 +1,7 @@
 mod app;
 mod doc;
+mod images;
+mod kitty;
 mod render;
 mod watch;
 
@@ -31,7 +33,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let view = app::View::new(doc::parse(&source));
+    // Relative image paths are read from the markdown file's directory.
+    let base = match Path::new(path).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => ".".into(),
+    };
+    // Asked before the terminal is set up, while nothing else reads its replies.
+    let images = images::Images::new(kitty::cell_size());
+    let view = app::View::new(doc::parse(&source), base, images);
 
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,

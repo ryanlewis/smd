@@ -765,7 +765,7 @@ mod tests {
         let wide = render(&parse(md), 40, &images);
         assert_eq!(wide.lines.len(), 5);
         assert_eq!(wide.placements(), vec![]);
-        // 16 columns do not fit in 15: the image is fitted to the width.
+        // 16 columns do not fit in 15: the image shrinks to one whole row.
         let narrow = render(&parse(md), 15, &images);
         let p = narrow.placements();
         assert_eq!((p[0].cols, p[0].rows), (14, 1));

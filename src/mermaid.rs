@@ -352,7 +352,7 @@ mod tests {
             fake.to_str().unwrap(),
             "graph LR\n",
             Theme::Dark,
-            Duration::from_millis(500),
+            Duration::from_secs(2),
         );
         let pid: libc::pid_t = std::fs::read_to_string(dir.join("child.pid"))
             .unwrap()
@@ -373,7 +373,7 @@ mod tests {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(got, Err("mermaid: mmdc took over 0s".into()));
+        assert_eq!(got, Err("mermaid: mmdc took over 2s".into()));
         assert!(gone, "the child outlived the timeout");
     }
 

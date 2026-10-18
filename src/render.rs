@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle};
+use crate::heading;
 use crate::images::{self, Images, Placement};
 use crate::kitty;
 use crate::table::Table;
@@ -132,7 +133,10 @@ fn placement(
         return None;
     }
     let ready = ctx.images.ready(&key)?;
-    let fitted = images::fit(ready.px, ctx.images.cell(), avail);
+    let fitted = match block.kind {
+        BlockKind::Heading { .. } => heading::fit(ready.px, ctx.images.cell(), avail)?,
+        _ => images::fit(ready.px, ctx.images.cell(), avail),
+    };
     let size = *ctx.sizes.entry(ready.id).or_insert(fitted);
     // Shown at a different size elsewhere: keep this one as text.
     if size != fitted {
@@ -872,6 +876,28 @@ mod tests {
         let layout = render(&parse("![w](wide.png)\n\n> ![w](wide.png)\n"), 30, &images);
         assert_eq!(layout.placements().len(), 1);
         assert_eq!(layout.lines.last().unwrap().to_string(), "│ [image: w]");
+    }
+
+    #[test]
+    fn a_heading_image_shrinks_by_whole_rows_then_falls_back_to_text() {
+        use crate::images::tests::{job, png, settle};
+        let doc = parse("# Title\n");
+        let mut store = Images::new((10, 20));
+        // A level-one heading drawn 40 by 3 cells.
+        // No heading image without a system font.
+        let Some(key) = images::key(&doc.blocks[0]) else {
+            return;
+        };
+        store.request(key, job(png(400, 60)));
+        settle(&mut store);
+        let size = |width| {
+            let layout = render(&doc, width, &store);
+            layout.placements().first().map(|p| (p.cols, p.rows))
+        };
+        assert_eq!(size(80), Some((40, 3)));
+        assert_eq!(size(30), Some((27, 2)));
+        assert_eq!(size(13), None);
+        assert_eq!(plain("# Title\n", 13), vec!["Title"]);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod app;
 mod doc;
+mod heading;
 mod images;
 mod kitty;
 mod maths;
@@ -56,7 +57,10 @@ fn main() -> ExitCode {
     // Images are drawn for a dark background unless the terminal says otherwise.
     theme::set(probe.and_then(|p| p.theme).unwrap_or(theme::Theme::Dark));
     let images = match probe {
-        Some(probe) if probe.graphics => images::Images::new(probe.cell),
+        Some(probe) if probe.graphics => {
+            heading::set_cell(probe.cell);
+            images::Images::new(probe.cell)
+        }
         _ => images::Images::text(),
     };
     let view = app::View::new(doc::parse(&source), base, images);

@@ -1,0 +1,416 @@
+//! Headings drawn as images in a real font, larger for higher levels.
+//!
+//! The font is read from the machine rather than bundled (see
+//! [`raster::sans_bold`]), with the monospace bold face for inline code. A
+//! heading with a character neither font has, or with no font found at all,
+//! stays as text.
+//!
+//! Each level is drawn at a fixed height in whole cell rows, so the image does
+//! not change when the pane is resized. A heading wider than the pane is
+//! shrunk to fit by whole rows (see [`fit`]); one that cannot shrink to a row
+//! is shown as text instead.
+
+use std::sync::OnceLock;
+
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+
+use crate::doc::Inline;
+use crate::images::Job;
+use crate::kitty;
+use crate::raster::{self, Canvas, Rgba};
+use crate::theme::Theme;
+
+/// Cell size used by heading jobs, set once at start-up.
+static CELL: OnceLock<(u16, u16)> = OnceLock::new();
+
+const DEFAULT_CELL: (u16, u16) = (8, 16);
+
+/// Draw headings for cells of `cell` pixels. Call once, before any are made.
+pub fn set_cell(cell: (u16, u16)) {
+    let _ = CELL.set((cell.0.max(1), cell.1.max(1)));
+}
+
+fn cell() -> (u16, u16) {
+    CELL.get().copied().unwrap_or(DEFAULT_CELL)
+}
+
+/// Rows of the image and font height, in cell heights, for levels 1 to 6.
+const SIZES: [(u32, f32); 6] = [
+    (3, 2.4),
+    (2, 1.8),
+    (2, 1.45),
+    (1, 1.0),
+    (1, 0.92),
+    (1, 0.85),
+];
+
+/// A run of heading text, and whether it is inline code.
+type Run = (String, bool);
+
+/// The heading's text as runs. Line breaks become spaces, and runs of spaces
+/// outside code become one.
+fn runs(content: &[Inline]) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for inline in content {
+        let (text, code) = match inline {
+            Inline::Text { text, style } => (text.as_str(), style.code),
+            Inline::Break => (" ", false),
+        };
+        match out.last_mut() {
+            Some((s, c)) if *c == code => s.push_str(text),
+            _ => out.push((text.to_string(), code)),
+        }
+    }
+    for (s, code) in &mut out {
+        if !*code {
+            let mut collapsed = String::with_capacity(s.len());
+            for c in s.chars() {
+                let space = c.is_whitespace();
+                if !(space && collapsed.ends_with(' ')) {
+                    collapsed.push(if space { ' ' } else { c });
+                }
+            }
+            *s = collapsed;
+        }
+    }
+    if let Some((s, _)) = out.first_mut() {
+        *s = s.trim_start().to_string();
+    }
+    if let Some((s, _)) = out.last_mut() {
+        *s = s.trim_end().to_string();
+    }
+    out.retain(|(s, _)| !s.is_empty());
+    out
+}
+
+/// Text drawn in one font and colour.
+struct Piece<'a> {
+    font: &'a FontVec,
+    text: String,
+    colour: Rgba,
+}
+
+/// The runs split by font: text in `sans`, code in `mono` where it has the
+/// glyph and in `sans` where only that does. `None` when a character is in
+/// neither.
+fn pieces<'a>(
+    runs: &[Run],
+    sans: &'a FontVec,
+    mono: &'a FontVec,
+    (text, code): (Rgba, Rgba),
+) -> Option<Vec<Piece<'a>>> {
+    let has = |font: &FontVec, c: char| c.is_whitespace() || font.glyph_id(c).0 != 0;
+    let mut out: Vec<Piece> = Vec::new();
+    for (s, is_code) in runs {
+        let colour = if *is_code { code } else { text };
+        for c in s.chars() {
+            let font = match (*is_code && has(mono, c), has(sans, c)) {
+                (true, _) => mono,
+                (false, true) => sans,
+                (false, false) => return None,
+            };
+            match out.last_mut() {
+                Some(p) if std::ptr::eq(p.font, font) && p.colour == colour => p.text.push(c),
+                _ => out.push(Piece {
+                    font,
+                    text: c.to_string(),
+                    colour,
+                }),
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The text and code fonts, or `None` when there is no text font.
+fn fonts() -> Option<(&'static FontVec, &'static FontVec)> {
+    let sans = raster::sans_bold().ok()?;
+    let mono = raster::fonts().map_or(sans, |f| f.bold());
+    Some((sans, mono))
+}
+
+/// What a heading image is made from, or `None` for a heading that stays
+/// text: an empty one, or one the fonts cannot draw. Checking here rather
+/// than in the job keeps a heading that cannot be drawn from being tried
+/// again on every reload.
+pub fn name(level: u8, content: &[Inline], theme: Theme) -> Option<String> {
+    let runs = runs(content);
+    let (sans, mono) = fonts()?;
+    if runs.is_empty() || pieces(&runs, sans, mono, colours(level, theme)).is_none() {
+        return None;
+    }
+    let (w, h) = cell();
+    Some(format!("heading:{level}:{}:{w}x{h}:{runs:?}", theme.name()))
+}
+
+/// Make the image for a heading.
+pub fn job(level: u8, content: &[Inline], theme: Theme) -> Job {
+    let runs = runs(content);
+    let cell = cell();
+    Box::new(move || {
+        draw(level, &runs, cell, theme)
+            .and_then(|canvas| canvas.png())
+            .map_err(|e| format!("heading: {e}"))
+    })
+}
+
+/// Cells to show a heading image of `px` pixels in at most `max_cols`
+/// columns, or `None` when it would be less than a row tall.
+///
+/// Unlike [`images::fit`](crate::images::fit), a shrunken heading drops whole
+/// rows and narrows to match: Ghostty stretches an image to fill its cells, so
+/// rounding the rows up would squash the text sideways.
+pub fn fit(px: (u32, u32), cell: (u16, u16), max_cols: u16) -> Option<(u16, u16)> {
+    let (cw, ch) = (u32::from(cell.0.max(1)), u32::from(cell.1.max(1)));
+    let cols = px.0.div_ceil(cw).max(1);
+    let rows = px.1.div_ceil(ch).max(1);
+    let max_cols = u32::from(max_cols);
+    if cols <= max_cols {
+        return Some((cols as u16, rows as u16));
+    }
+    let shrunk = rows * max_cols / cols;
+    if shrunk == 0 {
+        return None;
+    }
+    Some(((cols * shrunk).div_ceil(rows) as u16, shrunk as u16))
+}
+
+/// Text and code colours for a level, close to the text-mode styles. Code
+/// matches inline code in tables.
+fn colours(level: u8, theme: Theme) -> (Rgba, Rgba) {
+    match theme {
+        Theme::Dark => {
+            let text = match level {
+                1 => [0xd7, 0x8b, 0xf0, 0xff],
+                2 => [0x6f, 0xd3, 0xe8, 0xff],
+                3 => [0x8f, 0xd8, 0x8f, 0xff],
+                6 => [0xa8, 0xa8, 0xa8, 0xff],
+                _ => [0xe8, 0xe8, 0xe8, 0xff],
+            };
+            (text, [0xe5, 0xc0, 0x7b, 0xff])
+        }
+        Theme::Light => {
+            let text = match level {
+                1 => [0x8b, 0x3f, 0xa8, 0xff],
+                2 => [0x1f, 0x6f, 0x80, 0xff],
+                3 => [0x2e, 0x7d, 0x32, 0xff],
+                6 => [0x66, 0x66, 0x66, 0xff],
+                _ => [0x22, 0x22, 0x22, 0xff],
+            };
+            (text, [0x95, 0x5f, 0x00, 0xff])
+        }
+    }
+}
+
+/// Where a heading's text goes in its image.
+struct Plan<'a> {
+    pieces: Vec<Piece<'a>>,
+    /// Font size in pixels.
+    size: f32,
+    /// Where the text starts, and its baseline.
+    left: f32,
+    baseline: f32,
+    width: u32,
+    height: u32,
+}
+
+fn plan(level: u8, runs: &[Run], cell: (u16, u16), theme: Theme) -> Result<Plan<'static>, String> {
+    let (sans, mono) = fonts().ok_or("no font")?;
+    let pieces = pieces(runs, sans, mono, colours(level, theme)).ok_or("missing glyph")?;
+    let (cw, ch) = (u32::from(cell.0.max(1)), u32::from(cell.1.max(1)));
+    let (rows, size) = SIZES[usize::from(level.clamp(1, 6)) - 1];
+    let height = rows * ch;
+    let mut size = size * ch as f32;
+    let (mut advance, mut ink) = measure(&pieces, size);
+    // Accented capitals rise above the font's ascent: make the type smaller
+    // rather than cut them off.
+    // The ink is rounded out to whole pixels, so one step may not be enough.
+    for _ in 0..4 {
+        let tall = ink[3] - ink[1];
+        if tall <= height as f32 {
+            break;
+        }
+        size *= (height as f32 - 1.0) / tall;
+        (advance, ink) = measure(&pieces, size);
+    }
+    // Centre the line in the rows, then move it to keep all the ink inside.
+    // The ink was measured on a whole-pixel baseline, so keep it whole.
+    let scaled = sans.as_scaled(PxScale::from(size));
+    let centred = ((height as f32 - scaled.height()) / 2.0 + scaled.ascent()).round();
+    let baseline = centred.min(height as f32 - ink[3]).max(-ink[1]);
+    let left = (1.0 - ink[0]).max(1.0);
+    let right = left + advance.max(ink[2]);
+    let width = (right.ceil() as u32 + 1).div_ceil(cw) * cw;
+    if width > u32::from(kitty::MAX_CELLS) * cw {
+        return Err("too wide".into());
+    }
+    Ok(Plan {
+        pieces,
+        size,
+        left,
+        baseline,
+        width,
+        height,
+    })
+}
+
+/// How far the pieces advance, and the pixels their ink covers on the
+/// baseline 0 from x 0: left, top, right, bottom.
+fn measure(pieces: &[Piece], size: f32) -> (f32, [f32; 4]) {
+    let mut x = 0.0;
+    let mut ink = [0.0f32; 4];
+    for p in pieces {
+        if let Some([l, t, r, b]) = raster::ink(p.font, size, x, &p.text) {
+            ink = [ink[0].min(l), ink[1].min(t), ink[2].max(r), ink[3].max(b)];
+        }
+        x += raster::measure(p.font, size, &p.text);
+    }
+    (x, ink)
+}
+
+/// Draw `runs` on a clear background, a whole number of cells wide and tall.
+fn draw(level: u8, runs: &[Run], cell: (u16, u16), theme: Theme) -> Result<Canvas, String> {
+    let plan = plan(level, runs, cell, theme)?;
+    let mut canvas = Canvas::new(plan.width, plan.height);
+    let mut x = plan.left;
+    for p in &plan.pieces {
+        x = canvas.text(p.font, plan.size, x, plan.baseline, &p.text, p.colour);
+    }
+    Ok(canvas)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::{BlockKind, parse};
+
+    fn heading(md: &str) -> (u8, Vec<Inline>) {
+        match parse(md).blocks.remove(0).kind {
+            BlockKind::Heading { level, content } => (level, content),
+            other => panic!("not a heading: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runs_mark_inline_code_and_trim() {
+        let (_, content) = heading("## Use `smd --watch`  now\n");
+        assert_eq!(
+            runs(&content),
+            vec![
+                ("Use ".to_string(), false),
+                ("smd --watch".to_string(), true),
+                (" now".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_name_depends_on_level_text_and_theme() {
+        if fonts().is_none() {
+            return;
+        }
+        let named = |md, theme| {
+            let (level, content) = heading(md);
+            name(level, &content, theme)
+        };
+        assert_ne!(
+            named("# Title\n", Theme::Dark),
+            named("## Title\n", Theme::Dark)
+        );
+        assert_ne!(
+            named("# Title\n", Theme::Dark),
+            named("# Title\n", Theme::Light)
+        );
+        // Emphasis does not change how the heading is drawn.
+        assert_eq!(
+            named("# Title\n", Theme::Dark),
+            named("# *Title*\n", Theme::Dark)
+        );
+        assert_eq!(name(1, &[], Theme::Dark), None);
+    }
+
+    #[test]
+    fn fit_shrinks_by_whole_rows_keeping_shape() {
+        let cell = (10, 20);
+        // 40 by 3 cells, at natural size when there is room.
+        assert_eq!(fit((400, 60), cell, 80), Some((40, 3)));
+        assert_eq!(fit((400, 60), cell, 40), Some((40, 3)));
+        // Narrower: two rows need 27 columns, one row 14.
+        assert_eq!(fit((400, 60), cell, 39), Some((27, 2)));
+        assert_eq!(fit((400, 60), cell, 26), Some((14, 1)));
+        // Less than a row tall: shown as text.
+        assert_eq!(fit((400, 60), cell, 13), None);
+        assert_eq!(fit((400, 20), cell, 39), None);
+    }
+
+    fn drawn(md: &str, cell: (u16, u16), theme: Theme) -> Canvas {
+        let (level, content) = heading(md);
+        draw(level, &runs(&content), cell, theme).unwrap()
+    }
+
+    #[test]
+    fn levels_get_whole_rows_and_smaller_type() {
+        if fonts().is_none() {
+            return;
+        }
+        let sizes: Vec<(u32, u32)> = (1..=6)
+            .map(|n| {
+                drawn(
+                    &format!("{} Heading\n", "#".repeat(n)),
+                    (10, 20),
+                    Theme::Dark,
+                )
+                .size()
+            })
+            .collect();
+        let heights: Vec<u32> = sizes.iter().map(|s| s.1).collect();
+        assert_eq!(heights, vec![60, 40, 40, 20, 20, 20]);
+        for (w, _) in &sizes {
+            assert_eq!(w % 10, 0, "{sizes:?}");
+        }
+        for pair in sizes.windows(2) {
+            assert!(pair[0].0 > pair[1].0, "{sizes:?}");
+        }
+    }
+
+    #[test]
+    fn accents_and_overhangs_stay_inside_the_image() {
+        if fonts().is_none() {
+            return;
+        }
+        for level in 1..=6 {
+            for text in ["Évolution", "Å jÄ fÉ", "j`ÉÅ`f"] {
+                let (_, content) = heading(&format!("# {text}\n"));
+                let plan = plan(level, &runs(&content), (17, 34), Theme::Dark).unwrap();
+                let (_, [l, t, r, b]) = measure(&plan.pieces, plan.size);
+                let case = format!("h{level} {text}");
+                assert!(l + plan.left >= 0.0, "{case}");
+                assert!(t + plan.baseline >= 0.0, "{case}");
+                assert!(r + plan.left <= plan.width as f32, "{case}");
+                assert!(b + plan.baseline <= plan.height as f32, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_glyphs_and_huge_headings_stay_text() {
+        if fonts().is_none() {
+            return;
+        }
+        let (level, content) = heading("# 日本\n");
+        assert_eq!(name(level, &content, Theme::Dark), None);
+        let runs = vec![("word ".repeat(400), false)];
+        assert!(draw(1, &runs, (10, 20), Theme::Dark).is_err());
+    }
+
+    #[test]
+    fn the_theme_changes_the_colours_not_the_size() {
+        if fonts().is_none() {
+            return;
+        }
+        let dark = drawn("# Theme\n", (10, 20), Theme::Dark);
+        let light = drawn("# Theme\n", (10, 20), Theme::Light);
+        assert_eq!(dark.size(), light.size());
+        assert_ne!(dark.png().unwrap(), light.png().unwrap());
+    }
+}

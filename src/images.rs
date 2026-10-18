@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::doc::{Block, BlockKind, FigureKind};
 use crate::theme::{self, Theme};
-use crate::{kitty, maths, mermaid, table};
+use crate::{heading, kitty, maths, mermaid, table};
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -281,6 +281,9 @@ pub fn key(block: &Block) -> Option<Key> {
             kind: FigureKind::Table,
             source,
         } => Some(table_key(source, theme::current())),
+        BlockKind::Heading { level, content } => {
+            heading::name(*level, content, theme::current()).map(Key)
+        }
         _ => None,
     }
 }
@@ -317,6 +320,7 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
             let (source, theme) = (source.clone(), theme::current());
             Box::new(move || table::image(&source, theme))
         }
+        BlockKind::Heading { level, content } => heading::job(*level, content, theme::current()),
         _ => return None,
     };
     Some((key, job))

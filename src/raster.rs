@@ -66,6 +66,26 @@ pub fn fonts() -> Result<&'static Fonts, String> {
         .ok_or_else(|| "no monospace font found".to_string())
 }
 
+/// Bold proportional fonts to look for, for headings.
+const SANS_BOLD: &[Face] = &[
+    ("/System/Library/Fonts/Helvetica.ttc", 1),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
+    ("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 0),
+    (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        0,
+    ),
+];
+
+/// The system's bold proportional font, read once.
+pub fn sans_bold() -> Result<&'static FontVec, String> {
+    static FOUND: OnceLock<Option<FontVec>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| SANS_BOLD.iter().find_map(|&face| load(face)))
+        .as_ref()
+        .ok_or_else(|| "no bold sans-serif font found".to_string())
+}
+
 fn load((path, index): Face) -> Option<FontVec> {
     let data = std::fs::read(path).ok()?;
     FontVec::try_from_vec_and_index(data, index).ok()
@@ -188,6 +208,36 @@ pub fn measure(font: &FontVec, size: f32, text: &str) -> f32 {
         previous = Some(id);
     }
     width
+}
+
+/// The pixels `text` covers when drawn from `x` on the baseline 0, as left,
+/// top, right and bottom, or `None` when it has no ink.
+pub fn ink(font: &FontVec, size: f32, x: f32, text: &str) -> Option<[f32; 4]> {
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut x = x;
+    let mut previous = None;
+    let mut out: Option<[f32; 4]> = None;
+    for c in text.chars() {
+        let id = scaled.glyph_id(c);
+        if let Some(previous) = previous {
+            x += scaled.kern(previous, id);
+        }
+        if let Some(outline) = font.outline_glyph(id.with_scale_and_position(size, point(x, 0.0))) {
+            let b = outline.px_bounds();
+            out = Some(match out {
+                None => [b.min.x, b.min.y, b.max.x, b.max.y],
+                Some([l, t, r, bt]) => [
+                    l.min(b.min.x),
+                    t.min(b.min.y),
+                    r.max(b.max.x),
+                    bt.max(b.max.y),
+                ],
+            });
+        }
+        x += scaled.h_advance(id);
+        previous = Some(id);
+    }
+    out
 }
 
 #[cfg(test)]

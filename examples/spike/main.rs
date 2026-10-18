@@ -6,7 +6,7 @@
 //! placements and drawn as U+10EEEE placeholder cells, so scrolling only
 //! redraws text.
 //!
-//! Run: `cargo run --example spike -- [--bench N] [--delay MS] [--log FILE]
+//! Run: `cargo run --release --example spike -- [--bench N] [--delay MS] [--log FILE]
 //! [--no-images] [--reupload]`
 //! Keys: j/k or arrows scroll a line, space/b a page, g/G top/bottom,
 //! r re-uploads both images, q quits.
@@ -275,6 +275,10 @@ fn fit(px: (u32, u32), cell: (u16, u16), max_cols: u16, max_rows: u16) -> (u16, 
     if cols > max_cols {
         cols = max_cols;
         rows = (u64::from(px.1) * u64::from(cols * cw)).div_ceil(u64::from(px.0 * ch)) as u32;
+    }
+    if rows > max_rows {
+        rows = max_rows;
+        cols = (u64::from(px.0) * u64::from(rows * ch)).div_ceil(u64::from(px.1 * cw)) as u32;
     }
     (
         cols.clamp(1, max_cols) as u16,
@@ -830,5 +834,7 @@ mod tests {
     fn fit_shrinks_wide_images_keeping_aspect() {
         assert_eq!(fit((160, 32), (8, 16), 80, 40), (20, 2));
         assert_eq!(fit((1600, 320), (8, 16), 100, 40), (100, 10));
+        // Too tall for the pane: shrink columns too, not just rows.
+        assert_eq!(fit((1568, 224), (17, 34), 200, 5), (70, 5));
     }
 }

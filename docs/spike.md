@@ -26,7 +26,7 @@ Flags:
 
 - `--bench N --delay MS` scrolls N frames on its own.
 - `--no-images` is a text-only control run.
-- `--reupload` uploads both images again on every frame, which is roughly what terminal-browser did.
+- `--reupload` uploads both images again on every frame. It stands in for an app that keeps re-sending image data, which is how this spike reads terminal-browser's problem. terminal-browser itself was not tested.
 - `--log FILE` saves the summary to a file.
 
 ## Setup
@@ -79,7 +79,7 @@ These numbers are herdr API round-trips (process start plus herdr's socket plus 
 
 Typing and tab switching took the same time in every run. With images uploaded once, scrolling them costs herdr about 5 more points of server CPU and 4 more points of client CPU than scrolling plain text.
 
-Re-uploading every frame (about 665 KB of base64 per frame) pushes the herdr server to about 40% CPU, and the scroll rate drops from about 53 to about 36 frames a second. Images still showed during that run. Ghostty's CPU fell to 5% at the same time, which suggests herdr does not forward each re-upload to Ghostty. That was not confirmed.
+Re-uploading every frame (about 890 KB of base64 per frame) pushes the herdr server to about 40% CPU, and the scroll rate drops from about 53 to about 36 frames a second. Part of that drop is the example's own work: in this mode it base64-encodes both images again and places them again (two extra round-trips) on every frame. Images still showed during that run. Ghostty's CPU fell to 5% at the same time, which suggests herdr does not forward each re-upload to Ghostty. That was not confirmed.
 
 Plain Ghostty, for comparison (window 151x44 cells, same bench):
 
@@ -101,7 +101,7 @@ Plain Ghostty, for comparison (window 151x44 cells, same bench):
 
 How to read this:
 
-- **Inside herdr, herdr very likely answers the replies itself.** herdr keeps its own screen for each pane, so the graphics `OK` and the `CSI 5 n` reply most likely come from herdr, not from Ghostty. Two things point that way: uploads were acknowledged faster inside herdr (7 ms) than in plain Ghostty (13–22 ms), and a 3000-frame run with no delay finished in 0.2 s. This was not confirmed from herdr's source. If it holds, the herdr numbers measure how fast herdr takes in the data, not how fast Ghostty draws it.
+- **Inside herdr, herdr very likely answers the replies itself.** herdr keeps its own screen for each pane, so the graphics `OK` and the `CSI 5 n` reply most likely come from herdr, not from Ghostty. Two things point that way: uploads were acknowledged faster inside herdr (7 ms) than in plain Ghostty (10–22 ms), and a 3000-frame run with no delay finished in 0.2 s. This was not confirmed from herdr's source. If it holds, the herdr numbers measure how fast herdr takes in the data, not how fast Ghostty draws it.
 - **Directly, Ghostty answers from its parser, not its renderer.** So the redraw figures are the cost of sending a frame, not the time to paint it. For drawing cost, the CPU tables above are the better guide.
 
 ### Does OSC 66 text sizing work for headings?
@@ -126,11 +126,11 @@ From what was seen here. kitty itself was not tested.
 
 Unicode-placeholder images work in Ghostty, with and without herdr. herdr stays responsive while they scroll, so smd is viable. Build it within these limits:
 
-1. **Upload each image once, then place it with `U=1` and print placeholder cells.** Never re-send image data on scroll or redraw. That pattern (terminal-browser's) is what costs herdr about 40% CPU. On resize, place the image again and only upload again if the image itself must change (for example, a heading drawn for a new width).
+1. **Upload each image once, then place it with `U=1` and print placeholder cells.** Never re-send image data on scroll or redraw. Re-sending is what cost herdr about 40% CPU here. On resize, place the image again and only upload again if the image itself must change (for example, a heading drawn for a new width).
 2. **Do not use OSC 66 for headings.** Neither Ghostty nor herdr shows it. Draw headings as images, or as plain styled text.
 3. **Write both diacritics on every placeholder cell.** That is what was tested and works. Inferred diacritics are untested.
 4. **Get the cell size from `CSI 16 t`.** It works directly and in herdr (17x34 here). Fall back to `TIOCGWINSZ` pixels.
-5. **Keep uploads small.** Send PNG (`f=100`) or compressed data (`o=z`) rather than raw RGBA. The 622 KB raw heading took 7–22 ms, the 44 KB PNG took 2–5 ms.
+5. **Keep uploads small.** Send PNG (`f=100`) or compressed data (`o=z`) rather than raw RGBA. The 622 KB raw heading took 7–22 ms to upload (herdr and plain Ghostty together), and the 44 KB PNG took 2–5 ms.
 6. **Do not rely on terminal replies for flow control inside herdr.** herdr very likely answers them itself.
 7. **kitty is unverified.** smd's docs say "kitty graphics protocol", but nothing here was checked in kitty. Test kitty, with and without herdr, before claiming kitty support, and use that test for the OSC 66 question too.
 

@@ -365,6 +365,10 @@ impl<'a> Builder<'a> {
                 return;
             }
             Tag::Image { dest_url, .. } => {
+                // A linked image stays inline so it keeps its link.
+                if !self.links.is_empty() {
+                    self.top().other_inline = true;
+                }
                 self.push_text("[image: ", self.style(), range);
                 self.image_depth += 1;
                 if self.image_depth == 1 {
@@ -849,6 +853,24 @@ mod tests {
         assert_eq!(
             kinds("see ![a](a.png)\n"),
             vec![BlockKind::Paragraph(vec![text("see [image: a]")])]
+        );
+    }
+
+    #[test]
+    fn a_linked_image_stays_a_link() {
+        let blocks = kinds("[![CI](ci.png)](https://x.org/ci)\n");
+        let BlockKind::Paragraph(inlines) = &blocks[0] else {
+            panic!("expected a paragraph, got {blocks:?}");
+        };
+        assert_eq!(
+            inlines,
+            &vec![styled(
+                "[image: CI]",
+                InlineStyle {
+                    link: Some("https://x.org/ci".into()),
+                    ..Default::default()
+                }
+            )]
         );
     }
 

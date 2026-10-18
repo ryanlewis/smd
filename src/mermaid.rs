@@ -53,7 +53,7 @@ fn draw(program: &str, source: &str, theme: Theme, cache: Option<&Path>) -> Resu
     }
     let data = {
         let _slot = Slot::take();
-        run(program, source, theme)?
+        run(program, source, theme, TIMEOUT)?
     };
     let png = Png::new(data.clone()).map_err(|e| format!("mermaid: mmdc gave {e}"))?;
     if let Some(path) = cache {
@@ -63,23 +63,27 @@ fn draw(program: &str, source: &str, theme: Theme, cache: Option<&Path>) -> Resu
     Ok(png)
 }
 
-/// Run `mmdc`, reading the diagram from stdin and the PNG from stdout.
-fn run(program: &str, source: &str, theme: Theme) -> Result<Vec<u8>, String> {
+/// Run `mmdc`, reading the diagram from stdin and the PNG from stdout. It is
+/// stopped, with the browser it started, after `timeout`.
+fn run(program: &str, source: &str, theme: Theme, timeout: Duration) -> Result<Vec<u8>, String> {
     let mmdc_theme = match theme {
         Theme::Dark => "dark",
         Theme::Light => "default",
     };
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(["-i", "-", "-o", "-", "-e", "png", "-q"])
         .args(["-t", mmdc_theme, "-b", "transparent", "-s", SCALE])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            ErrorKind::NotFound => "mermaid: mmdc not found on PATH".to_string(),
-            _ => format!("mermaid: cannot run mmdc: {e}"),
-        })?;
+        .stderr(Stdio::piped());
+    // Its own process group, so a timeout can stop the browser it starts too.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn().map_err(|e| match e.kind() {
+        ErrorKind::NotFound => "mermaid: mmdc not found on PATH".to_string(),
+        _ => format!("mermaid: cannot run mmdc: {e}"),
+    })?;
     // Both pipes are read on their own threads so neither can fill and stall
     // mmdc while the other is read.
     let reader = |mut pipe: Box<dyn Read + Send>| {
@@ -99,15 +103,15 @@ fn run(program: &str, source: &str, theme: Theme) -> Result<Vec<u8>, String> {
             let _ = stdin.write_all(source.as_bytes());
         });
     }
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                let _ = child.kill();
+                kill_group(&mut child);
                 let _ = child.wait();
-                return Err(format!("mermaid: mmdc took over {}s", TIMEOUT.as_secs()));
+                return Err(format!("mermaid: mmdc took over {}s", timeout.as_secs()));
             }
             Err(e) => return Err(format!("mermaid: mmdc: {e}")),
         }
@@ -122,6 +126,16 @@ fn run(program: &str, source: &str, theme: Theme) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(stdout)
+}
+
+/// Kill `child` and everything in its process group.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill(2) takes plain integers and has no memory effects.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
 }
 
 /// The line of `mmdc`'s output that says what went wrong, such as
@@ -318,6 +332,49 @@ mod tests {
         assert_eq!(cached, Some(png(12, 34)));
         assert_eq!(bad, Err("mermaid: Parse error on line 2".into()));
         assert_eq!(not_png, Err("mermaid: mmdc gave not a PNG".into()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_stops_the_whole_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("timeout");
+        // A stand-in for mmdc that starts a child, as mmdc starts Chromium,
+        // records its pid and sleeps.
+        let fake = dir.join("fake-mmdc");
+        let script = format!(
+            "#!/bin/sh\nsleep 300 &\necho $! > '{}'\nwait\n",
+            dir.join("child.pid").display()
+        );
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let got = run(
+            fake.to_str().unwrap(),
+            "graph LR\n",
+            Theme::Dark,
+            Duration::from_millis(500),
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(dir.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The kill is a signal; give the system a moment to reap the child.
+        let mut gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only checks that the process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !gone {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Err("mermaid: mmdc took over 0s".into()));
+        assert!(gone, "the child outlived the timeout");
     }
 
     #[test]

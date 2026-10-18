@@ -33,6 +33,17 @@ pub struct View {
     notice: Option<String>,
 }
 
+/// The block at the top of the view, found again after the document is laid
+/// out anew so the view stays on the same content.
+struct Anchor {
+    /// Its index in `Layout::blocks`.
+    index: usize,
+    /// Its markdown, which finds it in a reloaded document.
+    text: String,
+    /// The top line's offset from the block's first line.
+    offset: isize,
+}
+
 impl View {
     pub fn new(doc: Document, base: PathBuf, images: Images) -> Self {
         let mut view = View {
@@ -49,12 +60,14 @@ impl View {
         view
     }
 
-    /// Show a new version of the document, keeping the same line number at the
-    /// top of the view. Images it no longer has are deleted on the next flush.
+    /// Show a new version of the document, keeping the block at the top of the
+    /// view in place, or the same line number when that block is gone. Images
+    /// it no longer has are deleted on the next flush.
     pub fn reload(&mut self, doc: Document) {
+        let anchor = self.anchor();
         self.doc = doc;
         self.want_images();
-        self.relayout();
+        self.relayout(anchor);
     }
 
     fn want_images(&mut self) {
@@ -63,11 +76,44 @@ impl View {
         self.images.want(wanted);
     }
 
-    fn relayout(&mut self) {
+    fn relayout(&mut self, anchor: Option<Anchor>) {
         if self.width > 0 {
             self.layout = render(&self.doc, self.width, &self.images);
+            if let Some(row) = anchor.and_then(|a| self.find(&a)) {
+                self.scroll = row;
+            }
         }
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// What to keep at the top of the view. A view at the very top stays there.
+    fn anchor(&self) -> Option<Anchor> {
+        if self.scroll == 0 {
+            return None;
+        }
+        let (index, offset) = self.layout.anchor(self.scroll)?;
+        let span = self.layout.blocks[index].span.clone();
+        Some(Anchor {
+            index,
+            text: self.doc.source.get(span)?.to_string(),
+            offset,
+        })
+    }
+
+    /// The top line that puts `anchor` back where it was: the same offset into
+    /// the block with the same markdown nearest its old place. A block that
+    /// got shorter keeps the view on its last line.
+    fn find(&self, anchor: &Anchor) -> Option<usize> {
+        let source = &self.doc.source;
+        let (_, b) = self
+            .layout
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| source.get(b.span.clone()) == Some(anchor.text.as_str()))
+            .min_by_key(|(i, _)| i.abs_diff(anchor.index))?;
+        let last = b.rows.len().saturating_sub(1) as isize;
+        Some(b.rows.start.saturating_add_signed(anchor.offset.min(last)))
     }
 
     /// Take in images that became ready. Returns true when the view changed.
@@ -75,7 +121,9 @@ impl View {
         if !self.images.receive() {
             return false;
         }
-        self.relayout();
+        // The layout is still the one on screen, so the anchor comes from it.
+        let anchor = self.anchor();
+        self.relayout(anchor);
         true
     }
 
@@ -404,6 +452,80 @@ mod tests {
         v.flush_images(&mut out).unwrap();
         assert_eq!(commands(out), vec![format!("\x1b_Ga=d,d=I,i={a},q=2")]);
         assert_eq!(v.layout.placements()[0].id, b);
+    }
+
+    #[test]
+    fn reload_keeps_the_top_block_in_place() {
+        let mut v = view(10);
+        press(&mut v, KeyCode::PageDown);
+        assert_eq!(top(&v), "");
+        press(&mut v, KeyCode::Down);
+        assert_eq!(top(&v), "line 3");
+        // Two paragraphs added above move the view down with its block.
+        let md: String = (0..10).map(|n| format!("line {n}\n\n")).collect();
+        v.reload(parse(&format!("new\n\nnew\n\n{md}")));
+        assert_eq!(v.scroll, 10);
+        assert_eq!(top(&v), "line 3");
+        // A view at the top stays there when lines are added above.
+        press(&mut v, KeyCode::Char('g'));
+        v.reload(parse(&format!("more\n\n{md}")));
+        assert_eq!(v.scroll, 0);
+    }
+
+    /// The text of the top line of the view.
+    fn top(v: &View) -> String {
+        v.layout.lines[v.scroll].to_string()
+    }
+
+    /// A 20x5 view of `md` read from a fresh directory holding `a.png`, an
+    /// image 5 rows tall, with the view scrolled `down` lines before the image
+    /// arrives.
+    fn arriving(name: &str, md: &str, down: usize) -> View {
+        use crate::images::tests::png;
+        let dir = std::env::temp_dir().join(format!("smd-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
+        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        v.resize(20, 5);
+        v.scroll_by(down as isize);
+        assert_eq!(v.scroll, down);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !v.receive_images() {
+            assert!(Instant::now() < deadline, "image not ready");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        v
+    }
+
+    fn paragraphs(n: usize) -> String {
+        (0..n).map(|n| format!("line {n}\n\n")).collect()
+    }
+
+    #[test]
+    fn an_image_arriving_above_the_view_keeps_the_top_line() {
+        // As text the image is one line, so "line 1" is on line 6.
+        let md = format!("top\n\n![a](a.png)\n\n{}", paragraphs(10));
+        let v = arriving("above", &md, 6);
+        assert_eq!(v.layout.blocks[1].rows, 2..7);
+        assert_eq!(v.scroll, 10);
+        assert_eq!(top(&v), "line 1");
+    }
+
+    #[test]
+    fn an_image_arriving_below_the_view_keeps_the_top_line() {
+        let md = format!("{}![a](a.png)\n", paragraphs(10));
+        let v = arriving("below", &md, 2);
+        assert_eq!(v.scroll, 2);
+        assert_eq!(top(&v), "line 1");
+    }
+
+    #[test]
+    fn a_view_at_the_top_stays_there_when_an_image_arrives() {
+        let v = arriving("top", &format!("![a](a.png)\n\n{}", paragraphs(10)), 0);
+        assert_eq!(v.scroll, 0);
+        assert_eq!(v.layout.blocks[0].rows, 0..5);
     }
 
     #[test]

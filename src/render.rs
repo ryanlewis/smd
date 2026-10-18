@@ -45,6 +45,22 @@ impl Layout {
         }
         out
     }
+
+    /// The block to keep in place when `row` is the top line of the view, as
+    /// its index in `blocks` and the row's offset from the block's first line.
+    /// That is the innermost block holding the row, or the next block when the
+    /// row falls between blocks, giving a negative offset.
+    pub fn anchor(&self, row: usize) -> Option<(usize, isize)> {
+        let (index, b) = match self.blocks.iter().rposition(|b| b.rows.contains(&row)) {
+            Some(i) => (i, &self.blocks[i]),
+            None => self
+                .blocks
+                .iter()
+                .enumerate()
+                .find(|(_, b)| b.rows.start > row)?,
+        };
+        Some((index, row as isize - b.rows.start as isize))
+    }
 }
 
 struct Ctx<'a> {
@@ -605,6 +621,21 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn anchor_is_the_innermost_block_or_the_next_one() {
+        // A quote (block 0) holding two paragraphs (1 and 2), then one more.
+        let layout = render(&parse("> one\n>\n> two\n\nthree\n"), 20, &no_images());
+        let rows: Vec<_> = layout.blocks.iter().map(|b| b.rows.clone()).collect();
+        assert_eq!(rows, vec![0..3, 0..1, 2..3, 4..5]);
+        assert_eq!(layout.anchor(0), Some((1, 0)));
+        // Inside the quote but between its paragraphs.
+        assert_eq!(layout.anchor(1), Some((0, 1)));
+        assert_eq!(layout.anchor(2), Some((2, 0)));
+        // Between blocks.
+        assert_eq!(layout.anchor(3), Some((3, -1)));
+        assert_eq!(layout.anchor(5), None);
     }
 
     #[test]

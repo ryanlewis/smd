@@ -15,7 +15,8 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::doc::{Block, BlockKind, FigureKind};
-use crate::{kitty, maths, mermaid, theme};
+use crate::theme::{self, Theme};
+use crate::{kitty, maths, mermaid, table};
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -259,6 +260,10 @@ pub fn key(block: &Block) -> Option<Key> {
             "mermaid:{}",
             mermaid::name(source, theme::current())
         ))),
+        BlockKind::Figure {
+            kind: FigureKind::Table,
+            source,
+        } => Some(table_key(source, theme::current())),
         _ => None,
     }
 }
@@ -288,9 +293,21 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
             kind: FigureKind::Mermaid,
             source,
         } => mermaid::job(source.clone(), theme::current()),
+        BlockKind::Figure {
+            kind: FigureKind::Table,
+            source,
+        } => {
+            let (source, theme) = (source.clone(), theme::current());
+            Box::new(move || table::image(&source, theme))
+        }
         _ => return None,
     };
     Some((key, job))
+}
+
+/// A table's image depends on its source and the theme, never on the width.
+fn table_key(source: &str, theme: Theme) -> Key {
+    Key(format!("table:{}:{source}", theme.name()))
 }
 
 /// Every image the blocks, and the blocks inside them, are drawn as.
@@ -444,6 +461,19 @@ pub mod tests {
         assert_eq!(rows, kitty::MAX_CELLS);
         assert!((1..=80).contains(&cols));
         assert_eq!(fit((100_000, 100), (10, 20), 1000).0, kitty::MAX_CELLS);
+    }
+
+    #[test]
+    fn a_table_is_keyed_on_its_source_and_theme() {
+        let doc = parse("| a |\n|---|\n| 1 |\n");
+        assert_eq!(
+            key(&doc.blocks[0]),
+            Some(table_key("| a |\n|---|\n| 1 |", Theme::Dark))
+        );
+        assert_ne!(
+            table_key("| a |", Theme::Dark),
+            table_key("| a |", Theme::Light)
+        );
     }
 
     #[test]

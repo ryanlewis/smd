@@ -2,6 +2,8 @@ mod app;
 mod doc;
 mod render;
 
+use std::ffi::OsString;
+use std::path::Path;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -11,7 +13,7 @@ fn version_line() -> String {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("{}", version_line());
         return ExitCode::SUCCESS;
@@ -23,7 +25,7 @@ fn main() -> ExitCode {
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(err) => {
-            eprintln!("smd: {path}: {err}");
+            eprintln!("smd: {}: {err}", Path::new(path).display());
             return ExitCode::FAILURE;
         }
     };

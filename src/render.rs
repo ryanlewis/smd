@@ -166,8 +166,8 @@ fn units(content: &[Inline], base: Style) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut word: Vec<(String, Style)> = Vec::new();
     for inline in content {
-        let (text, style) = match inline {
-            Inline::Text { text, style } => (text, inline_style(base, style)),
+        let (text, code, style) = match inline {
+            Inline::Text { text, style } => (text, style.code, inline_style(base, style)),
             Inline::Break => {
                 if !word.is_empty() {
                     units.push(Unit::Word(std::mem::take(&mut word)));
@@ -177,7 +177,8 @@ fn units(content: &[Inline], base: Style) -> Vec<Unit> {
             }
         };
         for c in text.chars() {
-            if c.is_whitespace() {
+            // Code keeps its spaces and is not broken at them.
+            if c.is_whitespace() && !code {
                 if !word.is_empty() {
                     units.push(Unit::Word(std::mem::take(&mut word)));
                 }
@@ -453,6 +454,11 @@ mod tests {
             plain("```\nlet x = 1;\n\tindented\n```\n", 8),
             vec!["let x = ", "1;", "    inde", "nted"]
         );
+    }
+
+    #[test]
+    fn inline_code_keeps_its_spaces() {
+        assert_eq!(plain("run `a  b c` now\n", 8), vec!["run", "a  b c", "now"]);
     }
 
     #[test]

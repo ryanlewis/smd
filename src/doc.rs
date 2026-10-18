@@ -263,8 +263,12 @@ impl<'a> Builder<'a> {
                     math: true,
                     ..self.style()
                 };
+                // Display maths alone does not make a paragraph prose.
+                let other = self.top().other_inline;
                 self.text(&format!("$${math}$$"), style, range);
-                self.top().display_math.push(math.trim().to_string());
+                let top = self.top();
+                top.other_inline = other;
+                top.display_math.push(math.trim().to_string());
             }
             Event::FootnoteReference(label) => {
                 self.text(&format!("[^{label}]"), self.style(), range);
@@ -310,7 +314,7 @@ impl<'a> Builder<'a> {
             },
             Tag::Item => FrameKind::Item { task: None },
             Tag::Table(_) => {
-                let source = self.source[range.clone()].trim_end().to_string();
+                let source = table_source(self.source, range.clone());
                 self.push_block(
                     BlockKind::Figure {
                         kind: FigureKind::Table,
@@ -450,7 +454,7 @@ impl<'a> Builder<'a> {
             return;
         }
         let top = self.top();
-        if !text.trim().is_empty() && !style.math {
+        if !text.trim().is_empty() {
             top.other_inline = true;
         }
         if let Some(Inline::Text {
@@ -474,6 +478,27 @@ impl<'a> Builder<'a> {
         top.inlines.push(inline);
         extend_span(&mut top.inline_span, range);
     }
+}
+
+/// A table's markdown without the quote markers or list indent that sit in
+/// front of every line after the first, and with plain line endings.
+fn table_source(source: &str, range: Range<usize>) -> String {
+    let line_start = source[..range.start].rfind('\n').map_or(0, |i| i + 1);
+    let column = source[line_start..range.start].chars().count();
+    let mut lines = source[range].trim_end().lines();
+    let mut out = lines.next().unwrap_or("").to_string();
+    for line in lines {
+        let mut rest = line;
+        for _ in 0..column {
+            match rest.strip_prefix([' ', '\t', '>']) {
+                Some(r) => rest = r,
+                None => break,
+            }
+        }
+        out.push('\n');
+        out.push_str(rest);
+    }
+    out
 }
 
 fn extend_span(span: &mut Option<Range<usize>>, range: Range<usize>) {
@@ -703,6 +728,42 @@ mod tests {
             doc.blocks[1].kind,
             BlockKind::Paragraph(vec![text("after")])
         );
+    }
+
+    #[test]
+    fn table_in_a_quote_or_list_loses_its_markers() {
+        let figure = |md: &str| {
+            let doc = parse(md);
+            let blocks = match &doc.blocks[0].kind {
+                BlockKind::Quote(blocks) => blocks.clone(),
+                BlockKind::List { items, .. } => items[0].blocks.clone(),
+                other => panic!("unexpected {other:?}"),
+            };
+            blocks[0].kind.clone()
+        };
+        let table = BlockKind::Figure {
+            kind: FigureKind::Table,
+            source: "| a |\n|---|\n| 1 |".into(),
+        };
+        assert_eq!(figure("> | a |\n> |---|\n> | 1 |\n"), table);
+        assert_eq!(figure("- | a |\n  |---|\n  | 1 |\n"), table);
+    }
+
+    #[test]
+    fn table_source_drops_carriage_returns() {
+        assert_eq!(
+            kinds("| a |\r\n|---|\r\n| 1 |\r\n"),
+            vec![BlockKind::Figure {
+                kind: FigureKind::Table,
+                source: "| a |\n|---|\n| 1 |".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn display_maths_with_inline_maths_stays_a_paragraph() {
+        let blocks = kinds("$$y$$ $x$\n");
+        assert!(matches!(&blocks[0], BlockKind::Paragraph(_)), "{blocks:?}");
     }
 
     #[test]

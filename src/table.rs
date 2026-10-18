@@ -35,6 +35,8 @@ impl Table {
         let mut aligns = Vec::new();
         let mut rows: Vec<Vec<Cell>> = Vec::new();
         let mut style = InlineStyle::default();
+        // How deep in emphasis, strong and strikethrough spans, which nest.
+        let mut depth = [0u32; 3];
         for event in Parser::new_ext(source, options) {
             let (text, style) = match event {
                 Event::Start(Tag::Table(a)) => {
@@ -52,15 +54,15 @@ impl Table {
                     continue;
                 }
                 Event::Start(Tag::Emphasis) | Event::End(TagEnd::Emphasis) => {
-                    style.emphasis = matches!(event, Event::Start(_));
+                    style.emphasis = nest(&mut depth[0], &event);
                     continue;
                 }
                 Event::Start(Tag::Strong) | Event::End(TagEnd::Strong) => {
-                    style.strong = matches!(event, Event::Start(_));
+                    style.strong = nest(&mut depth[1], &event);
                     continue;
                 }
                 Event::Start(Tag::Strikethrough) | Event::End(TagEnd::Strikethrough) => {
-                    style.strikethrough = matches!(event, Event::Start(_));
+                    style.strikethrough = nest(&mut depth[2], &event);
                     continue;
                 }
                 Event::Start(Tag::Link { dest_url, .. }) => {
@@ -167,6 +169,16 @@ impl Table {
     }
 }
 
+/// Go in or out of a span that nests. Returns whether still inside one.
+fn nest(depth: &mut u32, event: &Event) -> bool {
+    if matches!(event, Event::Start(_)) {
+        *depth += 1;
+    } else {
+        *depth = depth.saturating_sub(1);
+    }
+    *depth > 0
+}
+
 fn text_width(cell: &Cell) -> usize {
     cell.iter().map(|(text, _)| text.width()).sum()
 }
@@ -223,6 +235,12 @@ pub fn image(source: &str, theme: Theme) -> Result<Png, String> {
 fn draw(source: &str, theme: Theme) -> Result<Canvas, String> {
     let table = Table::parse(source);
     let fonts = raster::fonts()?;
+    // A character the font cannot draw would be a box; cut text is better.
+    let chars = table.rows.iter().flatten().flatten();
+    let mut chars = chars.flat_map(|(text, _)| text.chars());
+    if let Some(c) = chars.find(|&c| !c.is_whitespace() && fonts.regular.glyph_id(c).0 == 0) {
+        return Err(format!("no glyph for {c:?}"));
+    }
     let palette = match theme {
         Theme::Dark => &DARK,
         Theme::Light => &LIGHT,
@@ -403,6 +421,16 @@ mod tests {
     }
 
     #[test]
+    fn nested_spans_keep_the_outer_style() {
+        let table = Table::parse("| *a _b_ c* |\n|---|");
+        let emphasis = InlineStyle {
+            emphasis: true,
+            ..InlineStyle::default()
+        };
+        assert_eq!(table.rows[0][0], vec![("a b c".to_string(), emphasis)]);
+    }
+
+    #[test]
     fn the_header_is_bold() {
         let table = Table::parse("| h |\n|---|\n| b |");
         let lines = table.text(|base, _| base);
@@ -423,5 +451,7 @@ mod tests {
         assert!(three.0 > one.0 && three.1 == one.1, "{one:?} {three:?}");
         assert!(taller.1 > one.1 && taller.0 == one.0, "{one:?} {taller:?}");
         assert!(image("| a |\n|---|\n| 1 |", Theme::Light).is_ok());
+        // A character the font lacks keeps the table as text.
+        assert!(draw("| a \u{F0000} |\n|---|", Theme::Dark).is_err());
     }
 }

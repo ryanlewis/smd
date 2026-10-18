@@ -8,7 +8,6 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle};
-use crate::heading;
 use crate::images::{self, Images, Placement};
 use crate::kitty;
 use crate::table::Table;
@@ -149,10 +148,7 @@ fn placement(
         return None;
     }
     let ready = ctx.images.ready(&key)?;
-    let fitted = match block.kind {
-        BlockKind::Heading { .. } => heading::fit(ready.px, ctx.images.cell(), avail)?,
-        _ => images::fit(ready.px, ctx.images.cell(), avail),
-    };
+    let fitted = images::fit(ready.px, ctx.images.cell(), avail)?;
     let size = *ctx.sizes.entry(ready.id).or_insert(fitted);
     // Shown at a different size elsewhere: keep this one as text.
     if size != fitted {
@@ -772,8 +768,8 @@ mod tests {
         // 16 columns do not fit in 15: the image is fitted to the width.
         let narrow = render(&parse(md), 15, &images);
         let p = narrow.placements();
-        assert_eq!((p[0].cols, p[0].rows), (15, 2));
-        assert_eq!(narrow.lines.len(), 2);
+        assert_eq!((p[0].cols, p[0].rows), (14, 1));
+        assert_eq!(narrow.lines.len(), 1);
     }
 
     /// Images with `src` ready, each `px` pixels, in a store with 10x20 cells.
@@ -904,7 +900,7 @@ mod tests {
     #[test]
     fn one_image_shown_at_two_sizes_keeps_the_second_as_text() {
         let images = ready(&[("wide.png", (1000, 100))]);
-        let layout = render(&parse("![w](wide.png)\n\n> ![w](wide.png)\n"), 30, &images);
+        let layout = render(&parse("![w](wide.png)\n\n> ![w](wide.png)\n"), 41, &images);
         assert_eq!(layout.placements().len(), 1);
         assert_eq!(layout.lines.last().unwrap().to_string(), "│ [image: w]");
     }

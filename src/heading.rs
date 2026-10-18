@@ -7,7 +7,7 @@
 //!
 //! Each level is drawn at a fixed height in whole cell rows, so the image does
 //! not change when the pane is resized. A heading wider than the pane is
-//! shrunk to fit by whole rows (see [`fit`]); one that cannot shrink to a row
+//! shrunk to fit by whole rows (see [`images::fit`](crate::images::fit)); one that cannot shrink to a row
 //! is shown as text instead.
 
 use std::sync::OnceLock;
@@ -152,27 +152,6 @@ pub fn job(level: u8, content: &[Inline], theme: Theme) -> Job {
             .and_then(|canvas| canvas.png())
             .map_err(|e| format!("heading: {e}"))
     })
-}
-
-/// Cells to show a heading image of `px` pixels in at most `max_cols`
-/// columns, or `None` when it would be less than a row tall.
-///
-/// Unlike [`images::fit`](crate::images::fit), a shrunken heading drops whole
-/// rows and narrows to match: Ghostty stretches an image to fill its cells, so
-/// rounding the rows up would squash the text sideways.
-pub fn fit(px: (u32, u32), cell: (u16, u16), max_cols: u16) -> Option<(u16, u16)> {
-    let (cw, ch) = (u32::from(cell.0.max(1)), u32::from(cell.1.max(1)));
-    let cols = px.0.div_ceil(cw).max(1);
-    let rows = px.1.div_ceil(ch).max(1);
-    let max_cols = u32::from(max_cols);
-    if cols <= max_cols {
-        return Some((cols as u16, rows as u16));
-    }
-    let shrunk = rows * max_cols / cols;
-    if shrunk == 0 {
-        return None;
-    }
-    Some(((cols * shrunk).div_ceil(rows) as u16, shrunk as u16))
 }
 
 /// Text and code colours for a level, close to the text-mode styles. Code
@@ -332,20 +311,6 @@ mod tests {
             named("# *Title*\n", Theme::Dark)
         );
         assert_eq!(name(1, &[], Theme::Dark), None);
-    }
-
-    #[test]
-    fn fit_shrinks_by_whole_rows_keeping_shape() {
-        let cell = (10, 20);
-        // 40 by 3 cells, at natural size when there is room.
-        assert_eq!(fit((400, 60), cell, 80), Some((40, 3)));
-        assert_eq!(fit((400, 60), cell, 40), Some((40, 3)));
-        // Narrower: two rows need 27 columns, one row 14.
-        assert_eq!(fit((400, 60), cell, 39), Some((27, 2)));
-        assert_eq!(fit((400, 60), cell, 26), Some((14, 1)));
-        // Less than a row tall: shown as text.
-        assert_eq!(fit((400, 60), cell, 13), None);
-        assert_eq!(fit((400, 20), cell, 39), None);
     }
 
     fn drawn(md: &str, cell: (u16, u16), theme: Theme) -> Canvas {

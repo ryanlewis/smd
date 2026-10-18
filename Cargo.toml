@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libc = "=0.2.191"
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 unicode-width = "=0.2.2"
 
 [dev-dependencies]
 font8x8 = "=0.3.1"
-libc = "=0.2.191"

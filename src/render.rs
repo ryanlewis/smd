@@ -47,6 +47,8 @@ impl Layout {
 }
 
 struct Ctx<'a> {
+    /// The markdown the blocks' spans point into.
+    source: &'a str,
     images: &'a Images,
     layout: Layout,
     /// The size each image was given where it first appeared. One image has
@@ -58,6 +60,7 @@ struct Ctx<'a> {
 /// image is ready in `images` are drawn as placeholder cells.
 pub fn render(doc: &Document, width: u16, images: &Images) -> Layout {
     let mut ctx = Ctx {
+        source: &doc.source,
         images,
         layout: Layout::default(),
         sizes: HashMap::new(),
@@ -183,7 +186,13 @@ fn contents(
             preformatted(source, CODE, width, first, rest, out);
         }
         BlockKind::Image { src, alt } if !ctx.images.graphics() => {
-            preformatted(&format!("![{alt}]({src})"), CODE, width, first, rest, out);
+            // As written, unless it spans lines, which in a quote or list
+            // would bring their markers along.
+            let text = match ctx.source.get(block.span.clone()).map(str::trim) {
+                Some(text) if !text.contains('\n') => text.to_string(),
+                _ => format!("![{alt}]({src})"),
+            };
+            preformatted(&text, CODE, width, first, rest, out);
         }
         BlockKind::Figure { kind, source } => {
             let table = (*kind == FigureKind::Table).then(|| Table::parse(source));
@@ -788,6 +797,13 @@ mod tests {
         assert_eq!(text, vec!["| a | ", "b |", "|---|-", "--|"]);
         assert_eq!(wide.lines[0].spans[0].style, CODE);
         assert!(layout.placements().is_empty());
+        // The image is shown as written, not rebuilt from its parts.
+        let md = "> ![a \\] b](<my diagram.png> \"Title\")\n";
+        let layout = render(&parse(md), 60, &Images::text());
+        assert_eq!(
+            layout.lines[0].to_string(),
+            "│ ![a \\] b](<my diagram.png> \"Title\")"
+        );
     }
 
     #[test]

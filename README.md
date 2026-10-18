@@ -15,4 +15,4 @@ Scroll with `j`/`k`, the arrow keys, PgUp/PgDn and `g`/`G`. Press `q` to quit.
 
 smd reloads the file when it changes on disk, including when an editor saves by renaming a new file over it. If the file is deleted, smd keeps showing the last version and says so on the bottom row.
 
-A paragraph that holds only a local PNG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder. This needs a terminal with kitty Unicode-placeholder support; it has been tested in Ghostty, directly and inside herdr.
+A paragraph that holds only a local PNG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder. This needs a terminal with kitty Unicode-placeholder support; it has been tested in Ghostty, directly and inside herdr. smd asks the terminal at start-up; in a terminal without kitty graphics, or with `--no-graphics`, images, diagrams, maths and tables are shown as their markdown source.

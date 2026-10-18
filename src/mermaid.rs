@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -90,8 +91,13 @@ fn run(program: &str, source: &str, theme: Theme) -> Result<Vec<u8>, String> {
     };
     let stdout = reader(Box::new(child.stdout.take().expect("piped")));
     let stderr = reader(Box::new(child.stderr.take().expect("piped")));
+    // Written on its own thread too, so a mmdc that never reads its input
+    // still runs into the timeout below.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(source.as_bytes());
+        let source = source.to_owned();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(source.as_bytes());
+        });
     }
     let deadline = Instant::now() + TIMEOUT;
     let status = loop {
@@ -131,12 +137,15 @@ fn error_line(stderr: &str) -> Option<String> {
 }
 
 /// Write the PNG under a temporary name, then move it into place, so a
-/// reader never sees half a file.
+/// reader never sees half a file. The name is unique to this write, as two
+/// jobs for the same diagram can finish together.
 fn store(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension(format!("png.{}.tmp", std::process::id()));
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("png.{}.{n}.tmp", std::process::id()));
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);

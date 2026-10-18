@@ -180,9 +180,12 @@ fn contents(
             let error = images::key(block).and_then(|key| ctx.images.error(&key));
             let first = match error {
                 Some(error) => {
-                    let note = format!("{error}; showing the source");
+                    let note = Inline::Text {
+                        text: format!("{error}; showing the source"),
+                        style: InlineStyle::default(),
+                    };
                     let dim = Style::new().add_modifier(Modifier::DIM);
-                    emit(first, vec![Span::styled(note, dim)], out);
+                    wrap(&[note], dim, width, first, rest, out);
                     rest
                 }
                 None => first,
@@ -732,6 +735,16 @@ mod tests {
         assert_eq!(
             lines,
             vec!["│ mermaid: boom; showing the source", "│ graph LR"]
+        );
+        // A narrow pane wraps the note rather than cutting it off.
+        let narrow: Vec<String> = render(&doc, 20, &images)
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            narrow,
+            vec!["│ mermaid: boom;", "│ showing the source", "│ graph LR"]
         );
     }
 }

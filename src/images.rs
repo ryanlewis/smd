@@ -461,22 +461,25 @@ fn load(path: &Path) -> Result<Png, String> {
 /// Cells to show an image of `px` pixels at its natural size, shrunk to at
 /// most `max_cols` columns, keeping its shape. A placeholder can address at
 /// most [`kitty::MAX_CELLS`] rows and columns.
-pub fn fit(px: (u32, u32), cell: (u16, u16), max_cols: u16) -> (u16, u16) {
+///
+/// Ghostty stretches an image to fill its cells, so a shrunken image takes
+/// whole rows first and the columns from them: rounding the rows up would
+/// squash it sideways. `None` when it would be less than a row tall.
+pub fn fit(px: (u32, u32), cell: (u16, u16), max_cols: u16) -> Option<(u16, u16)> {
     let (cw, ch) = (u64::from(cell.0.max(1)), u64::from(cell.1.max(1)));
     let (w, h) = (u64::from(px.0.max(1)), u64::from(px.1.max(1)));
     let limit = u64::from(kitty::MAX_CELLS);
     let max_cols = u64::from(max_cols).clamp(1, limit);
     let mut cols = w.div_ceil(cw);
     let mut rows = h.div_ceil(ch);
-    if cols > max_cols {
-        cols = max_cols;
-        rows = (h * cols * cw).div_ceil(w * ch);
+    if cols > max_cols || rows > limit {
+        rows = (h * max_cols * cw / (w * ch)).min(rows).min(limit);
+        if rows == 0 {
+            return None;
+        }
+        cols = (w * rows * ch).div_ceil(h * cw).clamp(1, max_cols);
     }
-    if rows > limit {
-        rows = limit;
-        cols = (w * rows * ch).div_ceil(h * cw);
-    }
-    (cols.clamp(1, max_cols) as u16, rows.clamp(1, limit) as u16)
+    Some((cols as u16, rows as u16))
 }
 
 #[cfg(test)]
@@ -538,24 +541,68 @@ pub mod tests {
 
     #[test]
     fn fit_keeps_small_images_at_natural_size() {
-        assert_eq!(fit((160, 32), (8, 16), 80), (20, 2));
+        assert_eq!(fit((160, 32), (8, 16), 80), Some((20, 2)));
         // Part cells round up.
-        assert_eq!(fit((161, 33), (8, 16), 80), (21, 3));
+        assert_eq!(fit((161, 33), (8, 16), 80), Some((21, 3)));
     }
 
     #[test]
     fn fit_shrinks_wide_images_to_the_width_keeping_shape() {
-        assert_eq!(fit((1600, 320), (8, 16), 100), (100, 10));
-        assert_eq!(fit((1568, 224), (17, 34), 40), (40, 3));
-        assert_eq!(fit((1000, 10), (10, 20), 0), (1, 1));
+        assert_eq!(fit((1600, 320), (8, 16), 100), Some((100, 10)));
+        // 2.86 rows at 40 columns: two whole rows, and 28 columns to match.
+        assert_eq!(fit((1568, 224), (17, 34), 40), Some((28, 2)));
+    }
+
+    /// The shown width over height, against the image's, in cells.
+    fn shape_error(px: (u32, u32), cell: (u16, u16), size: (u16, u16)) -> f64 {
+        let want = f64::from(px.0) / f64::from(px.1) * f64::from(cell.1) / f64::from(cell.0);
+        (f64::from(size.0) - want * f64::from(size.1)).abs()
+    }
+
+    #[test]
+    fn fit_keeps_a_wide_short_image_in_shape_at_one_to_three_rows() {
+        let cell = (10, 20);
+        // 134 by 4 cells, like a long heading.
+        let px = (1340, 80);
+        for (max_cols, want) in [(110, (101, 3)), (84, (67, 2)), (60, (34, 1))] {
+            let size = fit(px, cell, max_cols).unwrap();
+            assert_eq!(size, want, "in {max_cols} columns");
+            assert!(shape_error(px, cell, size) < 1.0, "{size:?}");
+        }
+        // Less than a row tall in 33 columns.
+        assert_eq!(fit(px, cell, 33), None);
+        assert_eq!(fit((1000, 10), cell, 0), None);
+    }
+
+    #[test]
+    fn fit_keeps_every_shrunken_image_in_shape() {
+        let cell = (9, 19);
+        for w in (50u32..3000).step_by(37) {
+            for h in (10..400).step_by(13) {
+                // Only shrunken images: at natural size part cells round up.
+                for max_cols in [1, 7, 20, 40, 84, 200] {
+                    if w.div_ceil(9) <= u32::from(max_cols) {
+                        continue;
+                    }
+                    if let Some(size) = fit((w, h), cell, max_cols) {
+                        assert!(size.0 <= max_cols, "{w}x{h} in {max_cols}: {size:?}");
+                        assert!(shape_error((w, h), cell, size) < 1.0, "{w}x{h}: {size:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn fit_stays_within_the_placeholder_limit() {
-        let (cols, rows) = fit((100, 100_000), (10, 20), 80);
+        let (cols, rows) = fit((100, 100_000), (10, 20), 80).unwrap();
         assert_eq!(rows, kitty::MAX_CELLS);
         assert!((1..=80).contains(&cols));
-        assert_eq!(fit((100_000, 100), (10, 20), 1000).0, kitty::MAX_CELLS);
+        // As wide as a placeholder allows is still less than a row tall.
+        assert_eq!(fit((100_000, 100), (10, 20), 1000), None);
+        let (cols, rows) = fit((10_000, 1000), (10, 20), 1000).unwrap();
+        assert_eq!((cols, rows), (280, 14));
+        assert!(cols <= kitty::MAX_CELLS);
     }
 
     #[test]

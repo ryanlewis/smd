@@ -20,14 +20,22 @@ fn version_line() -> String {
     format!("smd {VERSION}")
 }
 
+/// Remove every `flag` from `args`, returning whether there was one.
+fn take_flag(args: &mut Vec<OsString>, flag: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != flag);
+    args.len() != before
+}
+
 fn main() -> ExitCode {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("{}", version_line());
         return ExitCode::SUCCESS;
     }
+    let no_graphics = take_flag(&mut args, "--no-graphics");
     let [path] = args.as_slice() else {
-        eprintln!("usage: smd <file.md>");
+        eprintln!("usage: smd [--no-graphics] <file.md>");
         return ExitCode::from(2);
     };
     let watcher = watch::Watcher::new(path.into());
@@ -44,10 +52,13 @@ fn main() -> ExitCode {
         _ => ".".into(),
     };
     // Asked before the terminal is set up, while nothing else reads its replies.
-    let probe = kitty::probe();
+    let probe = (!no_graphics).then(kitty::probe);
     // Images are drawn for a dark background unless the terminal says otherwise.
-    theme::set(probe.theme.unwrap_or(theme::Theme::Dark));
-    let images = images::Images::new(probe.cell);
+    theme::set(probe.and_then(|p| p.theme).unwrap_or(theme::Theme::Dark));
+    let images = match probe {
+        Some(probe) if probe.graphics => images::Images::new(probe.cell),
+        _ => images::Images::text(),
+    };
     let view = app::View::new(doc::parse(&source), base, images);
 
     let mut terminal = match ratatui::try_init() {
@@ -75,5 +86,15 @@ mod tests {
     #[test]
     fn version_line_has_name_and_version() {
         assert_eq!(version_line(), format!("smd {}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn take_flag_removes_the_flag_wherever_it_is() {
+        let mut args: Vec<OsString> = vec!["--no-graphics".into(), "a.md".into()];
+        assert!(take_flag(&mut args, "--no-graphics"));
+        assert_eq!(args, vec![OsString::from("a.md")]);
+        let mut args: Vec<OsString> = vec!["a.md".into()];
+        assert!(!take_flag(&mut args, "--no-graphics"));
+        assert_eq!(args.len(), 1);
     }
 }

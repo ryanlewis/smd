@@ -15,8 +15,8 @@ use crate::doc::{self, Document};
 use crate::render::render;
 use crate::watch::{Change, Watcher};
 
-/// How often to look at the file on disk.
-const CHECK_EVERY: Duration = Duration::from_millis(250);
+/// How often to look at the file on disk. A change shows after two checks.
+const CHECK_EVERY: Duration = Duration::from_millis(150);
 
 pub struct View {
     doc: Document,
@@ -41,7 +41,8 @@ impl View {
         }
     }
 
-    /// Show a new version of the document, keeping the same top line in view.
+    /// Show a new version of the document, keeping the same line number at the
+    /// top of the view.
     pub fn reload(&mut self, doc: Document) {
         self.doc = doc;
         if self.width > 0 {

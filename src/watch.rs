@@ -5,7 +5,7 @@
 
 use std::fs::Metadata;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// What changed since the last check.
@@ -39,8 +39,8 @@ impl Stamp {
     }
 }
 
-/// Last thing seen at the path.
-#[derive(Debug, PartialEq)]
+/// What is at the path.
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Seen {
     File(Stamp),
     Deleted,
@@ -49,48 +49,58 @@ enum Seen {
 
 pub struct Watcher {
     path: PathBuf,
+    /// What the caller was last told about.
     seen: Seen,
+    /// A new state seen on the last check, waiting for a second look.
+    pending: Option<Seen>,
 }
 
 impl Watcher {
     /// Start watching `path`. Create the watcher before reading the file, so
-    /// a save that lands in between is seen on the first check.
+    /// a save that lands in between is seen.
     pub fn new(path: PathBuf) -> Self {
-        let seen = match std::fs::metadata(&path) {
-            Ok(meta) => Seen::File(Stamp::of(&meta)),
-            Err(_) => Seen::Unreadable,
-        };
-        Watcher { path, seen }
+        let seen = Self::look(&path).0;
+        Watcher {
+            path,
+            seen,
+            pending: None,
+        }
+    }
+
+    fn look(path: &Path) -> (Seen, Option<String>) {
+        match std::fs::metadata(path) {
+            Ok(meta) => (Seen::File(Stamp::of(&meta)), None),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (Seen::Deleted, None),
+            Err(err) => (Seen::Unreadable, Some(err.to_string())),
+        }
     }
 
     /// Look at the file again. Returns `None` when nothing has changed.
+    ///
+    /// A change is reported only once two checks in a row agree on it, so a
+    /// save that truncates and then writes is not caught half-written.
     pub fn check(&mut self) -> Option<Change> {
-        let meta = match std::fs::metadata(&self.path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return self.update(Seen::Deleted, Change::Deleted);
-            }
-            Err(err) => return self.update(Seen::Unreadable, Change::Unreadable(err.to_string())),
-        };
-        let stamp = Stamp::of(&meta);
-        if self.seen == Seen::File(stamp) {
+        let (now, err) = Self::look(&self.path);
+        if now == self.seen {
+            self.pending = None;
             return None;
         }
-        // Record the stamp even if the read fails, so a file that stays
+        if self.pending != Some(now) {
+            self.pending = Some(now);
+            return None;
+        }
+        // Record the state even if the read fails, so a file that stays
         // unreadable is reported once rather than on every check.
-        self.seen = Seen::File(stamp);
-        Some(match std::fs::read_to_string(&self.path) {
-            Ok(source) => Change::Changed(source),
-            Err(err) => Change::Unreadable(err.to_string()),
+        self.pending = None;
+        self.seen = now;
+        Some(match now {
+            Seen::Deleted => Change::Deleted,
+            Seen::Unreadable => Change::Unreadable(err.unwrap_or_default()),
+            Seen::File(_) => match std::fs::read_to_string(&self.path) {
+                Ok(source) => Change::Changed(source),
+                Err(err) => Change::Unreadable(err.to_string()),
+            },
         })
-    }
-
-    fn update(&mut self, seen: Seen, change: Change) -> Option<Change> {
-        if self.seen == seen {
-            return None;
-        }
-        self.seen = seen;
-        Some(change)
     }
 }
 
@@ -117,6 +127,12 @@ mod tests {
         }
     }
 
+    /// Check twice, as the run loop does over two ticks.
+    fn settle(w: &mut Watcher) -> Option<Change> {
+        assert_eq!(w.check(), None);
+        w.check()
+    }
+
     #[test]
     fn nothing_changed() {
         let dir = Scratch::new("same");
@@ -133,7 +149,7 @@ mod tests {
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         fs::write(&path, "one\ntwo\n").unwrap();
-        assert_eq!(w.check(), Some(Change::Changed("one\ntwo\n".into())));
+        assert_eq!(settle(&mut w), Some(Change::Changed("one\ntwo\n".into())));
         assert_eq!(w.check(), None);
     }
 
@@ -148,7 +164,7 @@ mod tests {
         // tells the two files apart.
         fs::write(&tmp, "two\n").unwrap();
         fs::rename(&tmp, &path).unwrap();
-        assert_eq!(w.check(), Some(Change::Changed("two\n".into())));
+        assert_eq!(settle(&mut w), Some(Change::Changed("two\n".into())));
     }
 
     #[test]
@@ -158,10 +174,10 @@ mod tests {
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         fs::remove_file(&path).unwrap();
-        assert_eq!(w.check(), Some(Change::Deleted));
+        assert_eq!(settle(&mut w), Some(Change::Deleted));
         assert_eq!(w.check(), None);
         fs::write(&path, "back\n").unwrap();
-        assert_eq!(w.check(), Some(Change::Changed("back\n".into())));
+        assert_eq!(settle(&mut w), Some(Change::Changed("back\n".into())));
     }
 
     #[test]
@@ -171,7 +187,21 @@ mod tests {
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
-        assert!(matches!(w.check(), Some(Change::Unreadable(_))));
+        assert!(matches!(settle(&mut w), Some(Change::Unreadable(_))));
         assert_eq!(w.check(), None);
+    }
+
+    #[test]
+    fn half_written_save_is_not_reported() {
+        let dir = Scratch::new("truncate");
+        let path = dir.0.join("a.md");
+        fs::write(&path, "one\n").unwrap();
+        let mut w = Watcher::new(path.clone());
+        // Truncated, and seen once before the write lands.
+        fs::write(&path, "").unwrap();
+        assert_eq!(w.check(), None);
+        fs::write(&path, "one\ntwo\n").unwrap();
+        assert_eq!(w.check(), None);
+        assert_eq!(w.check(), Some(Change::Changed("one\ntwo\n".into())));
     }
 }

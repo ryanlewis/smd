@@ -7,6 +7,8 @@
 //! longer in the document is deleted from the terminal.
 //!
 //! Until an image is ready, or if making it fails, its block shows as text.
+//! A store made with [`Images::text`], for a terminal without kitty graphics,
+//! makes no images at all and sends the terminal nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
@@ -92,6 +94,8 @@ struct Entry {
 pub struct Images {
     /// Cell size in pixels, width then height.
     cell: (u16, u16),
+    /// False when the terminal has no kitty graphics: every block is text.
+    graphics: bool,
     entries: HashMap<Key, Entry>,
     next_id: u32,
     /// Uploaded images that left the document, to delete on the next flush.
@@ -105,6 +109,7 @@ impl Images {
         let (tx, rx) = channel();
         Images {
             cell: (cell.0.max(1), cell.1.max(1)),
+            graphics: true,
             entries: HashMap::new(),
             // Start at a random id, so another program's images in the same
             // terminal, or another smd's, are unlikely to share one.
@@ -117,13 +122,25 @@ impl Images {
         }
     }
 
+    /// A store that never makes an image, for text mode.
+    pub fn text() -> Self {
+        Images {
+            graphics: false,
+            ..Images::new((1, 1))
+        }
+    }
+
     pub fn cell(&self) -> (u16, u16) {
         self.cell
     }
 
+    pub fn graphics(&self) -> bool {
+        self.graphics
+    }
+
     /// Ask for the image `key`, made by `job` unless it is already known.
     pub fn request(&mut self, key: Key, job: Job) {
-        if self.entries.contains_key(&key) {
+        if !self.graphics || self.entries.contains_key(&key) {
             return;
         }
         let id = self.next_id;
@@ -624,6 +641,20 @@ pub mod tests {
         let mut images = Images::new((10, 20));
         images.request(file_key("a.png"), job(png(10, 20)));
         settle(&mut images);
+        let mut out = Vec::new();
+        images.flush(&mut out, &[]).unwrap();
+        images.delete_all(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn text_mode_makes_no_images_and_sends_nothing() {
+        let mut images = Images::text();
+        images.want(vec![(file_key("a.png"), job(png(10, 20)))]);
+        images.request(file_key("b.png"), job(png(10, 20)));
+        assert!(images.entries.is_empty());
+        assert!(!images.receive());
+        assert_eq!(images.ready(&file_key("a.png")), None);
         let mut out = Vec::new();
         images.flush(&mut out, &[]).unwrap();
         images.delete_all(&mut out).unwrap();

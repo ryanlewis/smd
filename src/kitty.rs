@@ -3,7 +3,8 @@
 //!
 //! Every command asks for no reply (`q=2`). Inside herdr the replies come from
 //! herdr rather than the outer terminal, and a reply that reached the key
-//! reader would be read as key presses.
+//! reader would be read as key presses. The one query, in [`probe`], is sent
+//! and answered before the key reader starts.
 
 mod diacritics;
 
@@ -102,6 +103,9 @@ const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
 /// Cell size used when the terminal reports none.
 const FALLBACK_CELL: (u16, u16) = (8, 16);
 
+/// The image id the graphics query asks about. A query stores nothing.
+const QUERY_ID: u32 = 31;
+
 /// What the terminal said about itself at start-up.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Probe {
@@ -109,13 +113,20 @@ pub struct Probe {
     pub cell: (u16, u16),
     /// Whether the background is dark or light, if the terminal said.
     pub theme: Option<Theme>,
+    /// The terminal answered the kitty graphics query.
+    pub graphics: bool,
 }
 
-/// Ask the terminal for its cell size with `CSI 16 t` and its background
-/// colour with `OSC 11`. The cell size falls back to the pixel size the tty
-/// reports. Call it before the key reader starts: it reads the replies from
-/// the terminal itself. A `CSI 5 n` sent after the queries only ends the wait
-/// early when the terminal does not know them.
+/// Ask the terminal for its background colour with `OSC 11`, its cell size
+/// with `CSI 16 t` and whether it knows the kitty graphics protocol.
+///
+/// The queries end with `CSI c` (DA1). Terminals answer in order, and nearly
+/// all answer DA1, so the DA1 reply ends the wait: a terminal that sends it
+/// without a graphics reply has no graphics. One that answers nothing is given
+/// up on after a short timeout. The cell size falls back to the pixel size the
+/// tty reports. The queries are sent on the alternate screen, which is left
+/// again before this returns. Call it before the key reader starts: it reads
+/// the replies from the terminal itself.
 pub fn probe() -> Probe {
     let reply = query().unwrap_or_default();
     Probe {
@@ -123,6 +134,7 @@ pub fn probe() -> Probe {
             .or_else(window_cell_size)
             .unwrap_or(FALLBACK_CELL),
         theme: theme::parse_background_reply(&reply),
+        graphics: parse_graphics_reply(&reply),
     }
 }
 
@@ -135,7 +147,12 @@ fn window_cell_size() -> Option<(u16, u16)> {
     (cell.0 > 0 && cell.1 > 0).then_some(cell)
 }
 
-/// The terminal's replies to the start-up queries.
+/// The queries, in the order the replies are read.
+fn queries() -> String {
+    format!("\x1b]11;?\x1b\\\x1b[16t\x1b_Gi={QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c")
+}
+
+/// The terminal's replies to the start-up queries, read until the DA1 reply.
 #[cfg(unix)]
 fn query() -> Option<Vec<u8>> {
     use ratatui::crossterm::terminal;
@@ -148,15 +165,16 @@ fn query() -> Option<Vec<u8>> {
     if !was_raw {
         terminal::enable_raw_mode().ok()?;
     }
+    // On the alternate screen, so a terminal that prints the graphics query
+    // as text (Terminal.app does) leaves nothing behind once it is left.
     let mut out = io::stdout();
-    let sent = out
-        .write_all(b"\x1b]11;?\x1b\\\x1b[16t\x1b[5n")
+    let sent = write!(out, "\x1b[?1049h{}", queries())
         .and_then(|()| out.flush())
         .is_ok();
     let mut buf = Vec::new();
     let deadline = Instant::now() + REPLY_TIMEOUT;
     let fd = libc::STDIN_FILENO;
-    while sent && !buf.windows(4).any(|w| w == b"\x1b[0n") {
+    while sent && !has_da1_reply(&buf) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -179,6 +197,7 @@ fn query() -> Option<Vec<u8>> {
         }
         buf.extend_from_slice(&chunk[..n as usize]);
     }
+    let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
     if !was_raw {
         let _ = terminal::disable_raw_mode();
     }
@@ -188,6 +207,27 @@ fn query() -> Option<Vec<u8>> {
 #[cfg(not(unix))]
 fn query() -> Option<Vec<u8>> {
     None
+}
+
+/// Whether `buf` holds the DA1 reply, `CSI ? ... c`.
+fn has_da1_reply(buf: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(buf);
+    text.split("\x1b[?").skip(1).any(|reply| {
+        reply
+            .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+            .is_some_and(|end| reply[end..].starts_with('c'))
+    })
+}
+
+/// Whether `buf` holds a reply to the graphics query, `APC G i=31;... ST`.
+/// An error reply counts too: the terminal still knows the protocol.
+fn parse_graphics_reply(buf: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(buf);
+    let id = format!("i={QUERY_ID}");
+    text.split("\x1b_G").skip(1).any(|reply| {
+        let keys = reply.split(';').next().unwrap_or("");
+        keys.split(',').any(|key| key == id)
+    })
 }
 
 /// Find the reply to `CSI 16 t`, `CSI 6 ; height ; width t`, in what the
@@ -281,5 +321,34 @@ mod tests {
         assert_eq!(parse_cell_reply(b"\x1b[0n"), None);
         assert_eq!(parse_cell_reply(b"\x1b[6;0;0t"), None);
         assert_eq!(parse_cell_reply(b"\x1b[6;34"), None);
+    }
+
+    #[test]
+    fn graphics_reply_is_found_by_its_id() {
+        let kitty = b"\x1b[6;34;17t\x1b_Gi=31;OK\x1b\\\x1b[?62;22c";
+        assert!(parse_graphics_reply(kitty));
+        assert!(parse_graphics_reply(b"\x1b_Gi=31;ENOTSUPPORTED:x\x1b\\"));
+        // DA1 alone: no graphics.
+        assert!(!parse_graphics_reply(b"\x1b[6;34;17t\x1b[?1;2c"));
+        assert!(!parse_graphics_reply(b"\x1b_Gi=310;OK\x1b\\"));
+        assert!(!parse_graphics_reply(b""));
+    }
+
+    #[test]
+    fn da1_reply_ends_the_wait() {
+        assert!(has_da1_reply(b"\x1b[?62;22c"));
+        assert!(has_da1_reply(b"\x1b_Gi=31;OK\x1b\\\x1b[?1;2c"));
+        assert!(has_da1_reply(b"\x1b[?6c"));
+        assert!(!has_da1_reply(b"\x1b[?62;22"));
+        assert!(!has_da1_reply(b"\x1b[6;34;17t"));
+        assert!(!has_da1_reply(b"\x1b[?1;2t"));
+    }
+
+    #[test]
+    fn queries_end_with_da1() {
+        assert_eq!(
+            queries(),
+            "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c"
+        );
     }
 }

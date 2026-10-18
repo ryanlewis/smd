@@ -130,11 +130,15 @@ fn apply(view: &mut View, path: &Path, change: Change) {
     }
 }
 
-/// Run the view until the reader quits, reloading it when the file at `path`
-/// changes. Mouse capture stays off so the terminal's own selection keeps
-/// working.
-pub fn run(terminal: &mut DefaultTerminal, mut view: View, path: &Path) -> io::Result<()> {
-    let mut watcher = Watcher::new(path.to_path_buf());
+/// Run the view until the reader quits, reloading it when the watched file at
+/// `path` changes. Mouse capture stays off so the terminal's own selection
+/// keeps working.
+pub fn run(
+    terminal: &mut DefaultTerminal,
+    mut view: View,
+    path: &Path,
+    mut watcher: Watcher,
+) -> io::Result<()> {
     let mut last_check = Instant::now();
     let mut redraw = true;
     loop {

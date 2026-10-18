@@ -23,6 +23,7 @@ fn main() -> ExitCode {
         eprintln!("usage: smd <file.md>");
         return ExitCode::from(2);
     };
+    let watcher = watch::Watcher::new(path.into());
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(err) => {
@@ -39,7 +40,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = app::run(&mut terminal, view, Path::new(path));
+    let result = app::run(&mut terminal, view, Path::new(path), watcher);
     ratatui::restore();
     match result {
         Ok(()) => ExitCode::SUCCESS,

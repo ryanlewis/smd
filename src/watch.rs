@@ -53,8 +53,8 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Start watching `path`, whose current contents the caller has already
-    /// read.
+    /// Start watching `path`. Create the watcher before reading the file, so
+    /// a save that lands in between is seen on the first check.
     pub fn new(path: PathBuf) -> Self {
         let seen = match std::fs::metadata(&path) {
             Ok(meta) => Seen::File(Stamp::of(&meta)),

@@ -179,9 +179,9 @@ fn contents(
             preformatted(code, CODE, width, first, rest, out);
         }
         // Without graphics an image block is never drawn, so it shows its
-        // source as code. A table that fits is text in either mode.
+        // source as code. Tables are text already, cut when too wide.
         BlockKind::Figure { kind, source }
-            if !ctx.images.graphics() && is_image(*kind, source, width, first, rest) =>
+            if !ctx.images.graphics() && *kind != FigureKind::Table =>
         {
             preformatted(source, CODE, width, first, rest, out);
         }
@@ -317,13 +317,6 @@ fn cut(spans: Vec<Span<'static>>, avail: usize) -> Vec<Span<'static>> {
 }
 
 const CODE: Style = Style::new().fg(Color::Yellow);
-
-/// Whether a figure is meant to be drawn as an image: every figure but a
-/// table that fits the width as text.
-fn is_image(kind: FigureKind, source: &str, width: usize, first: &[Span], rest: &[Span]) -> bool {
-    let prefix = spans_width(first).max(spans_width(rest));
-    kind != FigureKind::Table || Table::parse(source).width() > width.saturating_sub(prefix).max(1)
-}
 
 fn heading_style(level: u8) -> Style {
     let style = Style::new().add_modifier(Modifier::BOLD);
@@ -788,14 +781,13 @@ mod tests {
         for row in [0, 2] {
             assert_eq!(layout.lines[row].spans[0].style, CODE, "row {row}");
         }
-        // A table that fits is text either way; one too wide shows its source.
+        // Tables stay text, cut with … when too wide.
         for row in [4, 8] {
             assert_ne!(layout.lines[row].spans[0].style, CODE, "row {row}");
         }
-        let wide = render(&parse("| a | b |\n|---|---|\n"), 6, &Images::text());
+        let wide = render(&parse("| aaaa | bbbb |\n|---|---|\n"), 8, &Images::text());
         let text: Vec<String> = wide.lines.iter().map(|l| l.to_string()).collect();
-        assert_eq!(text, vec!["| a | ", "b |", "|---|-", "--|"]);
-        assert_eq!(wide.lines[0].spans[0].style, CODE);
+        assert!(text.iter().all(|l| l.ends_with('…')), "{text:?}");
         assert!(layout.placements().is_empty());
         // The image is shown as written, not rebuilt from its parts.
         let md = "> ![a \\] b](<my diagram.png> \"Title\")\n";

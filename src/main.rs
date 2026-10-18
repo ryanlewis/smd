@@ -1,15 +1,49 @@
+mod app;
+mod doc;
+mod render;
+
+use std::process::ExitCode;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn version_line() -> String {
     format!("smd {VERSION}")
 }
 
-fn main() {
-    if std::env::args()
-        .skip(1)
-        .any(|a| a == "--version" || a == "-V")
-    {
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("{}", version_line());
+        return ExitCode::SUCCESS;
+    }
+    let [path] = args.as_slice() else {
+        eprintln!("usage: smd <file.md>");
+        return ExitCode::from(2);
+    };
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(err) => {
+            eprintln!("smd: {path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let view = app::View::new(doc::parse(&source));
+
+    let mut terminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            eprintln!("smd: cannot open the terminal: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = app::run(&mut terminal, view);
+    ratatui::restore();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("smd: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 

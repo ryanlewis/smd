@@ -1,0 +1,479 @@
+//! Lays a document out as styled lines for a given width.
+
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle};
+
+const TAB_WIDTH: usize = 4;
+
+/// Lay out the whole document for a view `width` columns wide.
+pub fn render(doc: &Document, width: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    blocks(&doc.blocks, width as usize, &[], &[], false, &mut out);
+    out
+}
+
+/// Render blocks one after another. `first` prefixes the first line and
+/// `rest` every other line, which is how list markers and quote bars nest.
+fn blocks(
+    blocks: &[Block],
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    tight: bool,
+    out: &mut Vec<Line<'static>>,
+) {
+    for (i, b) in blocks.iter().enumerate() {
+        if i > 0 && !tight {
+            emit(rest, Vec::new(), out);
+        }
+        block(b, width, if i == 0 { first } else { rest }, rest, out);
+    }
+}
+
+fn block(
+    block: &Block,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    match &block.kind {
+        BlockKind::Paragraph(content) => {
+            wrap(content, Style::default(), width, first, rest, out);
+        }
+        BlockKind::Heading { level, content } => {
+            wrap(content, heading_style(*level), width, first, rest, out);
+        }
+        BlockKind::Code { code, .. } => {
+            preformatted(
+                code,
+                Style::new().fg(Color::Yellow),
+                width,
+                first,
+                rest,
+                out,
+            );
+        }
+        BlockKind::Figure { kind, source } => {
+            let style = match kind {
+                FigureKind::Table => Style::default(),
+                FigureKind::Mermaid | FigureKind::Math => Style::new().fg(Color::Cyan),
+            };
+            preformatted(source, style, width, first, rest, out);
+        }
+        BlockKind::Html(html) => {
+            preformatted(
+                html,
+                Style::new().add_modifier(Modifier::DIM),
+                width,
+                first,
+                rest,
+                out,
+            );
+        }
+        BlockKind::Rule => {
+            let avail = width.saturating_sub(spans_width(first)).max(1);
+            let rule = Span::styled("─".repeat(avail), Style::new().add_modifier(Modifier::DIM));
+            emit(first, vec![rule], out);
+        }
+        BlockKind::Quote(inner) => {
+            let bar = Span::styled("│ ", Style::new().fg(Color::DarkGray));
+            let first = with(first, bar.clone());
+            let rest = with(rest, bar);
+            blocks(inner, width, &first, &rest, false, out);
+        }
+        BlockKind::List {
+            start,
+            tight,
+            items,
+        } => {
+            let markers: Vec<String> = (0..items.len() as u64)
+                .map(|n| match start {
+                    Some(s) => format!("{}. ", s + n),
+                    None => "• ".to_string(),
+                })
+                .collect();
+            let marker_width = markers.iter().map(|m| m.width()).max().unwrap_or(0);
+            for (i, (item, marker)) in items.iter().zip(markers).enumerate() {
+                if i > 0 && !tight {
+                    emit(rest, Vec::new(), out);
+                }
+                let mut marker = format!("{marker:>marker_width$}");
+                let mut indent = marker_width;
+                if let Some(done) = item.task {
+                    marker.push_str(if done { "[x] " } else { "[ ] " });
+                    indent += 4;
+                }
+                let item_first = with(
+                    if i == 0 { first } else { rest },
+                    Span::styled(marker, Style::new().fg(Color::Blue)),
+                );
+                let item_rest = with(rest, Span::raw(" ".repeat(indent)));
+                if item.blocks.is_empty() {
+                    emit(&item_first, Vec::new(), out);
+                }
+                blocks(&item.blocks, width, &item_first, &item_rest, *tight, out);
+            }
+        }
+    }
+}
+
+fn heading_style(level: u8) -> Style {
+    let style = Style::new().add_modifier(Modifier::BOLD);
+    match level {
+        1 => style.fg(Color::Magenta).add_modifier(Modifier::UNDERLINED),
+        2 => style.fg(Color::Cyan),
+        3 => style.fg(Color::Green),
+        _ => style,
+    }
+}
+
+fn inline_style(base: Style, style: &InlineStyle) -> Style {
+    let mut s = base;
+    if style.emphasis {
+        s = s.add_modifier(Modifier::ITALIC);
+    }
+    if style.strong {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    if style.strikethrough {
+        s = s.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if style.code {
+        s = s.fg(Color::Yellow);
+    }
+    if style.math {
+        s = s.fg(Color::Cyan);
+    }
+    if style.link.is_some() {
+        s = s.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+    }
+    s
+}
+
+/// A unit of inline content for line breaking.
+enum Unit {
+    /// A run of non-space text, possibly in several styles.
+    Word(Vec<(String, Style)>),
+    Space(Style),
+    Break,
+}
+
+fn units(content: &[Inline], base: Style) -> Vec<Unit> {
+    let mut units = Vec::new();
+    let mut word: Vec<(String, Style)> = Vec::new();
+    for inline in content {
+        let (text, style) = match inline {
+            Inline::Text { text, style } => (text, inline_style(base, style)),
+            Inline::Break => {
+                if !word.is_empty() {
+                    units.push(Unit::Word(std::mem::take(&mut word)));
+                }
+                units.push(Unit::Break);
+                continue;
+            }
+        };
+        for c in text.chars() {
+            if c.is_whitespace() {
+                if !word.is_empty() {
+                    units.push(Unit::Word(std::mem::take(&mut word)));
+                }
+                if !matches!(units.last(), Some(Unit::Space(_))) {
+                    units.push(Unit::Space(style));
+                }
+            } else {
+                match word.last_mut() {
+                    Some((s, st)) if *st == style => s.push(c),
+                    _ => word.push((c.to_string(), style)),
+                }
+            }
+        }
+    }
+    if !word.is_empty() {
+        units.push(Unit::Word(word));
+    }
+    units
+}
+
+/// Fill lines greedily with inline content, breaking at spaces.
+fn wrap(
+    content: &[Inline],
+    base: Style,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    let mut lines = Lines::new(width, first, rest, out);
+    let mut space: Option<Style> = None;
+    for unit in units(content, base) {
+        match unit {
+            Unit::Break => {
+                lines.finish();
+                space = None;
+            }
+            Unit::Space(style) => {
+                if lines.used > 0 {
+                    space = Some(style);
+                }
+            }
+            Unit::Word(segments) => {
+                let word_width: usize = segments.iter().map(|(s, _)| s.width()).sum();
+                if let Some(style) = space.take() {
+                    if lines.used + 1 + word_width > lines.avail() {
+                        lines.finish();
+                    } else {
+                        lines.push(" ", style);
+                    }
+                }
+                if word_width <= lines.avail() {
+                    for (s, style) in &segments {
+                        lines.push(s, *style);
+                    }
+                } else {
+                    // Longer than a whole line: break it anywhere.
+                    for (s, style) in &segments {
+                        lines.push_breaking(s, *style);
+                    }
+                }
+            }
+        }
+    }
+    lines.finish_last();
+}
+
+/// Text shown as is, broken at the edge of the view rather than reflowed.
+fn preformatted(
+    text: &str,
+    style: Style,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    let mut lines = Lines::new(width, first, rest, out);
+    let text = text.trim_end_matches('\n');
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            lines.finish();
+        }
+        lines.push_breaking(&expand_tabs(line), style);
+    }
+    lines.finish_last();
+}
+
+fn expand_tabs(line: &str) -> String {
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut out = String::new();
+    let mut col = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            let n = TAB_WIDTH - col % TAB_WIDTH;
+            out.extend(std::iter::repeat_n(' ', n));
+            col += n;
+        } else {
+            out.push(c);
+            col += c.width().unwrap_or(0);
+        }
+    }
+    out
+}
+
+/// Builds prefixed lines, tracking how much of the current one is used.
+struct Lines<'a> {
+    width: usize,
+    first: &'a [Span<'static>],
+    rest: &'a [Span<'static>],
+    out: &'a mut Vec<Line<'static>>,
+    current: Vec<Span<'static>>,
+    used: usize,
+    emitted: usize,
+}
+
+impl<'a> Lines<'a> {
+    fn new(
+        width: usize,
+        first: &'a [Span<'static>],
+        rest: &'a [Span<'static>],
+        out: &'a mut Vec<Line<'static>>,
+    ) -> Self {
+        Lines {
+            width,
+            first,
+            rest,
+            out,
+            current: Vec::new(),
+            used: 0,
+            emitted: 0,
+        }
+    }
+
+    fn prefix(&self) -> &'a [Span<'static>] {
+        if self.emitted == 0 {
+            self.first
+        } else {
+            self.rest
+        }
+    }
+
+    /// Columns available for content on the current line.
+    fn avail(&self) -> usize {
+        self.width.saturating_sub(spans_width(self.prefix())).max(1)
+    }
+
+    fn push(&mut self, s: &str, style: Style) {
+        self.used += s.width();
+        match self.current.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push_str(s),
+            _ => self.current.push(Span::styled(s.to_string(), style)),
+        }
+    }
+
+    fn push_breaking(&mut self, s: &str, style: Style) {
+        let mut buf = [0; 4];
+        for c in s.chars() {
+            let w = c.width().unwrap_or(0);
+            if self.used > 0 && self.used + w > self.avail() {
+                self.finish();
+            }
+            self.push(c.encode_utf8(&mut buf), style);
+        }
+    }
+
+    fn finish(&mut self) {
+        let content = std::mem::take(&mut self.current);
+        emit(self.prefix(), content, self.out);
+        self.used = 0;
+        self.emitted += 1;
+    }
+
+    /// Emit the last line, and at least one line for the block.
+    fn finish_last(&mut self) {
+        if !self.current.is_empty() || self.emitted == 0 {
+            self.finish();
+        }
+    }
+}
+
+fn emit(prefix: &[Span<'static>], content: Vec<Span<'static>>, out: &mut Vec<Line<'static>>) {
+    let mut spans = prefix.to_vec();
+    if content.is_empty() {
+        // No trailing spaces on blank lines, so copied text stays clean.
+        while let Some(last) = spans.last_mut() {
+            let trimmed = last.content.trim_end().to_string();
+            if trimmed.is_empty() {
+                spans.pop();
+            } else {
+                last.content = trimmed.into();
+                break;
+            }
+        }
+    }
+    spans.extend(content);
+    out.push(Line::from(spans));
+}
+
+fn with(prefix: &[Span<'static>], span: Span<'static>) -> Vec<Span<'static>> {
+    let mut v = prefix.to_vec();
+    v.push(span);
+    v
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::parse;
+
+    fn plain(md: &str, width: u16) -> Vec<String> {
+        render(&parse(md), width)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn paragraphs_reflow_to_width() {
+        assert_eq!(
+            plain("one two three four five\n\nsix\n", 10),
+            vec!["one two", "three four", "five", "", "six"]
+        );
+    }
+
+    #[test]
+    fn long_words_break_anywhere() {
+        assert_eq!(plain("abcdefghij\n", 4), vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wide_characters_count_two_columns() {
+        assert_eq!(plain("日本語 日本\n", 6), vec!["日本語", "日本"]);
+    }
+
+    #[test]
+    fn list_items_wrap_under_their_text() {
+        assert_eq!(
+            plain("- alpha beta gamma\n- [x] done\n", 12),
+            vec!["• alpha beta", "  gamma", "• [x] done"]
+        );
+    }
+
+    #[test]
+    fn ordered_markers_align() {
+        let md: String = (1..=10).map(|n| format!("{n}. item\n")).collect();
+        let lines = plain(&md, 20);
+        assert_eq!(lines[0], " 1. item");
+        assert_eq!(lines[9], "10. item");
+    }
+
+    #[test]
+    fn nested_tight_list_has_no_blank_lines() {
+        assert_eq!(plain("- a\n  - b\n- c\n", 20), vec!["• a", "  • b", "• c"]);
+    }
+
+    #[test]
+    fn quotes_prefix_every_line() {
+        assert_eq!(
+            plain("> one two\n>\n> three\n", 9),
+            vec!["│ one two", "│", "│ three"]
+        );
+    }
+
+    #[test]
+    fn code_keeps_lines_and_breaks_at_the_edge() {
+        assert_eq!(
+            plain("```\nlet x = 1;\n\tindented\n```\n", 8),
+            vec!["let x = ", "1;", "    inde", "nted"]
+        );
+    }
+
+    #[test]
+    fn figures_show_their_source() {
+        assert_eq!(
+            plain("```mermaid\ngraph TD\n  A --> B\n```\n", 40),
+            vec!["graph TD", "  A --> B"]
+        );
+        assert_eq!(
+            plain("| a | b |\n|---|---|\n| 1 | 2 |\n", 40),
+            vec!["| a | b |", "|---|---|", "| 1 | 2 |"]
+        );
+    }
+
+    #[test]
+    fn no_line_is_wider_than_the_view() {
+        let md = "# A heading that is long\n\n> - quoted list item with words\n\n```\na long line of code here\n```\n\n---\n";
+        for width in 8..30u16 {
+            for line in render(&parse(md), width) {
+                assert!(line.width() <= width as usize, "width {width}: {line:?}");
+            }
+        }
+    }
+}

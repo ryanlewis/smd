@@ -36,12 +36,34 @@ pub struct View {
 /// The block at the top of the view, found again after the document is laid
 /// out anew so the view stays on the same content.
 struct Anchor {
-    /// Its index in `Layout::blocks`.
-    index: usize,
-    /// Its markdown, which finds it in a reloaded document.
-    text: String,
+    /// Where the block starts in the source.
+    start: usize,
+    /// How many blocks before it start at the same byte, such as a quote and
+    /// its first paragraph, or display maths split from one paragraph.
+    rank: usize,
     /// The top line's offset from the block's first line.
     offset: isize,
+}
+
+impl Anchor {
+    /// The same anchor in `new`, an edited copy of `old`. A block that starts
+    /// before the edited bytes keeps its start and one that starts after them
+    /// moves with them; one that starts inside them is lost.
+    fn moved(self, old: &str, new: &str) -> Option<Anchor> {
+        let (old, new) = (old.as_bytes(), new.as_bytes());
+        let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+        let room = old.len().min(new.len()) - prefix;
+        let suffix = old.iter().rev().zip(new.iter().rev());
+        let suffix = suffix.take(room).take_while(|(a, b)| a == b).count();
+        let start = if self.start < prefix {
+            self.start
+        } else if self.start >= old.len() - suffix {
+            self.start + new.len() - old.len()
+        } else {
+            return None;
+        };
+        Some(Anchor { start, ..self })
+    }
 }
 
 impl View {
@@ -65,7 +87,8 @@ impl View {
     /// it no longer has are deleted on the next flush.
     pub fn reload(&mut self, doc: Document) {
         let anchor = self.anchor();
-        self.doc = doc;
+        let old = std::mem::replace(&mut self.doc, doc);
+        let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
         self.want_images();
         self.relayout(anchor);
     }
@@ -92,26 +115,28 @@ impl View {
             return None;
         }
         let (index, offset) = self.layout.anchor(self.scroll)?;
-        let span = self.layout.blocks[index].span.clone();
+        let blocks = &self.layout.blocks;
+        let start = blocks[index].span.start;
+        let rank = blocks[..index]
+            .iter()
+            .filter(|b| b.span.start == start)
+            .count();
         Some(Anchor {
-            index,
-            text: self.doc.source.get(span)?.to_string(),
+            start,
+            rank,
             offset,
         })
     }
 
     /// The top line that puts `anchor` back where it was: the same offset into
-    /// the block with the same markdown nearest its old place. A block that
-    /// got shorter keeps the view on its last line.
+    /// its block. A block that got shorter keeps the view on its last line.
     fn find(&self, anchor: &Anchor) -> Option<usize> {
-        let source = &self.doc.source;
-        let (_, b) = self
+        let b = self
             .layout
             .blocks
             .iter()
-            .enumerate()
-            .filter(|(_, b)| source.get(b.span.clone()) == Some(anchor.text.as_str()))
-            .min_by_key(|(i, _)| i.abs_diff(anchor.index))?;
+            .filter(|b| b.span.start == anchor.start)
+            .nth(anchor.rank)?;
         let last = b.rows.len().saturating_sub(1) as isize;
         Some(b.rows.start.saturating_add_signed(anchor.offset.min(last)))
     }
@@ -470,6 +495,17 @@ mod tests {
         press(&mut v, KeyCode::Char('g'));
         v.reload(parse(&format!("more\n\n{md}")));
         assert_eq!(v.scroll, 0);
+    }
+
+    #[test]
+    fn reload_tells_blocks_with_the_same_text_apart() {
+        let md = "same\n\n".repeat(10);
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        v.scroll_by(8);
+        // A copy added above pushes the block the view is on down with it.
+        v.reload(parse(&format!("new\n\nsame\n\n{md}")));
+        assert_eq!(v.scroll, 12);
     }
 
     /// The text of the top line of the view.

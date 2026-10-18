@@ -49,17 +49,17 @@ impl Layout {
     /// The block to keep in place when `row` is the top line of the view, as
     /// its index in `blocks` and the row's offset from the block's first line.
     /// That is the innermost block holding the row, or the next block when the
-    /// row falls between blocks, giving a negative offset.
+    /// row falls between blocks, even inside a quote or list, giving a
+    /// negative offset.
     pub fn anchor(&self, row: usize) -> Option<(usize, isize)> {
-        let (index, b) = match self.blocks.iter().rposition(|b| b.rows.contains(&row)) {
-            Some(i) => (i, &self.blocks[i]),
-            None => self
-                .blocks
-                .iter()
-                .enumerate()
-                .find(|(_, b)| b.rows.start > row)?,
+        let holder = self.blocks.iter().rposition(|b| b.rows.contains(&row));
+        let next = self.blocks.iter().position(|b| b.rows.start > row);
+        let index = match (holder, next) {
+            (Some(h), Some(n)) if self.blocks[n].rows.end <= self.blocks[h].rows.end => n,
+            (Some(h), _) => h,
+            (None, n) => n?,
         };
-        Some((index, row as isize - b.rows.start as isize))
+        Some((index, row as isize - self.blocks[index].rows.start as isize))
     }
 }
 
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(rows, vec![0..3, 0..1, 2..3, 4..5]);
         assert_eq!(layout.anchor(0), Some((1, 0)));
         // Inside the quote but between its paragraphs.
-        assert_eq!(layout.anchor(1), Some((0, 1)));
+        assert_eq!(layout.anchor(1), Some((2, -1)));
         assert_eq!(layout.anchor(2), Some((2, 0)));
         // Between blocks.
         assert_eq!(layout.anchor(3), Some((3, -1)));

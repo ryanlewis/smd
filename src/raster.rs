@@ -86,6 +86,12 @@ pub fn sans_bold() -> Result<&'static FontVec, String> {
         .ok_or_else(|| "no bold sans-serif font found".to_string())
 }
 
+/// Every bold proportional font `sans_bold` could pick on this machine.
+#[cfg(test)]
+pub fn sans_bold_all() -> Vec<FontVec> {
+    SANS_BOLD.iter().filter_map(|&face| load(face)).collect()
+}
+
 fn load((path, index): Face) -> Option<FontVec> {
     let data = std::fs::read(path).ok()?;
     FontVec::try_from_vec_and_index(data, index).ok()

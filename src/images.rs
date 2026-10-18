@@ -9,6 +9,7 @@
 //! Until an image is ready, or if making it fails, its block shows as text.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -103,9 +104,11 @@ impl Images {
         Images {
             cell: (cell.0.max(1), cell.1.max(1)),
             entries: HashMap::new(),
-            // Start somewhere other than 1, so another program's images in the
-            // same terminal are less likely to share an id.
-            next_id: std::process::id() % kitty::MAX_ID + 1,
+            // Start at a random id, so another program's images in the same
+            // terminal, or another smd's, are unlikely to share one.
+            next_id: (RandomState::new().hash_one(std::process::id()) % u64::from(kitty::MAX_ID))
+                as u32
+                + 1,
             deleted: Vec::new(),
             tx,
             rx,
@@ -138,12 +141,16 @@ impl Images {
         );
     }
 
-    /// Ask for exactly these images: start the new ones and forget the rest,
-    /// deleting from the terminal any that were uploaded.
+    /// Ask for exactly these images: start the new ones, try again the ones
+    /// that failed, and forget the rest, deleting from the terminal any that
+    /// were uploaded.
     pub fn want(&mut self, wanted: Vec<(Key, Job)>) {
         let keep: HashSet<&Key> = wanted.iter().map(|(k, _)| k).collect();
         let deleted = &mut self.deleted;
         self.entries.retain(|key, entry| {
+            if matches!(entry.state, State::Failed) {
+                return false;
+            }
             let kept = keep.contains(key);
             if !kept && entry.placed.is_some() {
                 deleted.push(entry.id);
@@ -243,7 +250,12 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
     let job: Job = match &block.kind {
         BlockKind::Image { src, .. } => {
             let path = base.join(src);
-            Box::new(move || load(&path))
+            let decoded = percent_decode(src).map(|src| base.join(src));
+            Box::new(move || match (load(&path), decoded) {
+                // Editors write spaces in paths as %20.
+                (Err(_), Some(decoded)) if !path.exists() => load(&decoded),
+                (result, _) => result,
+            })
         }
         _ => return None,
     };
@@ -269,6 +281,33 @@ pub fn wanted_in(blocks: &[Block], base: &Path, out: &mut Vec<(Key, Job)>) {
 /// Images on the web are left as text.
 fn is_local(src: &str) -> bool {
     !src.is_empty() && !src.contains("://") && !src.starts_with("data:")
+}
+
+/// `src` with its %XX escapes decoded, if it has any.
+fn percent_decode(src: &str) -> Option<String> {
+    if !src.contains('%') {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn load(path: &Path) -> Result<Png, String> {
@@ -396,6 +435,40 @@ pub mod tests {
         let a = images.ready(&file_key("a.png")).unwrap();
         assert_eq!(a.px, (30, 40));
         assert_eq!(images.ready(&file_key("missing.png")), None);
+    }
+
+    #[test]
+    fn a_failed_image_is_tried_again_on_the_next_reload() {
+        let dir = std::env::temp_dir().join(format!("smd-images-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = parse("![d](d.png)\n");
+        let want = |images: &mut Images| {
+            images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
+            settle(images);
+        };
+        let mut images = Images::new((10, 20));
+        want(&mut images);
+        assert_eq!(images.ready(&file_key("d.png")), None);
+        std::fs::write(dir.join("d.png"), png(10, 20)).unwrap();
+        want(&mut images);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(images.ready(&file_key("d.png")).unwrap().px, (10, 20));
+    }
+
+    #[test]
+    fn escaped_paths_are_decoded() {
+        let dir = std::env::temp_dir().join(format!("smd-images-escape-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("my diagram.png"), png(10, 20)).unwrap();
+        let doc = parse("![d](my%20diagram.png)\n");
+        let mut images = Images::new((10, 20));
+        images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
+        settle(&mut images);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(images.ready(&file_key("my%20diagram.png")).is_some());
+        assert_eq!(percent_decode("a%2"), Some("a%2".into()));
+        assert_eq!(percent_decode("%e6%97%a5.png"), Some("日.png".into()));
+        assert_eq!(percent_decode("plain.png"), None);
     }
 
     #[test]

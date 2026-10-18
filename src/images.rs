@@ -14,8 +14,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use crate::doc::{Block, BlockKind};
-use crate::kitty;
+use crate::doc::{Block, BlockKind, FigureKind};
+use crate::{kitty, maths};
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -239,6 +239,10 @@ impl Images {
 pub fn key(block: &Block) -> Option<Key> {
     match &block.kind {
         BlockKind::Image { src, .. } if is_local(src) => Some(Key(format!("file:{src}"))),
+        BlockKind::Figure {
+            kind: FigureKind::Math,
+            source,
+        } => Some(Key(format!("math:{}:{source}", maths::dark_background()))),
         _ => None,
     }
 }
@@ -256,6 +260,13 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
                 (Err(_), Some(decoded)) if !path.exists() => load(&decoded),
                 (result, _) => result,
             })
+        }
+        BlockKind::Figure {
+            kind: FigureKind::Math,
+            source,
+        } => {
+            let (source, dark) = (source.clone(), maths::dark_background());
+            Box::new(move || maths::render(&source, dark))
         }
         _ => return None,
     };
@@ -420,6 +431,24 @@ pub mod tests {
         let doc = parse("![a](pics/a.png)\n\n![b](https://x.org/b.png)\n\ntext\n");
         let keys: Vec<Option<Key>> = doc.blocks.iter().map(key).collect();
         assert_eq!(keys, vec![Some(file_key("pics/a.png")), None, None]);
+    }
+
+    #[test]
+    fn display_maths_is_an_image_unless_it_is_broken() {
+        let doc = parse("$$\\frac{1}{2}$$\n\n$$\\notacommand{x}$$\n\ninline $x$\n");
+        let keys: Vec<Option<Key>> = doc.blocks.iter().map(key).collect();
+        assert!(keys[0].is_some() && keys[1].is_some());
+        assert_eq!(keys[2], None);
+        let mut images = Images::new((10, 20));
+        images.want(
+            doc.blocks
+                .iter()
+                .filter_map(|b| wanted(b, Path::new(".")))
+                .collect(),
+        );
+        settle(&mut images);
+        assert!(images.ready(keys[0].as_ref().unwrap()).is_some());
+        assert_eq!(images.ready(keys[1].as_ref().unwrap()), None);
     }
 
     #[test]

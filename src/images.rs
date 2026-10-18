@@ -9,12 +9,18 @@
 //! Until an image is ready, or if making it fails, its block shows as text.
 //! A store made with [`Images::text`], for a terminal without kitty graphics,
 //! makes no images at all and sends the terminal nothing.
+//!
+//! A job that panics fails like any other, with a short error. Its thread is
+//! named [`JOB_THREAD`] so a panic hook can tell its panics from the app's.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
 use crate::doc::{Block, BlockKind, FigureKind};
 use crate::theme::{self, Theme};
@@ -55,6 +61,62 @@ impl Png {
 
 /// Makes an image. It runs on its own thread.
 pub type Job = Box<dyn FnOnce() -> Result<Png, String> + Send>;
+
+/// The name of the threads jobs run on.
+pub const JOB_THREAD: &str = "smd-image";
+
+/// True on a thread running a job.
+pub fn in_job() -> bool {
+    std::thread::current().name() == Some(JOB_THREAD)
+}
+
+/// Run `job`, turning a panic into a short error.
+fn run(job: Job) -> Result<Png, String> {
+    panic::catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|payload| Err(panicked(&*payload)))
+}
+
+fn panicked(payload: &(dyn Any + Send)) -> String {
+    let message = match payload.downcast_ref::<&str>() {
+        Some(message) => message,
+        None => payload.downcast_ref::<String>().map_or("", String::as_str),
+    };
+    match message.lines().next() {
+        Some(line) if !line.is_empty() => format!("crashed: {line}"),
+        _ => "crashed".into(),
+    }
+}
+
+/// The ids of the images in the terminal, shared so a panic hook can delete
+/// them when the app cannot.
+#[derive(Clone, Default)]
+pub struct Uploaded(Arc<Mutex<HashSet<u32>>>);
+
+impl Uploaded {
+    /// Delete every image in the terminal.
+    pub fn delete_all(&self, out: &mut impl Write) -> io::Result<()> {
+        // A panic while the lock was held leaves the set as it was.
+        let ids = match self.0.lock() {
+            Ok(ids) => ids,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for &id in ids.iter() {
+            kitty::delete(out, id)?;
+        }
+        out.flush()
+    }
+
+    fn set(&self, id: u32, uploaded: bool) {
+        let mut ids = match self.0.lock() {
+            Ok(ids) => ids,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if uploaded {
+            ids.insert(id);
+        } else {
+            ids.remove(&id);
+        }
+    }
+}
 
 /// An image that is ready to lay out.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,6 +162,7 @@ pub struct Images {
     next_id: u32,
     /// Uploaded images that left the document, to delete on the next flush.
     deleted: Vec<u32>,
+    uploaded: Uploaded,
     tx: Sender<(Key, Result<Png, String>)>,
     rx: Receiver<(Key, Result<Png, String>)>,
 }
@@ -117,6 +180,7 @@ impl Images {
                 as u32
                 + 1,
             deleted: Vec::new(),
+            uploaded: Uploaded::default(),
             tx,
             rx,
         }
@@ -138,6 +202,11 @@ impl Images {
         self.graphics
     }
 
+    /// The images this store has in the terminal.
+    pub fn uploaded(&self) -> Uploaded {
+        self.uploaded.clone()
+    }
+
     /// Ask for the image `key`, made by `job` unless it is already known.
     pub fn request(&mut self, key: Key, job: Job) {
         if !self.graphics || self.entries.contains_key(&key) {
@@ -147,9 +216,12 @@ impl Images {
         self.next_id = id % kitty::MAX_ID + 1;
         let tx = self.tx.clone();
         let sent = key.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send((sent, job()));
-        });
+        std::thread::Builder::new()
+            .name(JOB_THREAD.into())
+            .spawn(move || {
+                let _ = tx.send((sent, run(job)));
+            })
+            .expect("failed to spawn thread");
         self.entries.insert(
             key,
             Entry {
@@ -230,6 +302,7 @@ impl Images {
         let mut sent = false;
         for id in self.deleted.drain(..) {
             kitty::delete(out, id)?;
+            self.uploaded.set(id, false);
             sent = true;
         }
         for p in placements {
@@ -240,6 +313,7 @@ impl Images {
                 continue;
             };
             if let Some(data) = png.take() {
+                self.uploaded.set(entry.id, true);
                 kitty::upload(out, entry.id, &data)?;
                 sent = true;
             }
@@ -662,6 +736,51 @@ pub mod tests {
         let mut out = Vec::new();
         images.flush(&mut out, &[]).unwrap();
         images.delete_all(&mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_job_that_panics_fails_with_a_short_error() {
+        let mut images = Images::new((10, 20));
+        images.request(
+            file_key("a.png"),
+            Box::new(|| panic!("index out of range\nmore")),
+        );
+        images.request(file_key("b.png"), Box::new(|| panic!("bad {}", 7)));
+        images.request(file_key("c.png"), Box::new(|| std::panic::panic_any(1)));
+        settle(&mut images);
+        assert_eq!(
+            images.error(&file_key("a.png")),
+            Some("crashed: index out of range")
+        );
+        assert_eq!(images.error(&file_key("b.png")), Some("crashed: bad 7"));
+        assert_eq!(images.error(&file_key("c.png")), Some("crashed"));
+    }
+
+    #[test]
+    fn uploaded_tracks_the_images_in_the_terminal() {
+        let mut images = Images::new((10, 20));
+        images.request(file_key("a.png"), job(png(10, 20)));
+        settle(&mut images);
+        let id = images.ready(&file_key("a.png")).unwrap().id;
+        let uploaded = images.uploaded();
+        let mut out = Vec::new();
+        uploaded.delete_all(&mut out).unwrap();
+        assert!(out.is_empty());
+
+        let at = [Placement {
+            id,
+            cols: 1,
+            rows: 1,
+        }];
+        images.flush(&mut Vec::new(), &at).unwrap();
+        let mut out = Vec::new();
+        uploaded.delete_all(&mut out).unwrap();
+        assert_eq!(commands(out), vec![format!("\x1b_Ga=d,d=I,i={id},q=2")]);
+
+        images.delete_all(&mut Vec::new()).unwrap();
+        let mut out = Vec::new();
+        uploaded.delete_all(&mut out).unwrap();
         assert!(out.is_empty());
     }
 

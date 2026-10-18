@@ -12,6 +12,8 @@ mod theme;
 mod watch;
 
 use std::ffi::OsString;
+use std::io;
+use std::panic;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -63,7 +65,6 @@ fn main() -> ExitCode {
         }
         _ => images::Images::text(),
     };
-    let view = app::View::new(doc::parse(&source), base, images);
 
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
@@ -72,6 +73,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Set after ratatui's hook, which restores the terminal, so it runs first.
+    // A job's panic is caught and shown as a failed image, so it prints
+    // nothing; any other deletes the images before the terminal is restored.
+    let uploaded = images.uploaded();
+    let restore = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if images::in_job() {
+            return;
+        }
+        let _ = uploaded.delete_all(&mut io::stdout());
+        restore(info);
+    }));
+    // Made once the hook is set, as this starts the jobs.
+    let view = app::View::new(doc::parse(&source), base, images);
     let result = app::run(&mut terminal, view, Path::new(path), watcher);
     ratatui::restore();
     match result {

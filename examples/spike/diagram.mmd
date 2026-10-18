@@ -1,0 +1,9 @@
+flowchart LR
+    md[Markdown file] --> parse[Parse]
+    parse --> text[Plain text blocks]
+    parse --> rich[Mermaid, maths, headings, wide tables]
+    rich --> render[Render to PNG]
+    render --> upload[Upload once with kitty graphics]
+    upload --> place[Unicode placeholders in the text flow]
+    text --> screen[Terminal]
+    place --> screen

@@ -12,3 +12,5 @@ cargo build --release
 ```
 
 Scroll with `j`/`k`, the arrow keys, PgUp/PgDn and `g`/`G`. Press `q` to quit.
+
+smd reloads the file when it changes on disk, including when an editor saves by renaming a new file over it. If the file is deleted, smd keeps showing the last version and says so on the bottom row.

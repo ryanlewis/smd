@@ -206,9 +206,20 @@ impl View {
     /// Handle a key press. Returns true when the reader should quit.
     pub fn key(&mut self, key: KeyEvent) -> bool {
         let page = (self.height as isize).max(1);
+        let half = (page / 2).max(1);
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => return true,
+                KeyCode::Char('d') => self.scroll_by(half),
+                KeyCode::Char('u') => self.scroll_by(-half),
+                KeyCode::Char('f') => self.scroll_by(page),
+                KeyCode::Char('b') => self.scroll_by(-page),
+                _ => {}
+            }
+            return false;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(page),
@@ -331,6 +342,25 @@ mod tests {
         press(&mut v, KeyCode::PageUp);
         assert_eq!(v.scroll, 9);
         press(&mut v, KeyCode::Char('g'));
+        assert_eq!(v.scroll, 0);
+    }
+
+    #[test]
+    fn control_keys_scroll_by_half_and_whole_pages() {
+        let mut v = view(10);
+        let ctrl = |v: &mut View, c| v.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        ctrl(&mut v, 'd');
+        assert_eq!(v.scroll, 2);
+        ctrl(&mut v, 'f');
+        assert_eq!(v.scroll, 7);
+        ctrl(&mut v, 'b');
+        assert_eq!(v.scroll, 2);
+        ctrl(&mut v, 'u');
+        assert_eq!(v.scroll, 0);
+        // Control does not turn a letter into its plain key.
+        assert!(!ctrl(&mut v, 'q'));
+        ctrl(&mut v, 'g');
+        ctrl(&mut v, 'j');
         assert_eq!(v.scroll, 0);
     }
 

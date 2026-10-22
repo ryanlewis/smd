@@ -179,17 +179,30 @@ impl Canvas {
     }
 
     fn encode(&self) -> Result<Vec<u8>, String> {
-        let mut data = Vec::new();
-        let mut encoder = png::Encoder::new(&mut data, self.width, self.height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer
-            .write_image_data(self.pixels.as_flattened())
-            .map_err(|e| e.to_string())?;
-        writer.finish().map_err(|e| e.to_string())?;
-        Ok(data)
+        encode(
+            self.width,
+            self.height,
+            png::ColorType::Rgba,
+            self.pixels.as_flattened(),
+        )
     }
+}
+
+/// PNG bytes for 8-bit `pixels` in `color`, row by row.
+pub fn encode(
+    width: u32,
+    height: u32,
+    color: png::ColorType,
+    pixels: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut data = Vec::new();
+    let mut encoder = png::Encoder::new(&mut data, width, height);
+    encoder.set_color(color);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(pixels).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    Ok(data)
 }
 
 /// How wide `text` is at `size` pixels.

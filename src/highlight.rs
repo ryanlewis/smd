@@ -34,9 +34,10 @@ pub type Segments = Vec<(String, Style)>;
 /// Diffs need no syntaxes.
 pub fn highlight(set: Option<&SyntaxSet>, lang: &str, code: &str) -> Option<Vec<Segments>> {
     let code = code.trim_end_matches('\n');
+    // Attributes such as `rust,no_run` follow the language after a comma.
+    let lang = lang.split(',').next().unwrap_or(lang);
     if lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch") {
-        let lines = code.split('\n');
-        return Some(lines.map(|l| vec![(l.to_string(), diff(l))]).collect());
+        return Some(diff(code));
     }
     let set = set?;
     let syntax = set.find_syntax_by_token(lang)?;
@@ -73,20 +74,65 @@ pub fn highlight(set: Option<&SyntaxSet>, lang: &str, code: &str) -> Option<Vec<
     Some(out)
 }
 
-/// The colour for a diff line: added green, removed red, hunk headers cyan
-/// and file headers bold.
-fn diff(line: &str) -> Style {
-    let headers = ["diff ", "index ", "--- ", "+++ "];
-    if headers.iter().any(|h| line.starts_with(h)) {
-        Style::new().add_modifier(Modifier::BOLD)
-    } else if line.starts_with("@@") {
-        Style::new().fg(Color::Cyan)
-    } else if line.starts_with('+') {
-        Style::new().fg(Color::Green)
-    } else if line.starts_with('-') {
-        Style::new().fg(Color::Red)
-    } else {
-        Style::new()
+/// A diff's lines coloured: added green, removed red, hunk headers cyan and
+/// file headers bold. Inside a hunk, as long as its header says, a line is
+/// added or removed by its first character even when it looks like a header.
+fn diff(code: &str) -> Vec<Segments> {
+    let (added, removed) = (Style::new().fg(Color::Green), Style::new().fg(Color::Red));
+    // Lines left in the current hunk, of the old file and the new.
+    let (mut old, mut new) = (0usize, 0usize);
+    let mut style = |line: &str| {
+        if old + new > 0 {
+            return match line.chars().next() {
+                Some('+') => {
+                    new = new.saturating_sub(1);
+                    added
+                }
+                Some('-') => {
+                    old = old.saturating_sub(1);
+                    removed
+                }
+                // A note such as "\ No newline at end of file".
+                Some('\\') => Style::new(),
+                _ => {
+                    old = old.saturating_sub(1);
+                    new = new.saturating_sub(1);
+                    Style::new()
+                }
+            };
+        }
+        let headers = ["diff ", "index ", "--- ", "+++ "];
+        if line.starts_with("@@") {
+            (old, new) = hunk_lengths(line);
+            Style::new().fg(Color::Cyan)
+        } else if headers.iter().any(|h| line.starts_with(h)) {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else if line.starts_with('+') {
+            added
+        } else if line.starts_with('-') {
+            removed
+        } else {
+            Style::new()
+        }
+    };
+    let lines = code.split('\n');
+    lines.map(|l| vec![(l.to_string(), style(l))]).collect()
+}
+
+/// How many lines of the old and new file a hunk header such as
+/// `@@ -1,3 +1,4 @@` says follow, or none when it cannot be read.
+fn hunk_lengths(header: &str) -> (usize, usize) {
+    let length = |range: Option<&str>, sign: char| -> Option<usize> {
+        let range = range?.strip_prefix(sign)?;
+        match range.split_once(',') {
+            Some((_, n)) => n.parse().ok(),
+            None => range.parse::<usize>().ok().map(|_| 1),
+        }
+    };
+    let mut words = header.split_whitespace().skip(1);
+    match (length(words.next(), '-'), length(words.next(), '+')) {
+        (Some(old), Some(new)) => (old, new),
+        _ => (0, 0),
     }
 }
 
@@ -138,5 +184,31 @@ mod tests {
         let lines = highlight(Some(syntax_set()), "rust", "// note\nlet x = 1;\n").unwrap();
         let text: Vec<&str> = lines.iter().flatten().map(|(s, _)| s.as_str()).collect();
         assert!(text.iter().all(|s| !s.contains('\n')), "{text:?}");
+    }
+
+    #[test]
+    fn hunk_lines_that_look_like_headers_keep_their_colour() {
+        let code = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n--- old note\n+++ x\n";
+        let lines = highlight(None, "diff", code).unwrap();
+        let fg: Vec<_> = lines.iter().map(|l| l[0].1.fg).collect();
+        assert_eq!(
+            fg,
+            [
+                None,
+                None,
+                Some(Color::Cyan),
+                Some(Color::Red),
+                Some(Color::Green)
+            ]
+        );
+    }
+
+    #[test]
+    fn attributes_after_a_comma_are_not_part_of_the_language() {
+        let lines = highlight(Some(syntax_set()), "rust,no_run", "fn main() {}").unwrap();
+        assert_eq!(
+            lines[0][0],
+            ("fn".to_string(), Style::new().fg(Color::Magenta))
+        );
     }
 }

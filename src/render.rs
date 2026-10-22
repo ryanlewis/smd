@@ -5,9 +5,11 @@ use std::ops::Range;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use syntect::parsing::SyntaxSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle};
+use crate::highlight::{self, Segments};
 use crate::images::{self, Images, Placement};
 use crate::kitty;
 use crate::table::Table;
@@ -73,21 +75,30 @@ struct Ctx<'a> {
     sizes: HashMap<u32, (u16, u16)>,
     /// The colour code blocks are drawn on, when the background is known.
     panel: Option<Color>,
+    /// The syntaxes code is coloured with, once they have loaded.
+    syntaxes: Option<&'a SyntaxSet>,
 }
 
 /// Lay out the whole document for a view `width` columns wide. Blocks whose
 /// image is ready in `images` are drawn as placeholder cells.
 pub fn render(doc: &Document, width: u16, images: &Images) -> Layout {
-    layout(doc, width, images, theme::code_panel())
+    layout(doc, width, images, theme::code_panel(), highlight::ready())
 }
 
-fn layout(doc: &Document, width: u16, images: &Images, panel: Option<Color>) -> Layout {
+fn layout(
+    doc: &Document,
+    width: u16,
+    images: &Images,
+    panel: Option<Color>,
+    syntaxes: Option<&SyntaxSet>,
+) -> Layout {
     let mut ctx = Ctx {
         source: &doc.source,
         images,
         layout: Layout::default(),
         sizes: HashMap::new(),
         panel,
+        syntaxes,
     };
     blocks(&doc.blocks, width as usize, &[], &[], false, &mut ctx);
     ctx.layout
@@ -190,16 +201,23 @@ fn contents(
         BlockKind::Heading { level, content } => {
             wrap(content, heading_style(*level), width, first, rest, out);
         }
-        BlockKind::Code { code, .. } => match ctx.panel {
-            Some(bg) => code_panel(code, bg, width, first, rest, out),
-            // With no colour to shade, indenting sets the code apart.
-            None => {
-                let indent = Span::raw("  ");
-                let first = with(first, indent.clone());
-                let rest = with(rest, indent);
-                preformatted(code, CODE, width, &first, &rest, out);
+        BlockKind::Code { lang, code } => {
+            let colours = lang
+                .as_deref()
+                .and_then(|lang| highlight::highlight(ctx.syntaxes, lang, code));
+            match ctx.panel {
+                Some(bg) => code_panel(code, colours.as_deref(), bg, width, first, rest, out),
+                // With no colour to shade, indenting sets the code apart.
+                None => {
+                    let indent = Span::raw("  ");
+                    let first = with(first, indent.clone());
+                    let rest = with(rest, indent);
+                    let mut lines = Lines::new(width, &first, &rest, out);
+                    lines.code(code, colours.as_deref(), Style::new());
+                    lines.finish_last();
+                }
             }
-        },
+        }
         BlockKind::Figure {
             kind: FigureKind::Table,
             source,
@@ -456,6 +474,7 @@ fn preformatted(
 /// so copied code has no added indent.
 fn code_panel(
     code: &str,
+    colours: Option<&[Segments]>,
     bg: Color,
     width: usize,
     first: &[Span<'static>],
@@ -465,25 +484,23 @@ fn code_panel(
     let mut lines = Lines::new(width, first, rest, out);
     lines.pad = Some(Style::new().bg(bg));
     lines.finish();
-    lines.preformatted(code, CODE.bg(bg));
+    lines.code(code, colours, Style::new().bg(bg));
     lines.finish();
     lines.finish();
 }
 
-fn expand_tabs(line: &str) -> String {
-    if !line.contains('\t') {
-        return line.to_string();
-    }
+/// `text` with its tabs turned to spaces, where it starts at column `col`,
+/// which is moved on past it.
+fn expand_tabs(text: &str, col: &mut usize) -> String {
     let mut out = String::new();
-    let mut col = 0;
-    for c in line.chars() {
+    for c in text.chars() {
         if c == '\t' {
-            let n = TAB_WIDTH - col % TAB_WIDTH;
+            let n = TAB_WIDTH - *col % TAB_WIDTH;
             out.extend(std::iter::repeat_n(' ', n));
-            col += n;
+            *col += n;
         } else {
             out.push(c);
-            col += c.width().unwrap_or(0);
+            *col += c.width().unwrap_or(0);
         }
     }
     out
@@ -561,7 +578,24 @@ impl<'a> Lines<'a> {
             if i > 0 {
                 self.finish();
             }
-            self.push_breaking(&expand_tabs(line), style);
+            self.push_breaking(&expand_tabs(line, &mut 0), style);
+        }
+    }
+
+    /// Code on a `bg` style, in its `colours` when it has them and yellow
+    /// otherwise. The last line is left open.
+    fn code(&mut self, code: &str, colours: Option<&[Segments]>, bg: Style) {
+        let Some(colours) = colours else {
+            return self.preformatted(code, CODE.patch(bg));
+        };
+        for (i, line) in colours.iter().enumerate() {
+            if i > 0 {
+                self.finish();
+            }
+            let mut col = 0;
+            for (text, style) in line {
+                self.push_breaking(&expand_tabs(text, &mut col), bg.patch(*style));
+            }
         }
     }
 
@@ -696,7 +730,7 @@ mod tests {
     const BG: Color = Color::Rgb(48, 48, 63);
 
     fn panel(md: &str, width: u16) -> Vec<Line<'static>> {
-        layout(&parse(md), width, &no_images(), Some(BG)).lines
+        layout(&parse(md), width, &no_images(), Some(BG), None).lines
     }
 
     fn text(lines: &[Line]) -> Vec<String> {
@@ -753,7 +787,14 @@ mod tests {
 
     #[test]
     fn code_is_indented_when_the_background_is_unknown() {
-        let lines = layout(&parse("```\nlet x = 1;\n\nz\n```\n"), 8, &no_images(), None).lines;
+        let lines = layout(
+            &parse("```\nlet x = 1;\n\nz\n```\n"),
+            8,
+            &no_images(),
+            None,
+            None,
+        )
+        .lines;
         assert_eq!(text(&lines), vec!["  let x ", "  = 1;", "", "  z"]);
         assert!(
             lines
@@ -770,6 +811,7 @@ mod tests {
             40,
             &Images::text(),
             Some(BG),
+            None,
         )
         .lines;
         assert_eq!(text(&lines), vec!["graph TD", "", "<div>x</div>"]);
@@ -999,7 +1041,7 @@ mod tests {
         let md = "# A heading that is long\n\n> - quoted list item with words\n\n```\na long line of code here\n```\n\n---\n\n- | a | 日本語 |\n  |---|---|\n  | b | c |\n";
         for panel in [None, Some(BG)] {
             for width in 8..30u16 {
-                for line in layout(&parse(md), width, &no_images(), panel).lines {
+                for line in layout(&parse(md), width, &no_images(), panel, None).lines {
                     assert!(line.width() <= width as usize, "width {width}: {line:?}");
                 }
             }
@@ -1034,6 +1076,117 @@ mod tests {
         assert_eq!(
             narrow,
             vec!["│ mermaid: boom;", "│ showing the source", "│ graph LR"]
+        );
+    }
+
+    fn highlighted(md: &str, width: u16, ready: bool) -> Vec<Line<'static>> {
+        let set = ready.then(highlight::syntax_set);
+        layout(&parse(md), width, &no_images(), Some(BG), set).lines
+    }
+
+    /// The colour of the first piece of a line holding `text`.
+    fn fg_of(lines: &[Line], text: &str) -> Option<Color> {
+        let span = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.contains(text));
+        span.unwrap().style.fg
+    }
+
+    #[test]
+    fn code_is_coloured_by_its_language_on_the_panel() {
+        let md = "```rust\n// note\nfn add(a: Vec<u8>) { \"hi\"; 1; add(2) }\n```\n";
+        let lines = highlighted(md, 60, true);
+        let dim = lines[1].spans[0].style;
+        assert!(dim.add_modifier.contains(Modifier::DIM), "{dim:?}");
+        let code = &lines[2..3];
+        assert_eq!(fg_of(code, "fn"), Some(Color::Magenta));
+        assert_eq!(fg_of(code, "add"), Some(Color::Blue));
+        assert_eq!(fg_of(code, "Vec"), Some(Color::Yellow));
+        assert_eq!(fg_of(code, "hi"), Some(Color::Green));
+        assert_eq!(fg_of(code, "1"), Some(Color::Cyan));
+        for line in &lines {
+            assert_eq!(line.width(), 60, "{line:?}");
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(BG)),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_lines_are_coloured_by_their_first_character() {
+        let md =
+            "```diff\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n same\n-old\n+new\n```\n";
+        let lines = highlighted(md, 30, true);
+        let style = |row: usize| lines[row].spans[0].style;
+        for row in 1..=3 {
+            assert!(
+                style(row).add_modifier.contains(Modifier::BOLD),
+                "row {row}"
+            );
+        }
+        assert_eq!(style(4).fg, Some(Color::Cyan));
+        assert_eq!(style(5).fg, None);
+        assert_eq!(style(6).fg, Some(Color::Red));
+        assert_eq!(style(7).fg, Some(Color::Green));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.style.bg == Some(BG)))
+        );
+        let patch = highlighted("```patch\n+new\n```\n", 30, false);
+        assert_eq!(patch[1].spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn unknown_or_missing_languages_stay_yellow() {
+        for md in ["```nosuchlang\nlet x = 1;\n```\n", "```\nlet x = 1;\n```\n"] {
+            let lines = highlighted(md, 20, true);
+            assert_eq!(lines[1].spans[0].style, CODE.bg(BG), "{md}");
+        }
+    }
+
+    #[test]
+    fn code_is_yellow_until_the_syntaxes_are_ready() {
+        let lines = highlighted("```rust\nfn main() {}\n```\n", 20, false);
+        assert_eq!(lines[1].spans[0].style, CODE.bg(BG));
+    }
+
+    #[test]
+    fn highlighted_lines_break_at_the_edge_in_their_colours() {
+        let md = "```rust\nlet s = \"abcdefghijkl\";\n\tlet t = 1;\n```\n";
+        let lines = highlighted(md, 10, true);
+        assert_eq!(
+            text(&lines),
+            vec![
+                "          ",
+                "let s = \"a",
+                "bcdefghijk",
+                "l\";       ",
+                "    let t ",
+                "= 1;      ",
+                "          ",
+            ]
+        );
+        for line in &lines {
+            assert_eq!(line.width(), 10, "{line:?}");
+        }
+        assert_eq!(fg_of(&lines[2..3], "bcd"), Some(Color::Green));
+        assert_eq!(fg_of(&lines[3..4], "l"), Some(Color::Green));
+        assert_eq!(fg_of(&lines[4..5], "let"), Some(Color::Magenta));
+    }
+
+    #[test]
+    fn code_is_coloured_without_a_panel_too() {
+        let md = "```rust\nfn main() {}\n```\n";
+        let set = Some(highlight::syntax_set());
+        let lines = layout(&parse(md), 20, &no_images(), None, set).lines;
+        assert_eq!(fg_of(&lines, "fn"), Some(Color::Magenta));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.style.bg.is_none()))
         );
     }
 }

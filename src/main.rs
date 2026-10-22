@@ -1,6 +1,7 @@
 mod app;
 mod doc;
 mod heading;
+mod highlight;
 mod images;
 mod kitty;
 mod maths;
@@ -89,6 +90,8 @@ fn main() -> ExitCode {
         let _ = uploaded.delete_all(&mut io::stdout());
         restore(info);
     }));
+    // Started once the hook is set, like the jobs below.
+    highlight::load_in_background();
     // Made once the hook is set, as this starts the jobs.
     let view = app::View::new(doc::parse(&source), base, images);
     let result = app::run(&mut terminal, view, Path::new(path), watcher);

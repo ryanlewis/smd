@@ -450,29 +450,34 @@ fn load(path: &Path) -> Result<Png, String> {
     }
 }
 
-/// A GIF's first frame, placed on its logical screen. What the frame does
-/// not cover, and its transparent pixels, stay transparent.
+/// The most pixels a GIF's screen may have.
+const GIF_MAX_PIXELS: usize = 40_000_000;
+
+/// A GIF's first frame, placed on its logical screen, which grows to hold the
+/// frame if it is too small. What the frame does not cover, and its
+/// transparent pixels, stay transparent.
 fn gif(data: &[u8]) -> Result<Png, String> {
     let error = |e: gif::DecodingError| format!("GIF: {e}");
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
     let mut decoder = options.read_info(data).map_err(error)?;
-    let (width, height) = (usize::from(decoder.width()), usize::from(decoder.height()));
+    let screen = (usize::from(decoder.width()), usize::from(decoder.height()));
     let frame = decoder
         .read_next_frame()
         .map_err(error)?
         .ok_or("GIF has no frames")?;
-    let mut pixels = vec![0u8; width * height * 4];
     let (left, top) = (usize::from(frame.left), usize::from(frame.top));
     let frame_width = usize::from(frame.width);
+    let width = screen.0.max(left + frame_width);
+    let height = screen.1.max(top + usize::from(frame.height));
+    if width * height > GIF_MAX_PIXELS {
+        return Err("GIF too large".into());
+    }
+    let mut pixels = vec![0u8; width * height * 4];
+    let n = frame_width * 4;
     for y in 0..usize::from(frame.height) {
-        if top + y >= height || left >= width {
-            break;
-        }
-        let n = frame_width.min(width - left) * 4;
-        let from = y * frame_width * 4;
         let at = ((top + y) * width + left) * 4;
-        pixels[at..at + n].copy_from_slice(&frame.buffer[from..from + n]);
+        pixels[at..at + n].copy_from_slice(&frame.buffer[y * n..(y + 1) * n]);
     }
     let data = raster::encode(width as u32, height as u32, png::ColorType::Rgba, &pixels)?;
     Png::new(data)
@@ -753,6 +758,24 @@ pub mod tests {
         assert_eq!(pixel(&png, 1, 2), [255, 0, 0, 255]);
         assert_eq!(pixel(&png, 2, 2)[3], 0);
         assert_eq!(pixel(&png, 2, 3), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_gif_screen_too_big_fails() {
+        let frame = gif::Frame::from_palette_pixels(1, 1, [0], RED_GREEN, None);
+        assert!(load_bytes("huge.gif", &gif_bytes(65535, 65535, &[frame])).is_err());
+    }
+
+    #[test]
+    fn a_gif_screen_grows_to_hold_its_first_frame() {
+        let frame = gif::Frame::from_palette_pixels(3, 2, [0; 6], RED_GREEN, None);
+        let png = load_bytes("zero.gif", &gif_bytes(0, 0, &[frame])).unwrap();
+        assert_eq!((png.width, png.height), (3, 2));
+        let mut frame = gif::Frame::from_palette_pixels(3, 2, [0; 6], RED_GREEN, None);
+        frame.left = 1;
+        let png = load_bytes("wide.gif", &gif_bytes(2, 2, &[frame])).unwrap();
+        assert_eq!((png.width, png.height), (4, 2));
+        assert_eq!(pixel(&png, 3, 1), [255, 0, 0, 255]);
     }
 
     /// The fixture is a 5 by 3 red PNG saved as JPEG with

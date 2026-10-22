@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::doc::{Block, BlockKind, FigureKind};
 use crate::theme;
-use crate::{heading, kitty, maths, mermaid};
+use crate::{heading, kitty, maths, mermaid, raster};
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -437,8 +437,61 @@ fn percent_decode(src: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// A PNG, GIF or JPEG file, told apart by its first bytes. A GIF shows its
+/// first frame.
 fn load(path: &Path) -> Result<Png, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if data.starts_with(b"GIF8") {
+        gif(&data)
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        jpeg(&data)
+    } else {
+        Png::new(data)
+    }
+}
+
+/// A GIF's first frame, placed on its logical screen. What the frame does
+/// not cover, and its transparent pixels, stay transparent.
+fn gif(data: &[u8]) -> Result<Png, String> {
+    let error = |e: gif::DecodingError| format!("GIF: {e}");
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = options.read_info(data).map_err(error)?;
+    let (width, height) = (usize::from(decoder.width()), usize::from(decoder.height()));
+    let frame = decoder
+        .read_next_frame()
+        .map_err(error)?
+        .ok_or("GIF has no frames")?;
+    let mut pixels = vec![0u8; width * height * 4];
+    let (left, top) = (usize::from(frame.left), usize::from(frame.top));
+    let frame_width = usize::from(frame.width);
+    for y in 0..usize::from(frame.height) {
+        if top + y >= height || left >= width {
+            break;
+        }
+        let n = frame_width.min(width - left) * 4;
+        let from = y * frame_width * 4;
+        let at = ((top + y) * width + left) * 4;
+        pixels[at..at + n].copy_from_slice(&frame.buffer[from..from + n]);
+    }
+    let data = raster::encode(width as u32, height as u32, png::ColorType::Rgba, &pixels)?;
+    Png::new(data)
+}
+
+/// A JPEG in the colours the decoder gives.
+fn jpeg(data: &[u8]) -> Result<Png, String> {
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+    let mut decoder = zune_jpeg::JpegDecoder::new(io::Cursor::new(data));
+    let pixels = decoder.decode().map_err(|e| format!("JPEG: {e}"))?;
+    let info = decoder.info().ok_or("JPEG has no size")?;
+    let color = match decoder.output_colorspace() {
+        Some(ColorSpace::RGB) => png::ColorType::Rgb,
+        Some(ColorSpace::RGBA) => png::ColorType::Rgba,
+        Some(ColorSpace::Luma) => png::ColorType::Grayscale,
+        Some(ColorSpace::LumaA) => png::ColorType::GrayscaleAlpha,
+        _ => return Err("JPEG colours not supported".into()),
+    };
+    let data = raster::encode(info.width.into(), info.height.into(), color, &pixels)?;
     Png::new(data)
 }
 
@@ -645,6 +698,87 @@ pub mod tests {
         want(&mut images);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(images.ready(&file_key("d.png")).unwrap().px, (10, 20));
+    }
+
+    /// `data` written to a file and loaded from it.
+    fn load_bytes(name: &str, data: &[u8]) -> Result<Png, String> {
+        let dir = std::env::temp_dir().join(format!("smd-images-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, data).unwrap();
+        let png = load(&path);
+        let _ = std::fs::remove_file(&path);
+        png
+    }
+
+    /// A GIF of `frames` on a screen `width` by `height`.
+    fn gif_bytes(width: u16, height: u16, frames: &[gif::Frame]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut encoder = gif::Encoder::new(&mut data, width, height, &[]).unwrap();
+        for frame in frames {
+            encoder.write_frame(frame).unwrap();
+        }
+        drop(encoder);
+        data
+    }
+
+    /// The RGBA pixel at `x`, `y` of an RGBA PNG.
+    fn pixel(png: &Png, x: u32, y: u32) -> [u8; 4] {
+        let mut reader = png::Decoder::new(&png.data[..]).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        reader.next_frame(&mut buf).unwrap();
+        let at = ((y * png.width + x) * 4) as usize;
+        buf[at..at + 4].try_into().unwrap()
+    }
+
+    const RED_GREEN: [u8; 6] = [255, 0, 0, 0, 255, 0];
+
+    #[test]
+    fn a_gif_shows_its_first_frame() {
+        let first = gif::Frame::from_palette_pixels(3, 2, [0, 1, 0, 1, 0, 1], RED_GREEN, None);
+        let second = gif::Frame::from_palette_pixels(3, 2, [1; 6], RED_GREEN, None);
+        let png = load_bytes("a.gif", &gif_bytes(3, 2, &[first, second])).unwrap();
+        assert_eq!((png.width, png.height), (3, 2));
+        assert_eq!(pixel(&png, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(pixel(&png, 1, 0), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn a_small_gif_frame_sits_on_its_screen() {
+        let mut frame = gif::Frame::from_palette_pixels(2, 2, [0, 1, 1, 0], RED_GREEN, Some(1));
+        (frame.left, frame.top) = (1, 2);
+        let png = load_bytes("small.gif", &gif_bytes(4, 4, &[frame])).unwrap();
+        assert_eq!((png.width, png.height), (4, 4));
+        assert_eq!(pixel(&png, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(pixel(&png, 1, 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&png, 2, 2)[3], 0);
+        assert_eq!(pixel(&png, 2, 3), [255, 0, 0, 255]);
+    }
+
+    /// The fixture is a 5 by 3 red PNG saved as JPEG with
+    /// `sips -s format jpeg -s formatOptions 50`.
+    #[test]
+    fn a_jpeg_loads_at_its_size() {
+        let jpeg = include_bytes!("../tests/fixtures/red-5x3.jpg");
+        let png = load_bytes("red.jpg", jpeg).unwrap();
+        assert_eq!((png.width, png.height), (5, 3));
+        let [r, g, b] = pixel_rgb(&png);
+        assert!(r > 150 && g < 80 && b < 80, "{r} {g} {b}");
+    }
+
+    /// The first pixel of an RGB PNG.
+    fn pixel_rgb(png: &Png) -> [u8; 3] {
+        let mut reader = png::Decoder::new(&png.data[..]).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        reader.next_frame(&mut buf).unwrap();
+        buf[..3].try_into().unwrap()
+    }
+
+    #[test]
+    fn other_files_and_broken_images_fail() {
+        assert!(load_bytes("a.txt", b"hello").is_err());
+        assert!(load_bytes("cut.gif", b"GIF89a").is_err());
+        assert!(load_bytes("cut.jpg", b"\xff\xd8\xff\xe0").is_err());
     }
 
     #[test]

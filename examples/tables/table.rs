@@ -358,7 +358,8 @@ pub fn wrap(cell: &Cell, width: usize) -> Wrapped {
         .enumerate()
         .flat_map(|(i, (text, _))| text.chars().map(move |c| (c, i)));
     // Words, each with the run of the space before it.
-    let mut words: Vec<(Option<usize>, Vec<(char, usize)>)> = Vec::new();
+    type Word = (Option<usize>, Vec<(char, usize)>);
+    let mut words: Vec<Word> = Vec::new();
     let mut sep = None;
     let mut word = Vec::new();
     for (c, i) in chars {

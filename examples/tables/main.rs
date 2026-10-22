@@ -42,6 +42,18 @@ mod images {
             Ok(Png { data })
         }
     }
+
+    #[cfg(test)]
+    pub mod tests {
+        /// A PNG header for an image `w` by `h` pixels, as in `src/images.rs`.
+        pub fn png(w: u32, h: u32) -> Vec<u8> {
+            let mut data = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+            data.extend(w.to_be_bytes());
+            data.extend(h.to_be_bytes());
+            data.extend([8, 6, 0, 0, 0]);
+            data
+        }
+    }
 }
 
 use std::fmt::Write as _;

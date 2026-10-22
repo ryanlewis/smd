@@ -1,5 +1,6 @@
 //! Whether the terminal has a dark or a light background, so images drawn for
-//! it can match, and its colour, which code blocks are shaded from. The terminal is asked once at start-up; see [`crate::kitty`].
+//! it can match, and its colour, which code blocks are shaded from. The
+//! terminal is asked once at start-up; see [`crate::kitty`].
 
 use std::sync::OnceLock;
 

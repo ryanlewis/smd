@@ -58,6 +58,10 @@ fn main() -> ExitCode {
     let probe = (!no_graphics).then(kitty::probe);
     // Images are drawn for a dark background unless the terminal says otherwise.
     theme::set(probe.and_then(|p| p.theme).unwrap_or(theme::Theme::Dark));
+    // Code blocks are shaded from it; without it they are indented instead.
+    if let Some(rgb) = probe.and_then(|p| p.background) {
+        theme::set_background(rgb);
+    }
     let images = match probe {
         Some(probe) if probe.graphics => {
             heading::set_cell(probe.cell);

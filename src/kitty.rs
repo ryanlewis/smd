@@ -113,6 +113,8 @@ pub struct Probe {
     pub cell: (u16, u16),
     /// Whether the background is dark or light, if the terminal said.
     pub theme: Option<Theme>,
+    /// The background colour, if the terminal said.
+    pub background: Option<theme::Rgb>,
     /// The terminal answered the kitty graphics query.
     pub graphics: bool,
 }
@@ -134,6 +136,7 @@ pub fn probe() -> Probe {
             .or_else(window_cell_size)
             .unwrap_or(FALLBACK_CELL),
         theme: theme::parse_background_reply(&reply),
+        background: theme::parse_background_colour(&reply),
         graphics: parse_graphics_reply(&reply),
     }
 }

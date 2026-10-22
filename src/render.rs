@@ -11,6 +11,7 @@ use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle};
 use crate::images::{self, Images, Placement};
 use crate::kitty;
 use crate::table::Table;
+use crate::theme;
 
 const TAB_WIDTH: usize = 4;
 
@@ -70,16 +71,23 @@ struct Ctx<'a> {
     /// The size each image was given where it first appeared. One image has
     /// one placement, so a later block showing it must use the same size.
     sizes: HashMap<u32, (u16, u16)>,
+    /// The colour code blocks are drawn on, when the background is known.
+    panel: Option<Color>,
 }
 
 /// Lay out the whole document for a view `width` columns wide. Blocks whose
 /// image is ready in `images` are drawn as placeholder cells.
 pub fn render(doc: &Document, width: u16, images: &Images) -> Layout {
+    layout(doc, width, images, theme::code_panel())
+}
+
+fn layout(doc: &Document, width: u16, images: &Images, panel: Option<Color>) -> Layout {
     let mut ctx = Ctx {
         source: &doc.source,
         images,
         layout: Layout::default(),
         sizes: HashMap::new(),
+        panel,
     };
     blocks(&doc.blocks, width as usize, &[], &[], false, &mut ctx);
     ctx.layout
@@ -182,9 +190,16 @@ fn contents(
         BlockKind::Heading { level, content } => {
             wrap(content, heading_style(*level), width, first, rest, out);
         }
-        BlockKind::Code { code, .. } => {
-            preformatted(code, CODE, width, first, rest, out);
-        }
+        BlockKind::Code { code, .. } => match ctx.panel {
+            Some(bg) => code_panel(code, bg, width, first, rest, out),
+            // With no colour to shade, indenting sets the code apart.
+            None => {
+                let indent = Span::raw("  ");
+                let first = with(first, indent.clone());
+                let rest = with(rest, indent);
+                preformatted(code, CODE, width, &first, &rest, out);
+            }
+        },
         BlockKind::Figure {
             kind: FigureKind::Table,
             source,
@@ -432,14 +447,27 @@ fn preformatted(
     out: &mut Vec<Line<'static>>,
 ) {
     let mut lines = Lines::new(width, first, rest, out);
-    let text = text.trim_end_matches('\n');
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            lines.finish();
-        }
-        lines.push_breaking(&expand_tabs(line), style);
-    }
+    lines.preformatted(text, style);
     lines.finish_last();
+}
+
+/// Code on a panel of colour `bg` reaching to the right edge, with a blank
+/// panel row above and below. There is no space inside the panel's left edge,
+/// so copied code has no added indent.
+fn code_panel(
+    code: &str,
+    bg: Color,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    let mut lines = Lines::new(width, first, rest, out);
+    lines.pad = Some(Style::new().bg(bg));
+    lines.finish();
+    lines.preformatted(code, CODE.bg(bg));
+    lines.finish();
+    lines.finish();
 }
 
 fn expand_tabs(line: &str) -> String {
@@ -470,6 +498,8 @@ struct Lines<'a> {
     current: Vec<Span<'static>>,
     used: usize,
     emitted: usize,
+    /// When set, each line is filled to the edge with spaces in this style.
+    pad: Option<Style>,
 }
 
 impl<'a> Lines<'a> {
@@ -487,6 +517,7 @@ impl<'a> Lines<'a> {
             current: Vec::new(),
             used: 0,
             emitted: 0,
+            pad: None,
         }
     }
 
@@ -522,7 +553,25 @@ impl<'a> Lines<'a> {
         }
     }
 
+    /// Text as is, one line per line and broken at the edge. The last line is
+    /// left open.
+    fn preformatted(&mut self, text: &str, style: Style) {
+        let text = text.trim_end_matches('\n');
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                self.finish();
+            }
+            self.push_breaking(&expand_tabs(line), style);
+        }
+    }
+
     fn finish(&mut self) {
+        if let Some(pad) = self.pad {
+            let gap = self.avail().saturating_sub(self.used);
+            if gap > 0 {
+                self.current.push(Span::styled(" ".repeat(gap), pad));
+            }
+        }
         let content = std::mem::take(&mut self.current);
         emit(self.prefix(), content, self.out);
         self.used = 0;
@@ -644,11 +693,91 @@ mod tests {
         );
     }
 
+    const BG: Color = Color::Rgb(48, 48, 63);
+
+    fn panel(md: &str, width: u16) -> Vec<Line<'static>> {
+        layout(&parse(md), width, &no_images(), Some(BG)).lines
+    }
+
+    fn text(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
     #[test]
     fn code_keeps_lines_and_breaks_at_the_edge() {
         assert_eq!(
-            plain("```\nlet x = 1;\n\tindented\n```\n", 8),
-            vec!["let x = ", "1;", "    inde", "nted"]
+            text(&panel("```\nlet x = 1;\n\tindented\n```\n", 8)),
+            vec![
+                "        ", "let x = ", "1;      ", "    inde", "nted    ", "        ",
+            ]
+        );
+    }
+
+    #[test]
+    fn code_panel_colours_every_cell_to_the_edge() {
+        let lines = panel("text\n\n```\nab\n\ncd\n```\n\nmore\n", 6);
+        assert_eq!(
+            text(&lines),
+            vec![
+                "text", "", "      ", "ab    ", "      ", "cd    ", "      ", "", "more"
+            ]
+        );
+        for line in &lines[2..7] {
+            assert_eq!(line.width(), 6);
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(BG)),
+                "{line:?}"
+            );
+        }
+        assert_eq!(lines[3].spans[0].style, CODE.bg(BG));
+        assert!(lines[0].spans.iter().all(|s| s.style.bg.is_none()));
+    }
+
+    #[test]
+    fn code_panel_starts_after_list_and_quote_prefixes() {
+        assert_eq!(
+            text(&panel("- ```\n  ab\n  ```\n", 8)),
+            vec!["•       ", "  ab    ", "        "]
+        );
+        let lines = panel("> ```\n> ab\n> ```\n", 8);
+        assert_eq!(text(&lines), vec!["│       ", "│ ab    ", "│       "]);
+        for line in &lines {
+            assert_eq!(line.spans[0].content, "│ ");
+            assert_eq!(line.spans[0].style.bg, None);
+            assert!(line.spans[1..].iter().all(|s| s.style.bg == Some(BG)));
+        }
+    }
+
+    #[test]
+    fn code_is_indented_when_the_background_is_unknown() {
+        let lines = layout(&parse("```\nlet x = 1;\n\nz\n```\n"), 8, &no_images(), None).lines;
+        assert_eq!(text(&lines), vec!["  let x ", "  = 1;", "", "  z"]);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .all(|s| s.style.bg.is_none())
+        );
+    }
+
+    #[test]
+    fn only_code_blocks_get_the_panel() {
+        let lines = layout(
+            &parse("```mermaid\ngraph TD\n```\n\n<div>x</div>\n"),
+            40,
+            &Images::text(),
+            Some(BG),
+        )
+        .lines;
+        assert_eq!(text(&lines), vec!["graph TD", "", "<div>x</div>"]);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .all(|s| s.style.bg.is_none())
         );
     }
 
@@ -868,9 +997,11 @@ mod tests {
     #[test]
     fn no_line_is_wider_than_the_view() {
         let md = "# A heading that is long\n\n> - quoted list item with words\n\n```\na long line of code here\n```\n\n---\n\n- | a | 日本語 |\n  |---|---|\n  | b | c |\n";
-        for width in 8..30u16 {
-            for line in render(&parse(md), width, &no_images()).lines {
-                assert!(line.width() <= width as usize, "width {width}: {line:?}");
+        for panel in [None, Some(BG)] {
+            for width in 8..30u16 {
+                for line in layout(&parse(md), width, &no_images(), panel).lines {
+                    assert!(line.width() <= width as usize, "width {width}: {line:?}");
+                }
             }
         }
     }

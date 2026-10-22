@@ -4,7 +4,7 @@ smd is a terminal markdown reader. It shows mermaid diagrams, maths and headings
 
 Tables are drawn as text. A table wider than the pane wraps its cells. A table with too many columns to wrap well is shown as one card per row, with a `Header: value` line for each cell.
 
-Code blocks are drawn on a panel a little lighter than the terminal's background (darker on a light one). If the terminal does not say what its background is, or with `--no-graphics`, they are indented instead.
+Code blocks are drawn on a panel a little lighter than the terminal's background (darker on a light one). If the terminal does not say what its background is, or with `--no-graphics`, they are indented instead. Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours.
 
 ## Build
 

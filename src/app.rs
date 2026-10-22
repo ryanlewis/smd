@@ -12,6 +12,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::doc::{self, Document};
+use crate::highlight;
 use crate::images::{self, Images};
 use crate::render::{Layout, render};
 use crate::watch::{Change, Watcher};
@@ -27,6 +28,8 @@ pub struct View {
     layout: Layout,
     /// Width the lines were laid out for; zero before the first layout.
     width: u16,
+    /// Whether the lines were laid out with the syntaxes for code.
+    highlighted: bool,
     height: u16,
     scroll: usize,
     /// A message shown on the bottom row, such as the file being deleted.
@@ -74,6 +77,7 @@ impl View {
             images,
             layout: Layout::default(),
             width: 0,
+            highlighted: false,
             height: 0,
             scroll: 0,
             notice: None,
@@ -101,6 +105,7 @@ impl View {
 
     fn relayout(&mut self, anchor: Option<Anchor>) {
         if self.width > 0 {
+            self.highlighted = highlight::ready().is_some();
             self.layout = render(&self.doc, self.width, &self.images);
             if let Some(row) = anchor.and_then(|a| self.find(&a)) {
                 self.scroll = row;
@@ -152,6 +157,17 @@ impl View {
         true
     }
 
+    /// Lay the document out again once the syntaxes for code have loaded.
+    /// Returns true when the view changed.
+    pub fn receive_syntaxes(&mut self) -> bool {
+        if self.highlighted || self.width == 0 || highlight::ready().is_none() {
+            return false;
+        }
+        let anchor = self.anchor();
+        self.relayout(anchor);
+        true
+    }
+
     /// Send the terminal what it needs to show the images on the last frame.
     /// This goes straight to the terminal, outside ratatui's buffer.
     pub fn flush_images(&mut self, out: &mut impl Write) -> io::Result<()> {
@@ -167,6 +183,7 @@ impl View {
     fn resize(&mut self, width: u16, height: u16) {
         if width != self.width {
             let old_len = self.layout.lines.len().max(1);
+            self.highlighted = highlight::ready().is_some();
             self.layout = render(&self.doc, width, &self.images);
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
@@ -296,6 +313,10 @@ fn run_view(
             }
             // Images are made on other threads; this is where they show up.
             if view.receive_images() {
+                redraw = true;
+            }
+            // So are the syntaxes code is coloured with.
+            if view.receive_syntaxes() {
                 redraw = true;
             }
         }

@@ -135,18 +135,18 @@ impl Table {
         let avail = avail.max(1);
         let natural = self.natural();
         if frame(&natural) <= avail {
-            return self.grid(&natural, styled).0;
+            return self.grid(&natural, styled).lines;
         }
         let cards = self.cards(avail, styled);
         if let Some(widths) = self.fit(avail) {
-            let (grid, hard) = self.grid(&widths, styled);
+            let grid = self.grid(&widths, styled);
             // Compared without their rules, which would favour cards on a
             // short table: a grid has 3 or 4 and cards one per row.
-            let rules = |lines: &Lines, n: usize| lines.len().saturating_sub(n);
             let body = self.rows.len() - 1;
-            let grid_rules = if body > 0 { 3 } else { 2 };
-            if hard <= MAX_HARD && rules(&grid, grid_rules) <= rules(&cards, body.max(1) + 1) {
-                return grid;
+            let card_rules = body.max(1) + 1;
+            let grid_text = grid.lines.len() - grid.rules;
+            if grid.hard <= MAX_HARD && grid_text <= cards.len().saturating_sub(card_rules) {
+                return grid.lines;
             }
         }
         cards
@@ -215,35 +215,39 @@ impl Table {
 
     /// The table inside box rules, each cell wrapped to its column's width,
     /// and how many words were broken mid-word.
-    fn grid(
-        &self,
-        widths: &[usize],
-        styled: impl Fn(Style, &InlineStyle) -> Style,
-    ) -> (Lines, usize) {
+    fn grid(&self, widths: &[usize], styled: impl Fn(Style, &InlineStyle) -> Style) -> Grid {
         let border = Style::new().fg(Color::DarkGray);
-        let rule = |left: &str, mid: &str, right: &str| {
-            let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        let rule = |left: &str, fill: &str, mid: &str, right: &str| {
+            let parts: Vec<String> = widths.iter().map(|w| fill.repeat(w + 2)).collect();
             vec![Span::styled(
                 format!("{left}{}{right}", parts.join(mid)),
                 border,
             )]
         };
+        let rows: Vec<Vec<Wrapped>> = self
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .zip(widths)
+                    .map(|(cell, &w)| wrap(cell, w))
+                    .collect()
+            })
+            .collect();
+        let height = |cells: &[Wrapped]| cells.iter().map(|w| w.lines.len()).max().unwrap_or(1);
+        // Rows that take several lines run together, so a dashed rule marks
+        // where each ends. A table whose rows are one line each stays compact.
+        let separate = rows[1..].iter().any(|cells| height(cells) > 1);
         let mut hard = 0;
-        let mut lines = vec![rule("┌", "┬", "┐")];
-        for (r, row) in self.rows.iter().enumerate() {
+        let mut lines = vec![rule("┌", "─", "┬", "┐")];
+        for (r, cells) in rows.iter().enumerate() {
             let base = if r == 0 {
                 Style::new().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let cells: Vec<Wrapped> = row
-                .iter()
-                .zip(widths)
-                .map(|(cell, &w)| wrap(cell, w))
-                .collect();
             hard += cells.iter().map(|w| w.hard).sum::<usize>();
-            let height = cells.iter().map(|w| w.lines.len()).max().unwrap_or(1);
-            for k in 0..height {
+            for k in 0..height(cells) {
                 let mut line = Vec::new();
                 for (c, cell) in cells.iter().enumerate() {
                     let edge = if c == 0 { "│ " } else { " │ " };
@@ -260,12 +264,18 @@ impl Table {
                 line.push(Span::styled(" │", border));
                 lines.push(line);
             }
-            if r == 0 && self.rows.len() > 1 {
-                lines.push(rule("├", "┼", "┤"));
+            if r + 1 < rows.len() {
+                if r == 0 {
+                    lines.push(rule("├", "─", "┼", "┤"));
+                } else if separate {
+                    lines.push(rule("├", "╌", "┼", "┤"));
+                }
             }
         }
-        lines.push(rule("└", "┴", "┘"));
-        (lines, hard)
+        lines.push(rule("└", "─", "┴", "┘"));
+        let rules =
+            2 + if rows.len() > 1 { 1 } else { 0 } + if separate { rows.len() - 2 } else { 0 };
+        Grid { lines, hard, rules }
     }
 
     /// Each body row as a card between rules: a `Header: value` line for
@@ -345,6 +355,15 @@ fn spans(lines: &[Cell], base: Style, styled: impl Fn(Style, &InlineStyle) -> St
 /// Columns taken by box rules and padding around columns of these widths.
 fn frame(widths: &[usize]) -> usize {
     widths.iter().sum::<usize>() + 3 * widths.len() + 1
+}
+
+/// A table drawn inside box rules.
+struct Grid {
+    lines: Lines,
+    /// Words broken mid-word.
+    hard: usize,
+    /// How many of the lines are rules.
+    rules: usize,
 }
 
 /// A cell broken into lines.
@@ -593,6 +612,31 @@ mod tests {
                 "└──────┴─────────────┘",
             ]
         );
+    }
+
+    #[test]
+    fn a_dashed_rule_separates_rows_only_when_one_wraps() {
+        let md =
+            "| name | note |\n|---|---|\n| a | one two three four |\n| b | five |\n| c | six |";
+        assert_eq!(
+            plain(&Table::parse(md), 22),
+            vec![
+                "┌──────┬─────────────┐",
+                "│ name │ note        │",
+                "├──────┼─────────────┤",
+                "│ a    │ one two     │",
+                "│      │ three four  │",
+                "├╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┤",
+                "│ b    │ five        │",
+                "├╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌┤",
+                "│ c    │ six         │",
+                "└──────┴─────────────┘",
+            ]
+        );
+        // Wide enough for one line a row: no rules between rows.
+        let lines = plain(&Table::parse(md), 40);
+        assert_eq!(lines.len(), 7);
+        assert!(lines.iter().all(|l| !l.contains('╌')), "{lines:?}");
     }
 
     #[test]

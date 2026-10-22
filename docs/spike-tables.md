@@ -59,6 +59,6 @@ The constants (30, 12, 2) are set from this test set, which is small.
 
 ## Open questions
 
-- **Rows run together when they wrap.** With several lines per row and no rule between rows, it can be hard to see where one row ends. A faint rule between body rows, only when some row wraps, would probably fix this. Not tried.
+- **Rows run together when they wrap.** With several lines per row and no rule between rows, it can be hard to see where one row ends. Done after the spike: smd draws a dashed rule between body rows when any row wraps.
 - **Header cells wrap like any other cell.** A narrow column can split its header over two lines. This is readable, but a header could be kept whole when it fits.
 - **The table images have a proportional look that text does not.** Dropping them is a visual change, so it is worth checking against real documents before removing the code.

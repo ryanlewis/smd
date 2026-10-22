@@ -23,8 +23,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use crate::doc::{Block, BlockKind, FigureKind};
-use crate::theme::{self, Theme};
-use crate::{heading, kitty, maths, mermaid, table};
+use crate::theme;
+use crate::{heading, kitty, maths, mermaid};
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -351,10 +351,6 @@ pub fn key(block: &Block) -> Option<Key> {
             "mermaid:{}",
             mermaid::name(source, theme::current())
         ))),
-        BlockKind::Figure {
-            kind: FigureKind::Table,
-            source,
-        } => Some(table_key(source, theme::current())),
         BlockKind::Heading { level, content } => {
             heading::name(*level, content, theme::current()).map(Key)
         }
@@ -387,22 +383,10 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
             kind: FigureKind::Mermaid,
             source,
         } => mermaid::job(source.clone(), theme::current()),
-        BlockKind::Figure {
-            kind: FigureKind::Table,
-            source,
-        } => {
-            let (source, theme) = (source.clone(), theme::current());
-            Box::new(move || table::image(&source, theme))
-        }
         BlockKind::Heading { level, content } => heading::job(*level, content, theme::current()),
         _ => return None,
     };
     Some((key, job))
-}
-
-/// A table's image depends on its source and the theme, never on the width.
-fn table_key(source: &str, theme: Theme) -> Key {
-    Key(format!("table:{}:{source}", theme.name()))
 }
 
 /// Every image the blocks, and the blocks inside them, are drawn as.
@@ -603,19 +587,6 @@ pub mod tests {
         let (cols, rows) = fit((10_000, 1000), (10, 20), 1000).unwrap();
         assert_eq!((cols, rows), (280, 14));
         assert!(cols <= kitty::MAX_CELLS);
-    }
-
-    #[test]
-    fn a_table_is_keyed_on_its_source_and_theme() {
-        let doc = parse("| a |\n|---|\n| 1 |\n");
-        assert_eq!(
-            key(&doc.blocks[0]),
-            Some(table_key("| a |\n|---|\n| 1 |", Theme::Dark))
-        );
-        assert_ne!(
-            table_key("| a |", Theme::Dark),
-            table_key("| a |", Theme::Light)
-        );
     }
 
     #[test]

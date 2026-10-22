@@ -138,15 +138,6 @@ fn placement(
     let key = images::key(block)?;
     let prefix = spans_width(first).max(spans_width(rest));
     let avail = width.saturating_sub(prefix).clamp(1, u16::MAX as usize) as u16;
-    // A table that fits stays as text.
-    if let BlockKind::Figure {
-        kind: FigureKind::Table,
-        source,
-    } = &block.kind
-        && Table::parse(source).width() <= usize::from(avail)
-    {
-        return None;
-    }
     let ready = ctx.images.ready(&key)?;
     let fitted = images::fit(ready.px, ctx.images.cell(), avail)?;
     let size = *ctx.sizes.entry(ready.id).or_insert(fitted);
@@ -194,11 +185,23 @@ fn contents(
         BlockKind::Code { code, .. } => {
             preformatted(code, CODE, width, first, rest, out);
         }
+        BlockKind::Figure {
+            kind: FigureKind::Table,
+            source,
+        } => {
+            let prefix = spans_width(first).max(spans_width(rest));
+            let avail = width.saturating_sub(prefix).max(1);
+            for (i, line) in Table::parse(source)
+                .lines(avail, inline_style)
+                .into_iter()
+                .enumerate()
+            {
+                emit(if i == 0 { first } else { rest }, line, out);
+            }
+        }
         // Without graphics an image block is never drawn, so it shows its
-        // source as code. Tables are text already, cut when too wide.
-        BlockKind::Figure { kind, source }
-            if !ctx.images.graphics() && *kind != FigureKind::Table =>
-        {
+        // source as code.
+        BlockKind::Figure { source, .. } if !ctx.images.graphics() => {
             preformatted(source, CODE, width, first, rest, out);
         }
         BlockKind::Image { src, alt } if !ctx.images.graphics() => {
@@ -210,16 +213,9 @@ fn contents(
             };
             preformatted(&text, CODE, width, first, rest, out);
         }
-        BlockKind::Figure { kind, source } => {
-            let table = (*kind == FigureKind::Table).then(|| Table::parse(source));
-            let prefix = spans_width(first).max(spans_width(rest));
-            let fits = |t: &Table| t.width() <= width.saturating_sub(prefix).max(1);
-            // A figure that could not be drawn says why above its source. A
-            // table that fits is meant to be text, so it has nothing to say.
-            let error = match &table {
-                Some(t) if fits(t) => None,
-                _ => images::key(block).and_then(|key| ctx.images.error(&key)),
-            };
+        BlockKind::Figure { source, .. } => {
+            // A figure that could not be drawn says why above its source.
+            let error = images::key(block).and_then(|key| ctx.images.error(&key));
             let first = match error {
                 Some(error) => {
                     let note = Inline::Text {
@@ -232,16 +228,8 @@ fn contents(
                 }
                 None => first,
             };
-            let Some(table) = table else {
-                let style = Style::new().fg(Color::Cyan);
-                preformatted(source, style, width, first, rest, out);
-                return;
-            };
-            for (i, line) in table.text(inline_style).into_iter().enumerate() {
-                let prefix = if i == 0 { first } else { rest };
-                let avail = width.saturating_sub(spans_width(prefix)).max(1);
-                emit(prefix, cut(line, avail), out);
-            }
+            let style = Style::new().fg(Color::Cyan);
+            preformatted(source, style, width, first, rest, out);
         }
         BlockKind::Html(html) => {
             preformatted(
@@ -305,31 +293,6 @@ fn contents(
             }
         }
     }
-}
-
-/// `spans` cut to `avail` columns, ending in `…` when anything was cut. Wide
-/// tables are cut rather than wrapped, so their columns stay lined up.
-fn cut(spans: Vec<Span<'static>>, avail: usize) -> Vec<Span<'static>> {
-    if spans_width(&spans) <= avail {
-        return spans;
-    }
-    let mut out = Vec::new();
-    let mut used = 0;
-    'spans: for span in spans {
-        let mut text = String::new();
-        for c in span.content.chars() {
-            let w = c.width().unwrap_or(0);
-            if used + w + 1 > avail {
-                out.push(Span::styled(text, span.style));
-                break 'spans;
-            }
-            text.push(c);
-            used += w;
-        }
-        out.push(Span::styled(text, span.style));
-    }
-    out.push(Span::styled("…", Style::new().fg(Color::DarkGray)));
-    out
 }
 
 const CODE: Style = Style::new().fg(Color::Yellow);
@@ -717,59 +680,34 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_table_without_its_image_is_cut_not_wrapped() {
+    fn a_wide_table_wraps_to_the_width_left_by_its_prefix() {
         assert_eq!(
-            plain("| alpha | beta |\n|---|---|\n| `x` | 2 |\n", 10),
+            plain(
+                "> | name | note |\n> |---|---|\n> | a | one two three four |\n",
+                24
+            ),
             vec![
-                "┌───────┬…",
-                "│ alpha │…",
-                "├───────┼…",
-                "│ x     │…",
-                "└───────┴…",
+                "│ ┌──────┬─────────────┐",
+                "│ │ name │ note        │",
+                "│ ├──────┼─────────────┤",
+                "│ │ a    │ one two     │",
+                "│ │      │ three four  │",
+                "│ └──────┴─────────────┘",
             ]
         );
     }
 
-    /// A store with the image of the table in `md` ready, at 10x20 cells.
-    fn table_ready(md: &str) -> Images {
-        let mut store = Images::new((10, 20));
+    #[test]
+    fn a_table_is_text_even_with_graphics() {
+        let md = "| alpha | beta |\n|---|---|\n| 1 | 2 |\n";
         let doc = parse(md);
-        let key = images::key(&doc.blocks[0]).unwrap();
-        let job = crate::images::tests::job(crate::images::tests::png(400, 60));
-        store.request(key, job);
-        crate::images::tests::settle(&mut store);
-        store
-    }
-
-    #[test]
-    fn a_failed_table_image_is_noted_only_when_the_table_does_not_fit() {
-        let md = "| alpha | beta |\n|---|---|\n| 1 | 2 |\n";
-        let mut images = Images::new((10, 20));
-        let key = images::key(&parse(md).blocks[0]).unwrap();
-        images.request(key, Box::new(|| Err("table: no glyph".into())));
-        crate::images::tests::settle(&mut images);
-        let lines = |width| -> Vec<String> {
-            let layout = render(&parse(md), width, &images);
-            layout.lines.iter().map(|l| l.to_string()).collect()
-        };
-        assert_eq!(lines(40)[0], "┌───────┬──────┐");
-        let narrow = lines(15);
-        assert_eq!(narrow[0], "table: no");
-        assert_eq!(narrow.last().unwrap(), "└───────┴─────…");
-    }
-
-    #[test]
-    fn a_table_becomes_its_image_only_when_it_does_not_fit() {
-        let md = "| alpha | beta |\n|---|---|\n| 1 | 2 |\n";
-        let images = table_ready(md);
-        let wide = render(&parse(md), 40, &images);
-        assert_eq!(wide.lines.len(), 5);
-        assert_eq!(wide.placements(), vec![]);
-        // 16 columns do not fit in 15: the image shrinks to one whole row.
-        let narrow = render(&parse(md), 15, &images);
-        let p = narrow.placements();
-        assert_eq!((p[0].cols, p[0].rows), (14, 1));
-        assert_eq!(narrow.lines.len(), 1);
+        assert_eq!(images::key(&doc.blocks[0]), None);
+        for width in [40, 15, 8] {
+            let graphics = render(&doc, width, &Images::new((10, 20)));
+            let text = render(&doc, width, &Images::text());
+            assert!(graphics.placements().is_empty());
+            assert_eq!(graphics.lines, text.lines, "width {width}");
+        }
     }
 
     /// Images with `src` ready, each `px` pixels, in a store with 10x20 cells.
@@ -812,13 +750,13 @@ mod tests {
         for row in [0, 2] {
             assert_eq!(layout.lines[row].spans[0].style, CODE, "row {row}");
         }
-        // Tables stay text, cut with … when too wide.
+        // Tables are drawn, not shown as code, and fit the width.
         for row in [4, 8] {
             assert_ne!(layout.lines[row].spans[0].style, CODE, "row {row}");
         }
         let wide = render(&parse("| aaaa | bbbb |\n|---|---|\n"), 8, &Images::text());
         let text: Vec<String> = wide.lines.iter().map(|l| l.to_string()).collect();
-        assert!(text.iter().all(|l| l.ends_with('…')), "{text:?}");
+        assert!(text.iter().all(|l| l.width() <= 8), "{text:?}");
         assert!(layout.placements().is_empty());
         // The image is shown as written, not rebuilt from its parts.
         let md = "> ![a \\] b](<my diagram.png> \"Title\")\n";

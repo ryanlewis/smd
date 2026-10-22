@@ -1,26 +1,37 @@
-//! Tables: drawn as text with box rules when they fit the view, and as an
-//! image when they do not.
+//! Tables, drawn as text. A table wider than the view wraps its cells, and
+//! one with too many columns to wrap well is drawn as cards: a block of
+//! `Header: value` lines per row. See `docs/spike-tables.md`.
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::InlineStyle;
-use crate::images::Png;
-use crate::raster::{self, Canvas, Rgba};
-use crate::theme::Theme;
 
-/// Text size of the image in pixels. The image is made at this one size and
-/// shrunk to fit the view, so a resize never makes a new one.
-const SIZE: f32 = 32.0;
+/// The longest word a column is widened to hold whole. A longer one, such as
+/// a URL, breaks.
+const WORD_CAP: usize = 30;
 
-/// The most pixels a table image may have; a bigger table stays as text.
-const MAX_PIXELS: u64 = 40_000_000;
+/// The narrowest a column is made when the longest words do not all fit,
+/// unless its text is shorter.
+const FLOOR: usize = 12;
+
+/// The most words wrapped cells may break mid-word before cards are used.
+const MAX_HARD: usize = 2;
+
+/// Characters a word too long for its column may break after. A break
+/// there does not count against `MAX_HARD`.
+const BREAK_AFTER: &str = "/-_.,:=";
 
 /// The text of one cell, in runs of one style each.
 type Cell = Vec<(String, InlineStyle)>;
+
+/// Characters, each with the index of the run it came from.
+type Chars = Vec<(char, usize)>;
+
+/// Lines of styled text.
+type Lines = Vec<Vec<Span<'static>>>;
 
 #[derive(Debug, PartialEq)]
 pub struct Table {
@@ -112,26 +123,103 @@ impl Table {
         Table { aligns, rows }
     }
 
-    /// The width of each column drawn as text.
-    fn widths(&self) -> Vec<usize> {
+    /// The table drawn in `avail` columns: as it is when it fits, with its
+    /// cells wrapped when that breaks few words and takes no more lines than
+    /// cards, and as cards otherwise. `styled` turns a cell's inline style into a
+    /// terminal style on top of a base style.
+    pub fn lines(
+        &self,
+        avail: usize,
+        styled: impl Fn(Style, &InlineStyle) -> Style + Copy,
+    ) -> Lines {
+        let avail = avail.max(1);
+        let natural = self.natural();
+        if frame(&natural) <= avail {
+            return self.grid(&natural, styled).0;
+        }
+        let cards = self.cards(avail, styled);
+        if let Some(widths) = self.fit(avail) {
+            let (grid, hard) = self.grid(&widths, styled);
+            // Compared without their rules, which would favour cards on a
+            // short table: a grid has 3 or 4 and cards one per row.
+            let rules = |lines: &Lines, n: usize| lines.len().saturating_sub(n);
+            let body = self.rows.len() - 1;
+            let grid_rules = if body > 0 { 3 } else { 2 };
+            if hard <= MAX_HARD && rules(&grid, grid_rules) <= rules(&cards, body.max(1) + 1) {
+                return grid;
+            }
+        }
+        cards
+    }
+
+    /// The width of each column with nothing wrapped.
+    fn natural(&self) -> Vec<usize> {
+        self.per_column(|cell| text_width(cell))
+    }
+
+    /// The widest word in each column, at most `WORD_CAP`.
+    fn words(&self) -> Vec<usize> {
+        self.per_column(|cell| {
+            let text: String = cell.iter().map(|(t, _)| t.as_str()).collect();
+            let widest = text.split(' ').map(UnicodeWidthStr::width).max();
+            widest.unwrap_or(0).min(WORD_CAP)
+        })
+    }
+
+    /// The most `measure` gives for any cell in each column, at least 1.
+    fn per_column(&self, measure: impl Fn(&Cell) -> usize) -> Vec<usize> {
         (0..self.aligns.len())
             .map(|c| {
-                let widest = self.rows.iter().map(|row| text_width(&row[c])).max();
+                let widest = self.rows.iter().map(|row| measure(&row[c])).max();
                 widest.unwrap_or(0).max(1)
             })
             .collect()
     }
 
-    /// Columns the table takes drawn as text.
-    pub fn width(&self) -> usize {
-        let widths = self.widths();
-        widths.iter().sum::<usize>() + 3 * widths.len() + 1
+    /// Column widths that fit the table in `avail` columns, or `None` when
+    /// even narrow columns do not. Each column first gets room for its
+    /// longest word, so words stay whole; when those do not all fit, it gets
+    /// `FLOOR` or its natural width, whichever is less. The rest of the space
+    /// goes to each column in proportion to how much more it wants.
+    fn fit(&self, avail: usize) -> Option<Vec<usize>> {
+        let natural = self.natural();
+        let budget = avail.checked_sub(frame(&vec![0; natural.len()]))?;
+        if natural.iter().sum::<usize>() <= budget {
+            return Some(natural);
+        }
+        let words = self.words();
+        let min = if words.iter().sum::<usize>() <= budget {
+            words
+        } else {
+            natural.iter().map(|&w| w.min(FLOOR)).collect()
+        };
+        let spare = budget.checked_sub(min.iter().sum())?;
+        let want: Vec<usize> = natural.iter().zip(&min).map(|(n, m)| n - m).collect();
+        let total = want.iter().sum::<usize>().max(1);
+        let mut widths: Vec<usize> = min
+            .iter()
+            .zip(&want)
+            .map(|(m, w)| m + w * spare / total)
+            .collect();
+        // Rounding down leaves a few columns over: give them out one at a
+        // time to whichever column is furthest short of its natural width.
+        for _ in 0..budget - widths.iter().sum::<usize>() {
+            let short = (0..widths.len()).max_by_key(|&c| natural[c] - widths[c]);
+            match short {
+                Some(c) if widths[c] < natural[c] => widths[c] += 1,
+                _ => break,
+            }
+        }
+        Some(widths)
     }
 
-    /// The table as lines of text inside box rules. `styled` turns a cell's
-    /// inline style into a terminal style on top of a base style.
-    pub fn text(&self, styled: impl Fn(Style, &InlineStyle) -> Style) -> Vec<Vec<Span<'static>>> {
-        let widths = self.widths();
+    /// The table inside box rules, each cell wrapped to its column's width,
+    /// and how many words were broken mid-word.
+    fn grid(
+        &self,
+        widths: &[usize],
+        styled: impl Fn(Style, &InlineStyle) -> Style,
+    ) -> (Lines, usize) {
         let border = Style::new().fg(Color::DarkGray);
         let rule = |left: &str, mid: &str, right: &str| {
             let parts: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
@@ -140,6 +228,7 @@ impl Table {
                 border,
             )]
         };
+        let mut hard = 0;
         let mut lines = vec![rule("┌", "┬", "┐")];
         for (r, row) in self.rows.iter().enumerate() {
             let base = if r == 0 {
@@ -147,26 +236,221 @@ impl Table {
             } else {
                 Style::default()
             };
-            let mut line = Vec::new();
-            for (c, cell) in row.iter().enumerate() {
-                let edge = if c == 0 { "│ " } else { " │ " };
-                line.push(Span::styled(edge, border));
-                let (before, after) = padding(self.aligns[c], widths[c] - text_width(cell));
-                line.push(Span::raw(" ".repeat(before)));
-                for (text, style) in cell {
-                    line.push(Span::styled(text.clone(), styled(base, style)));
+            let cells: Vec<Wrapped> = row
+                .iter()
+                .zip(widths)
+                .map(|(cell, &w)| wrap(cell, w))
+                .collect();
+            hard += cells.iter().map(|w| w.hard).sum::<usize>();
+            let height = cells.iter().map(|w| w.lines.len()).max().unwrap_or(1);
+            for k in 0..height {
+                let mut line = Vec::new();
+                for (c, cell) in cells.iter().enumerate() {
+                    let edge = if c == 0 { "│ " } else { " │ " };
+                    line.push(Span::styled(edge, border));
+                    let part = cell.lines.get(k).map_or(&[][..], Vec::as_slice);
+                    let extra = widths[c].saturating_sub(text_width(part));
+                    let (before, after) = padding(self.aligns[c], extra);
+                    line.push(Span::raw(" ".repeat(before)));
+                    for (text, style) in part {
+                        line.push(Span::styled(text.clone(), styled(base, style)));
+                    }
+                    line.push(Span::raw(" ".repeat(after)));
                 }
-                line.push(Span::raw(" ".repeat(after)));
+                line.push(Span::styled(" │", border));
+                lines.push(line);
             }
-            line.push(Span::styled(" │", border));
-            lines.push(line);
             if r == 0 && self.rows.len() > 1 {
                 lines.push(rule("├", "┼", "┤"));
             }
         }
         lines.push(rule("└", "┴", "┘"));
+        (lines, hard)
+    }
+
+    /// Each body row as a card between rules: a `Header: value` line for
+    /// each cell that has text, the value wrapped under itself. A table with
+    /// no body shows its header as one card.
+    fn cards(&self, width: usize, styled: impl Fn(Style, &InlineStyle) -> Style + Copy) -> Lines {
+        let rule = vec![Span::styled(
+            "─".repeat(width),
+            Style::new().fg(Color::DarkGray),
+        )];
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let heads = &self.rows[0];
+        if self.rows.len() == 1 {
+            let mut lines = vec![rule.clone()];
+            for head in heads.iter().filter(|h| !h.is_empty()) {
+                lines.extend(spans(&wrap(head, width).lines, bold, styled));
+            }
+            lines.push(rule);
+            return lines;
+        }
+        // Values line up after the headers, unless a header is so long that
+        // lining up would leave the values too little room.
+        let label = heads
+            .iter()
+            .map(|h| text_width(h))
+            .max()
+            .unwrap_or(0)
+            .min(width / 3);
+        let indent = label + 2;
+        let mut lines = Vec::new();
+        for row in &self.rows[1..] {
+            lines.push(rule.clone());
+            for (head, cell) in heads.iter().zip(row) {
+                if cell.is_empty() {
+                    continue;
+                }
+                let value = wrap(cell, width.saturating_sub(indent));
+                let mut values = spans(&value.lines, Style::default(), styled).into_iter();
+                let head_width = text_width(head) + 1;
+                if head_width <= label + 1 {
+                    let mut line = spans(std::slice::from_ref(head), bold, styled).remove(0);
+                    let pad = " ".repeat(indent - head_width);
+                    line.push(Span::styled(format!(":{pad}"), bold));
+                    line.extend(values.next().unwrap_or_default());
+                    lines.push(line);
+                } else {
+                    // The header on lines of its own, the value under it.
+                    let mut heading =
+                        spans(&wrap(head, width.saturating_sub(1)).lines, bold, styled);
+                    if let Some(last) = heading.last_mut() {
+                        last.push(Span::styled(":", bold));
+                    }
+                    lines.extend(heading);
+                }
+                for value in values {
+                    let mut line = vec![Span::raw(" ".repeat(indent))];
+                    line.extend(value);
+                    lines.push(line);
+                }
+            }
+        }
+        lines.push(rule);
         lines
     }
+}
+
+/// Lines of cell text as spans on top of `base`.
+fn spans(lines: &[Cell], base: Style, styled: impl Fn(Style, &InlineStyle) -> Style) -> Lines {
+    let line = |runs: &Cell| {
+        let runs = runs.iter();
+        runs.map(|(text, style)| Span::styled(text.clone(), styled(base, style)))
+            .collect()
+    };
+    lines.iter().map(line).collect()
+}
+
+/// Columns taken by box rules and padding around columns of these widths.
+fn frame(widths: &[usize]) -> usize {
+    widths.iter().sum::<usize>() + 3 * widths.len() + 1
+}
+
+/// A cell broken into lines.
+struct Wrapped {
+    lines: Vec<Cell>,
+    /// Words broken mid-word: not at a space or after `BREAK_AFTER`.
+    hard: usize,
+}
+
+/// Break a cell into lines no wider than `width`, at spaces where it can.
+/// A word wider than that breaks after punctuation from `BREAK_AFTER` when
+/// that keeps at least half the line, and at the width otherwise. Spaces
+/// at a break are dropped; spaces between words on a line are kept.
+fn wrap(cell: &Cell, width: usize) -> Wrapped {
+    let width = width.max(1);
+    // Each character with the index of the run it came from, as words,
+    // each with the spaces before it.
+    let mut words: Vec<(Chars, Chars)> = Vec::new();
+    let mut gap = Vec::new();
+    let mut word = Vec::new();
+    for (i, (text, _)) in cell.iter().enumerate() {
+        for c in text.chars() {
+            if c == ' ' {
+                if !word.is_empty() {
+                    words.push((std::mem::take(&mut gap), std::mem::take(&mut word)));
+                }
+                gap.push((c, i));
+            } else {
+                word.push((c, i));
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push((gap, word));
+    }
+
+    let mut lines: Vec<Vec<(char, usize)>> = vec![Vec::new()];
+    let mut used = 0;
+    let mut hard = 0;
+    for (gap, word) in words {
+        let w = chars_width(&word);
+        if used > 0 && used + gap.len() + w <= width {
+            let line = lines.last_mut().unwrap();
+            line.extend(gap.iter().chain(&word));
+            used += gap.len() + w;
+            continue;
+        }
+        if used > 0 {
+            lines.push(Vec::new());
+        }
+        let mut rest = &word[..];
+        while chars_width(rest) > width {
+            let (cut, soft) = break_point(rest, width);
+            hard += usize::from(!soft);
+            lines.last_mut().unwrap().extend_from_slice(&rest[..cut]);
+            lines.push(Vec::new());
+            rest = &rest[cut..];
+        }
+        lines.last_mut().unwrap().extend_from_slice(rest);
+        used = chars_width(rest);
+    }
+
+    let lines = lines
+        .into_iter()
+        .map(|line| {
+            let mut runs: Cell = Vec::new();
+            let mut last = None;
+            for (c, i) in line {
+                match runs.last_mut() {
+                    Some((s, _)) if last == Some(i) => s.push(c),
+                    _ => runs.push((c.to_string(), cell[i].1.clone())),
+                }
+                last = Some(i);
+            }
+            runs
+        })
+        .collect();
+    Wrapped { lines, hard }
+}
+
+/// Where to break a word too wide for `width`: how many characters stay on
+/// this line, and whether the break is after punctuation.
+fn break_point(word: &[(char, usize)], width: usize) -> (usize, bool) {
+    let mut fit = 0;
+    let mut used = 0;
+    for (c, _) in word {
+        used += c.width().unwrap_or(0);
+        if used > width {
+            break;
+        }
+        fit += 1;
+    }
+    // At least one character, so a character wider than the line still moves on.
+    let fit = fit.max(1);
+    let after = word[..fit]
+        .iter()
+        .rposition(|(c, _)| BREAK_AFTER.contains(*c))
+        .map(|p| p + 1);
+    match after {
+        Some(p) if p * 2 >= fit && p < word.len() => (p, true),
+        _ => (fit, false),
+    }
+}
+
+fn chars_width(chars: &[(char, usize)]) -> usize {
+    chars.iter().map(|(c, _)| c.width().unwrap_or(0)).sum()
 }
 
 /// Go in or out of a span that nests. Returns whether still inside one.
@@ -179,7 +463,7 @@ fn nest(depth: &mut u32, event: &Event) -> bool {
     *depth > 0
 }
 
-fn text_width(cell: &Cell) -> usize {
+fn text_width(cell: &[(String, InlineStyle)]) -> usize {
     cell.iter().map(|(text, _)| text.width()).sum()
 }
 
@@ -192,166 +476,24 @@ fn padding(align: Alignment, extra: usize) -> (usize, usize) {
     }
 }
 
-/// Tints are faint on dark: terminals blend in linear light, which makes a
-/// light tint over a dark background look stronger than its alpha.
-struct Palette {
-    text: Rgba,
-    rule: Rgba,
-    header: Rgba,
-    code: Rgba,
-    code_back: Rgba,
-    link: Rgba,
-    math: Rgba,
-}
-
-const DARK: Palette = Palette {
-    text: [0xd8, 0xde, 0xe9, 0xff],
-    rule: [0x6b, 0x72, 0x80, 0xff],
-    header: [0xff, 0xff, 0xff, 0x0a],
-    code: [0xe5, 0xc0, 0x7b, 0xff],
-    code_back: [0xff, 0xff, 0xff, 0x0c],
-    link: [0x61, 0xaf, 0xef, 0xff],
-    math: [0x56, 0xb6, 0xc2, 0xff],
-};
-
-const LIGHT: Palette = Palette {
-    text: [0x24, 0x29, 0x2f, 0xff],
-    rule: [0xa0, 0xa7, 0xb0, 0xff],
-    header: [0x00, 0x00, 0x00, 0x0e],
-    code: [0x95, 0x5f, 0x00, 0xff],
-    code_back: [0x00, 0x00, 0x00, 0x12],
-    link: [0x05, 0x50, 0xae, 0xff],
-    math: [0x0e, 0x74, 0x90, 0xff],
-};
-
-/// Draw the table in `source` as a PNG on a transparent background, in
-/// colours for the terminal's theme.
-pub fn image(source: &str, theme: Theme) -> Result<Png, String> {
-    draw(source, theme)
-        .and_then(|canvas| canvas.png())
-        .map_err(|e| format!("table: {e}"))
-}
-
-fn draw(source: &str, theme: Theme) -> Result<Canvas, String> {
-    let table = Table::parse(source);
-    let fonts = raster::fonts()?;
-    // A character the font cannot draw would be a box; cut text is better.
-    let chars = table.rows.iter().flatten().flatten();
-    let mut chars = chars.flat_map(|(text, _)| text.chars());
-    if let Some(c) = chars.find(|&c| !c.is_whitespace() && fonts.regular.glyph_id(c).0 == 0) {
-        return Err(format!("no glyph for {c:?}"));
-    }
-    let palette = match theme {
-        Theme::Dark => &DARK,
-        Theme::Light => &LIGHT,
-    };
-    let font = |header: bool, style: &InlineStyle| -> &FontVec {
-        if header || style.strong {
-            fonts.bold()
-        } else {
-            &fonts.regular
-        }
-    };
-    let measure = |r: usize, cell: &Cell| -> f32 {
-        let runs = cell.iter();
-        runs.map(|(text, style)| raster::measure(font(r == 0, style), SIZE, text))
-            .sum()
-    };
-
-    let pad = (SIZE * 0.5).round();
-    let line = 2.0;
-    let row_height = (SIZE * 1.6).round();
-    let columns = table.aligns.len();
-    let widths: Vec<f32> = (0..columns)
-        .map(|c| {
-            let cells = table.rows.iter().enumerate();
-            let widest = cells.map(|(r, row)| measure(r, &row[c]).ceil());
-            widest.fold(SIZE * 0.5, f32::max) + 2.0 * pad
-        })
-        .collect();
-    let width = line + widths.iter().map(|w| w + line).sum::<f32>();
-    let height = line + table.rows.len() as f32 * (row_height + line);
-    let (width, height) = (width as u32, height as u32);
-    if u64::from(width) * u64::from(height) > MAX_PIXELS {
-        return Err(format!("table too large: {width}x{height} px"));
-    }
-
-    let mut canvas = Canvas::new(width, height);
-    let scaled = fonts.regular.as_scaled(PxScale::from(SIZE));
-    let (ascent, descent) = (scaled.ascent(), scaled.descent());
-    let mut top = line;
-    for (r, row) in table.rows.iter().enumerate() {
-        if r == 0 {
-            let w = i64::from(width) - 2;
-            canvas.fill(1, 1, w, (row_height + line) as i64, palette.header);
-        }
-        let baseline = top + ((row_height - (ascent - descent)) / 2.0 + ascent).round();
-        let mut left = line;
-        for (c, cell) in row.iter().enumerate() {
-            let extra = widths[c] - 2.0 * pad - measure(r, cell);
-            let (before, _) = match table.aligns[c] {
-                Alignment::Right => (extra, 0.0),
-                Alignment::Center => ((extra / 2.0).floor(), 0.0),
-                Alignment::Left | Alignment::None => (0.0, 0.0),
-            };
-            let mut x = left + pad + before;
-            for (text, style) in cell {
-                let face = font(r == 0, style);
-                let colour = if style.code {
-                    palette.code
-                } else if style.math {
-                    palette.math
-                } else if style.link.is_some() {
-                    palette.link
-                } else {
-                    palette.text
-                };
-                let run = raster::measure(face, SIZE, text);
-                if style.code {
-                    let back = SIZE * 1.3;
-                    let y = top + ((row_height - back) / 2.0).round();
-                    let (x0, w) = ((x - 4.0) as i64, (run + 8.0) as i64);
-                    canvas.fill(x0, y as i64, w, back as i64, palette.code_back);
-                }
-                let end = canvas.text(face, SIZE, x, baseline, text, colour);
-                if style.link.is_some() {
-                    let y = (baseline + 3.0) as i64;
-                    canvas.fill(x as i64, y, run as i64, 2, colour);
-                }
-                if style.strikethrough {
-                    let y = (baseline - SIZE * 0.3) as i64;
-                    canvas.fill(x as i64, y, run as i64, 2, colour);
-                }
-                x = end;
-            }
-            left += widths[c] + line;
-        }
-        top += row_height + line;
-    }
-
-    // Rules between rows and columns, and round the edge.
-    let l = line as i64;
-    let mut y = 0.0;
-    for _ in 0..=table.rows.len() {
-        canvas.fill(0, y as i64, i64::from(width), l, palette.rule);
-        y += row_height + line;
-    }
-    let mut x = 0.0;
-    for c in 0..=columns {
-        canvas.fill(x as i64, 0, l, i64::from(height), palette.rule);
-        x += widths.get(c).copied().unwrap_or(0.0) + line;
-    }
-    Ok(canvas)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn plain(table: &Table) -> Vec<String> {
-        let lines = table.text(|base, _| base);
+    fn plain(table: &Table, avail: usize) -> Vec<String> {
+        let lines = table.lines(avail, |base, _| base);
         let text = |line: &Vec<Span>| line.iter().map(|s| s.content.as_ref()).collect();
         lines.iter().map(text).collect()
+    }
+
+    fn cell(text: &str) -> Cell {
+        vec![(text.to_string(), InlineStyle::default())]
+    }
+
+    fn wrapped(text: &str, width: usize) -> (Vec<String>, usize) {
+        let w = wrap(&cell(text), width);
+        let text = |line: &Cell| line.iter().map(|(t, _)| t.as_str()).collect();
+        (w.lines.iter().map(text).collect(), w.hard)
     }
 
     #[test]
@@ -390,7 +532,7 @@ mod tests {
     fn short_rows_are_filled_and_escaped_pipes_kept() {
         let table = Table::parse("| a | b |\n|---|---|\n| 1 |\n| x \\| y | 2 |");
         assert_eq!(
-            plain(&table),
+            plain(&table, 80),
             vec![
                 "┌───────┬───┐",
                 "│ a     │ b │",
@@ -400,7 +542,6 @@ mod tests {
                 "└───────┴───┘",
             ]
         );
-        assert_eq!(table.width(), 13);
     }
 
     #[test]
@@ -408,7 +549,7 @@ mod tests {
         let table =
             Table::parse("| left | mid | right |\n|:--|:-:|--:|\n| a | b | c |\n| é | 日本 | dd |");
         assert_eq!(
-            plain(&table),
+            plain(&table, 80),
             vec![
                 "┌──────┬──────┬───────┐",
                 "│ left │ mid  │ right │",
@@ -433,25 +574,146 @@ mod tests {
     #[test]
     fn the_header_is_bold() {
         let table = Table::parse("| h |\n|---|\n| b |");
-        let lines = table.text(|base, _| base);
+        let lines = table.lines(80, |base, _| base);
         assert!(lines[1][2].style.add_modifier.contains(Modifier::BOLD));
         assert!(!lines[3][2].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn the_image_grows_with_the_table() {
-        if raster::fonts().is_err() {
-            eprintln!("no system font; skipped");
-            return;
+    fn a_wide_table_wraps_its_cells() {
+        let table = Table::parse("| name | note |\n|---|---|\n| a | one two three four |");
+        assert_eq!(
+            plain(&table, 22),
+            vec![
+                "┌──────┬─────────────┐",
+                "│ name │ note        │",
+                "├──────┼─────────────┤",
+                "│ a    │ one two     │",
+                "│      │ three four  │",
+                "└──────┴─────────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn cells_wrap_at_spaces_and_keep_spaces_inside_a_line() {
+        assert_eq!(
+            wrapped("one two three", 7),
+            (vec!["one two".into(), "three".into()], 0)
+        );
+        assert_eq!(wrapped("a  b c", 4), (vec!["a  b".into(), "c".into()], 0));
+        assert_eq!(wrapped("", 4), (vec!["".into()], 0));
+    }
+
+    #[test]
+    fn a_long_word_breaks_after_punctuation_or_else_mid_word() {
+        assert_eq!(
+            wrapped("~/.gradle/caches/modules", 12),
+            (
+                vec!["~/.gradle/".into(), "caches/".into(), "modules".into()],
+                0
+            )
+        );
+        assert_eq!(
+            wrapped("abcdefghij", 4),
+            (vec!["abcd".into(), "efgh".into(), "ij".into()], 2)
+        );
+        // A break so early it wastes most of the line is not worth it.
+        assert_eq!(
+            wrapped("a/bcdefghij", 8),
+            (vec!["a/bcdefg".into(), "hij".into()], 1)
+        );
+    }
+
+    #[test]
+    fn a_wrapped_line_keeps_its_runs_and_styles() {
+        let code = InlineStyle {
+            code: true,
+            ..InlineStyle::default()
+        };
+        let cell = vec![
+            ("see ".to_string(), InlineStyle::default()),
+            ("a b".to_string(), code.clone()),
+        ];
+        let w = wrap(&cell, 5);
+        assert_eq!(
+            w.lines,
+            vec![
+                vec![
+                    ("see ".to_string(), InlineStyle::default()),
+                    ("a".to_string(), code.clone())
+                ],
+                vec![("b".to_string(), code)],
+            ]
+        );
+    }
+
+    #[test]
+    fn every_column_gets_room_for_its_longest_word_first() {
+        // Sharing by length alone would squeeze the MAC address column.
+        let table = Table::parse(
+            "| mac | vendor |\n|---|---|\n| 62:c3:61:e4:9c:de | a vendor with a long name here |",
+        );
+        let widths = table.fit(40).unwrap();
+        assert_eq!(widths[0], 17);
+        assert_eq!(frame(&widths), 40);
+        // Natural widths when they fit.
+        assert_eq!(table.fit(200).unwrap(), table.natural());
+        // Not even the floors fit.
+        assert_eq!(
+            Table::parse("| aaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbb |\n|---|---|").fit(20),
+            None
+        );
+    }
+
+    #[test]
+    fn too_many_columns_become_cards() {
+        let table = Table::parse(
+            "| tool | isolation mechanism | credentials |\n|---|---|---|\n\
+             | srt | seatbelt on macOS | runs as you |\n| lima | full VM | |",
+        );
+        assert_eq!(
+            plain(&table, 30),
+            vec![
+                "──────────────────────────────",
+                "tool:       srt",
+                "isolation mechanism:",
+                "            seatbelt on macOS",
+                "credentials:",
+                "            runs as you",
+                "──────────────────────────────",
+                "tool:       lima",
+                "isolation mechanism:",
+                "            full VM",
+                "──────────────────────────────",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_with_only_a_header_shows_it_as_one_card() {
+        let table = Table::parse("| aaaaaaaa | bbbbbbbb | cccccccc |\n|---|---|---|");
+        assert_eq!(
+            plain(&table, 10),
+            vec![
+                "──────────",
+                "aaaaaaaa",
+                "bbbbbbbb",
+                "cccccccc",
+                "──────────"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_line_is_wider_than_the_view() {
+        let md = "| a | b | c | d |\n|---|---|---|---|\n\
+                  | https://example.org/a/very/long/path | x y z | `code span` | 1 |";
+        let table = Table::parse(md);
+        for avail in [8, 20, 30, 45, 60, 100] {
+            for line in plain(&table, avail) {
+                assert!(line.width() <= avail, "{avail}: {line:?}");
+            }
         }
-        let size = |md: &str| draw(md, Theme::Dark).unwrap().size();
-        let one = size("| a |\n|---|\n| 1 |");
-        let three = size("| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |");
-        let taller = size("| a |\n|---|\n| 1 |\n| 2 |");
-        assert!(three.0 > one.0 && three.1 == one.1, "{one:?} {three:?}");
-        assert!(taller.1 > one.1 && taller.0 == one.0, "{one:?} {taller:?}");
-        assert!(image("| a |\n|---|\n| 1 |", Theme::Light).is_ok());
-        // A character the font lacks keeps the table as text.
-        assert!(draw("| a \u{F0000} |\n|---|", Theme::Dark).is_err());
     }
 }

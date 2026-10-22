@@ -473,6 +473,22 @@ fn padding(align: Alignment, extra: usize) -> (usize, usize) {
     }
 }
 
+/// `Canvas::fill`, which smd no longer needs since tables stopped being
+/// images.
+trait Fill {
+    fn fill(&mut self, x: i64, y: i64, w: i64, h: i64, colour: Rgba);
+}
+
+impl Fill for Canvas {
+    fn fill(&mut self, x: i64, y: i64, w: i64, h: i64, colour: Rgba) {
+        for yy in y..y + h {
+            for xx in x..x + w {
+                self.blend(xx, yy, colour, 1.0);
+            }
+        }
+    }
+}
+
 struct Palette {
     text: Rgba,
     rule: Rgba,

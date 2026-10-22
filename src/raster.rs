@@ -141,14 +141,6 @@ impl Canvas {
         dst[3] = (out * 255.0).round() as u8;
     }
 
-    pub fn fill(&mut self, x: i64, y: i64, w: i64, h: i64, colour: Rgba) {
-        for yy in y..y + h {
-            for xx in x..x + w {
-                self.blend(xx, yy, colour, 1.0);
-            }
-        }
-    }
-
     /// Draw `text` from `x` on the baseline `y`. Returns where it ends.
     pub fn text(
         &mut self,
@@ -266,7 +258,7 @@ mod tests {
     #[test]
     fn canvas_encodes_as_png_of_its_size() {
         let mut canvas = Canvas::new(30, 7);
-        canvas.fill(0, 0, 3, 3, [255, 0, 0, 255]);
+        canvas.blend(1, 1, [255, 0, 0, 255], 1.0);
         let data = canvas.encode().unwrap();
         // Width and height sit at the start of the IHDR chunk.
         assert_eq!(data[16..24], crate::images::tests::png(30, 7)[16..24]);

@@ -767,6 +767,35 @@ mod tests {
     }
 
     #[test]
+    fn loose_task_markers_unchecked_first_and_nested() {
+        let tasks = |items: &[ListItem]| items.iter().map(|i| i.task).collect::<Vec<_>>();
+        let blocks = kinds("- [ ] a\n\n- b\n");
+        let BlockKind::List {
+            tight: false,
+            items,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected a loose list, got {blocks:?}");
+        };
+        assert_eq!(tasks(items), [Some(false), None]);
+        let blocks = kinds("- x\n  - [ ] a\n\n  - [x] b\n");
+        let BlockKind::List { items, .. } = &blocks[0] else {
+            panic!("expected a list, got {blocks:?}");
+        };
+        assert_eq!(tasks(items), [None]);
+        let BlockKind::List {
+            tight: false,
+            items,
+            ..
+        } = &items[0].blocks[1].kind
+        else {
+            panic!("expected a nested loose list, got {:?}", items[0].blocks);
+        };
+        assert_eq!(tasks(items), [Some(false), Some(true)]);
+    }
+
+    #[test]
     fn loose_ordered_list() {
         let blocks = kinds("3. one\n\n4. two\n");
         assert!(matches!(
@@ -819,6 +848,21 @@ mod tests {
                 }],
                 "{md:?}"
             );
+        }
+    }
+
+    #[test]
+    fn math_fence_with_attributes_is_a_figure_and_near_misses_stay_code() {
+        assert_eq!(
+            kinds("```math,display\nx^2\n```\n"),
+            vec![BlockKind::Figure {
+                kind: FigureKind::Math,
+                source: "x^2\n".into()
+            }]
+        );
+        for lang in ["mermaidx", "mermaid-js"] {
+            let blocks = kinds(&format!("```{lang}\ngraph TD\n```\n"));
+            assert!(matches!(&blocks[0], BlockKind::Code { .. }), "{blocks:?}");
         }
     }
 

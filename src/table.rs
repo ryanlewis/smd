@@ -8,6 +8,7 @@ use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{Embed, InlineStyle, Link, embed, is_wiki, link_dest};
+use crate::render::breaks_at;
 
 /// The longest word a column is widened to hold whole. A longer one, such as
 /// a URL, breaks.
@@ -91,7 +92,7 @@ impl Table {
     fn words(&self) -> Vec<usize> {
         self.per_column(|cell| {
             let text: String = cell.iter().map(|(t, _)| t.as_str()).collect();
-            let widest = text.split(' ').map(UnicodeWidthStr::width).max();
+            let widest = text.split(breaks_at).map(UnicodeWidthStr::width).max();
             widest.unwrap_or(0).min(WORD_CAP)
         })
     }
@@ -316,7 +317,7 @@ fn wrap(cell: &Cell, width: usize) -> Wrapped {
     let mut word = Vec::new();
     for (i, (text, _)) in cell.iter().enumerate() {
         for c in text.chars() {
-            if c == ' ' {
+            if breaks_at(c) {
                 if !word.is_empty() {
                     words.push((std::mem::take(&mut gap), std::mem::take(&mut word)));
                 }
@@ -335,10 +336,11 @@ fn wrap(cell: &Cell, width: usize) -> Wrapped {
     let mut hard = 0;
     for (gap, word) in words {
         let w = chars_width(&word);
-        if used > 0 && used + gap.len() + w <= width {
+        let space = chars_width(&gap);
+        if used > 0 && used + space + w <= width {
             let line = lines.last_mut().unwrap();
             line.extend(gap.iter().chain(&word));
-            used += gap.len() + w;
+            used += space + w;
             continue;
         }
         if used > 0 {
@@ -777,6 +779,20 @@ mod tests {
         );
         assert_eq!(wrapped("a  b c", 4), (vec!["a  b".into(), "c".into()], 0));
         assert_eq!(wrapped("", 4), (vec!["".into()], 0));
+    }
+
+    #[test]
+    fn cells_wrap_at_any_space_but_a_no_break_one() {
+        assert_eq!(wrapped("a\u{3000}b", 1), (vec!["a".into(), "b".into()], 0));
+        assert_eq!(wrapped("a\tb", 1), (vec!["a".into(), "b".into()], 0));
+        // A wide space counts at its width.
+        assert_eq!(wrapped("a\u{3000}b", 3), (vec!["a".into(), "b".into()], 0));
+        assert_eq!(
+            wrapped("10\u{a0}km x", 5),
+            (vec!["10\u{a0}km".into(), "x".into()], 0)
+        );
+        let table = Table::parse("| aaaa\u{3000}bbbb | 10\u{a0}km |\n|-|-|");
+        assert_eq!(table.words(), vec![4, 5]);
     }
 
     #[test]

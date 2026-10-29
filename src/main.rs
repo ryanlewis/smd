@@ -166,6 +166,21 @@ fn apply(look: &Look) {
     }
 }
 
+/// Set after ratatui's hook, which restores the terminal, so it runs first.
+/// A job's panic is caught and shown as a failed image, so it prints
+/// nothing; any other deletes the images before the terminal is restored.
+fn set_panic_hook(uploaded: images::Uploaded, mouse: bool) {
+    let restore = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if images::in_job() {
+            return;
+        }
+        let _ = uploaded.delete_all(&mut io::stdout());
+        set_mouse(&mut io::stdout(), mouse, false);
+        restore(info);
+    }));
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     exit_code(smd(args), &mut io::stderr())
@@ -188,21 +203,9 @@ fn smd(args: Args) -> Result<(), Failure> {
     let images = images_for(look.cell);
 
     let mut terminal = opened(ratatui::try_init())?;
-    // Set after ratatui's hook, which restores the terminal, so it runs first.
-    // A job's panic is caught and shown as a failed image, so it prints
-    // nothing; any other deletes the images before the terminal is restored.
     let mouse = config.mouse;
     set_mouse(&mut io::stdout(), mouse, true);
-    let uploaded = images.uploaded();
-    let restore = panic::take_hook();
-    panic::set_hook(Box::new(move |info| {
-        if images::in_job() {
-            return;
-        }
-        let _ = uploaded.delete_all(&mut io::stdout());
-        set_mouse(&mut io::stdout(), mouse, false);
-        restore(info);
-    }));
+    set_panic_hook(images.uploaded(), mouse);
     // Started once the hook is set, like the jobs below.
     highlight::load_in_background();
     // Made once the hook is set, as this starts the jobs.

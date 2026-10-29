@@ -389,12 +389,11 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
     let job: Job = match &block.kind {
         BlockKind::Image { src, .. } => {
             key = path_key(base, src);
-            let path = base.join(src);
-            let decoded = percent_decode(src).map(|src| base.join(src));
-            Box::new(move || match (load(&path), decoded) {
-                // Editors write spaces in paths as %20.
-                (Err(_), Some(decoded)) if !path.exists() => load(&decoded),
-                (result, _) => result,
+            let paths: Vec<_> = candidates(src).map(|src| base.join(src)).collect();
+            Box::new(move || {
+                // The first that is there, or the path as written for the error.
+                let path = paths.iter().find(|p| p.is_file()).unwrap_or(&paths[0]);
+                load(path)
             })
         }
         BlockKind::Figure {
@@ -433,6 +432,24 @@ pub fn wanted_in(blocks: &[Block], base: &Path, out: &mut Vec<(Key, Job)>) {
             _ => {}
         }
     }
+}
+
+/// The files `src` may mean, in the order to look for them: as written,
+/// then decoded, as editors write spaces in paths as %20; then the same
+/// without a `#fragment` and then also without a `?query`, which links meant
+/// for a web page carry, such as `logo.png#gh-dark-mode-only`.
+fn candidates(src: &str) -> impl Iterator<Item = String> {
+    let unfragmented = src.split_once('#').map(|(path, _)| path);
+    let unqueried = unfragmented
+        .unwrap_or(src)
+        .split_once('?')
+        .map(|(path, _)| path);
+    let written = [Some(src), unfragmented, unqueried].into_iter().flatten();
+    written.flat_map(|src| {
+        [Some(src.to_string()), percent_decode(src)]
+            .into_iter()
+            .flatten()
+    })
 }
 
 /// Images on the web are left as text.
@@ -834,6 +851,45 @@ pub mod tests {
         assert!(load_bytes("a.txt", b"hello").is_err());
         assert!(load_bytes("cut.gif", b"GIF89a").is_err());
         assert!(load_bytes("cut.jpg", b"\xff\xd8\xff\xe0").is_err());
+    }
+
+    #[test]
+    fn a_fragment_or_query_is_dropped_only_when_the_file_is_not_there() {
+        let dir = std::env::temp_dir().join(format!("smd-images-suffix-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("img")).unwrap();
+        std::fs::write(dir.join("img/logo.png"), png(10, 20)).unwrap();
+        std::fs::write(dir.join("issue#12.png"), png(30, 40)).unwrap();
+        std::fs::write(dir.join("a#b.png"), png(50, 60)).unwrap();
+        std::fs::write(dir.join("both.png#a"), png(70, 80)).unwrap();
+        std::fs::write(dir.join("both.png"), png(10, 20)).unwrap();
+        std::fs::create_dir_all(dir.join("gone")).unwrap();
+        let srcs = [
+            "img/logo.png#gh-dark-mode-only",
+            "img/logo.png?raw=true",
+            "img/logo.png?raw=true#top",
+            "issue#12.png",
+            "a%23b.png",
+            "both.png#a",
+            "gone#x.png",
+        ];
+        let md: String = srcs.iter().map(|src| format!("![x]({src})\n\n")).collect();
+        let doc = parse(&md);
+        let mut images = Images::new((10, 20));
+        images.set_base(&dir);
+        images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
+        settle(&mut images);
+        let _ = std::fs::remove_dir_all(&dir);
+        let px = |src| images.ready(&file_key(src)).map(|r| r.px);
+        assert_eq!(px("img/logo.png#gh-dark-mode-only"), Some((10, 20)));
+        assert_eq!(px("img/logo.png?raw=true"), Some((10, 20)));
+        assert_eq!(px("img/logo.png?raw=true#top"), Some((10, 20)));
+        // A file whose name has a # in it is read as it is written.
+        assert_eq!(px("issue#12.png"), Some((30, 40)));
+        assert_eq!(px("a%23b.png"), Some((50, 60)));
+        assert_eq!(px("both.png#a"), Some((70, 80)));
+        // A folder is not an image: the error is about the path as written.
+        let error = images.error(&file_key("gone#x.png")).unwrap();
+        assert!(error.contains("gone#x.png"), "{error}");
     }
 
     #[test]

@@ -1242,6 +1242,204 @@ mod tests {
         assert_eq!(fg_of(&lines[4..5], "let"), Some(Color::Magenta));
     }
 
+    /// Each line as its text, then each span's text and style in brackets,
+    /// so a test pins both what is drawn and how.
+    fn styled(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                let spans: Vec<String> = l
+                    .spans
+                    .iter()
+                    .map(|s| {
+                        let st = s.style;
+                        let mut tags = Vec::new();
+                        if let Some(fg) = st.fg {
+                            tags.push(format!("fg={fg}"));
+                        }
+                        if let Some(bg) = st.bg {
+                            tags.push(format!("bg={bg}"));
+                        }
+                        if !st.add_modifier.is_empty() {
+                            tags.push(format!("{:?}", st.add_modifier));
+                        }
+                        format!("[{}|{}]", s.content, tags.join(","))
+                    })
+                    .collect();
+                spans.concat()
+            })
+            .collect()
+    }
+
+    /// A document with every kind of block `contents` handles.
+    const EVERY_KIND: &str = "\
+# One [a](x)
+
+## Two
+
+### Three
+
+#### Four
+
+text with [a link](y) in it
+
+---
+
+<div>x</div>
+
+3. three
+4. [ ] open
+5.
+
+- loose
+
+- [x] done
+
+> - in a quote
+>
+>   ---
+
+```mermaid
+graph TD
+```
+
+- ![two
+  lines](cat.png)
+
+> ```
+> code
+> ```
+";
+
+    /// In text mode every block is text: headings, links, rules, HTML,
+    /// ordered, task, empty and loose list items, quotes, figures and images
+    /// as their source, and code indented inside a quote with no panel.
+    #[test]
+    fn every_block_kind_without_graphics_is_pinned() {
+        let layout = layout(&parse(EVERY_KIND), 16, &Images::text(), None, None);
+        let got = styled(&layout.lines);
+        let want = vec![
+            "[One |fg=Magenta,BOLD | UNDERLINED][a|fg=Blue,BOLD | UNDERLINED]",
+            "",
+            "[Two|fg=Cyan,BOLD]",
+            "",
+            "[Three|fg=Green,BOLD]",
+            "",
+            "[Four|BOLD]",
+            "",
+            "[text with |][a link|fg=Blue,UNDERLINED]",
+            "[in it|]",
+            "",
+            "[────────────────|DIM]",
+            "",
+            "[<div>x</div>|DIM]",
+            "",
+            "[3. |fg=Blue][three|]",
+            "[4. [ ] |fg=Blue][open|]",
+            "[5.|fg=Blue]",
+            "",
+            "[• |fg=Blue][loose|]",
+            "",
+            "[• |fg=Blue][done|]",
+            "",
+            "[│ |fg=DarkGray][• |fg=Blue][in a quote|]",
+            "[│|fg=DarkGray]",
+            "[│ |fg=DarkGray][  |][────────────|DIM]",
+            "",
+            "[graph TD|fg=Yellow]",
+            "",
+            "[• |fg=Blue][![two lines](c|fg=Yellow]",
+            "[  |][at.png)|fg=Yellow]",
+            "",
+            "[│ |fg=DarkGray][  |][code|fg=Yellow]",
+        ];
+        assert_eq!(got, want);
+        let links: Vec<_> = layout
+            .links
+            .iter()
+            .map(|l| (l.link.dest.clone(), l.cells.clone()))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("x".to_string(), vec![(0, 4..5)]),
+                ("y".to_string(), vec![(8, 10..16)])
+            ]
+        );
+        let rows: Vec<_> = layout.blocks.iter().map(|b| b.rows.clone()).collect();
+        assert_eq!(
+            rows,
+            vec![
+                0..1,
+                2..3,
+                4..5,
+                6..7,
+                8..10,
+                11..12,
+                13..14,
+                15..18,
+                15..16,
+                16..17,
+                19..22,
+                19..20,
+                21..22,
+                23..26,
+                23..26,
+                23..24,
+                25..26,
+                27..28,
+                29..31,
+                29..31,
+                32..33,
+                32..33,
+            ]
+        );
+    }
+
+    /// With graphics but nothing ready, figures show their source in cyan and
+    /// images their alt text.
+    #[test]
+    fn every_block_kind_with_graphics_not_ready_is_pinned() {
+        let layout = layout(&parse(EVERY_KIND), 16, &no_images(), None, None);
+        let got = styled(&layout.lines);
+        let want = vec![
+            "[One |fg=Magenta,BOLD | UNDERLINED][a|fg=Blue,BOLD | UNDERLINED]",
+            "",
+            "[Two|fg=Cyan,BOLD]",
+            "",
+            "[Three|fg=Green,BOLD]",
+            "",
+            "[Four|BOLD]",
+            "",
+            "[text with |][a link|fg=Blue,UNDERLINED]",
+            "[in it|]",
+            "",
+            "[────────────────|DIM]",
+            "",
+            "[<div>x</div>|DIM]",
+            "",
+            "[3. |fg=Blue][three|]",
+            "[4. [ ] |fg=Blue][open|]",
+            "[5.|fg=Blue]",
+            "",
+            "[• |fg=Blue][loose|]",
+            "",
+            "[• |fg=Blue][done|]",
+            "",
+            "[│ |fg=DarkGray][• |fg=Blue][in a quote|]",
+            "[│|fg=DarkGray]",
+            "[│ |fg=DarkGray][  |][────────────|DIM]",
+            "",
+            "[graph TD|fg=Cyan]",
+            "",
+            "[• |fg=Blue][[image: two|]",
+            "[  |][lines]|]",
+            "",
+            "[│ |fg=DarkGray][  |][code|fg=Yellow]",
+        ];
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn code_is_coloured_without_a_panel_too() {
         let md = "```rust\nfn main() {}\n```\n";

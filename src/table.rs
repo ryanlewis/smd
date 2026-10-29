@@ -447,7 +447,7 @@ impl Builder {
             } => {
                 let wiki = is_wiki(link_type);
                 self.style.link = Some(Link {
-                    dest: link_dest(&dest_url, wiki).to_string(),
+                    dest: link_dest(&dest_url, wiki).into_owned(),
                     wiki,
                 });
             }
@@ -464,7 +464,7 @@ impl Builder {
                         self.embeds.push(true);
                         self.style.link = Some(link);
                     }
-                    Embed::Image(_) => {
+                    Embed::Image => {
                         self.embeds.push(false);
                         self.push(("[image: ".to_string(), self.style.clone()));
                     }

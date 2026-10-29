@@ -3,6 +3,7 @@
 //! Every block keeps the byte range it came from, so a later layer can swap a
 //! block (a figure, or a heading) for an image and still reach its source.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
@@ -126,45 +127,70 @@ pub fn is_image(name: &str) -> bool {
 pub enum Embed {
     /// An embedded note, shown as a link to it.
     Note(Link),
-    /// An image, by its path or, for a wiki embed, its name in the vault.
-    Image(String),
+    /// An image, loaded from [`image_src`].
+    Image,
 }
 
 /// What an image tag to `dest` stands for. A wiki embed of anything but an
-/// image file embeds a note. An embedded image is looked up by its name
-/// alone, without a fragment.
+/// image file embeds a note.
 pub fn embed(dest: &str, wiki: bool) -> Embed {
     if !wiki {
-        return Embed::Image(dest.to_string());
+        return Embed::Image;
     }
     let dest = link_dest(dest, true);
-    if is_image(dest) {
-        Embed::Image(without_fragment(dest).to_string())
+    if is_image(&dest) {
+        Embed::Image
     } else {
         Embed::Note(Link {
-            dest: dest.to_string(),
+            dest: dest.into_owned(),
             wiki: true,
         })
     }
 }
 
-/// Where a link or embed goes. A wiki link's name is read without spaces
-/// around it, `[[pic.png |300]]`, or a backslash at its end, which is left
-/// there when the pipe before an alias is escaped, `\|`, as it must be in a
-/// table.
-pub fn link_dest(dest: &str, wiki: bool) -> &str {
+/// The file an image tag loads: its path or, for a wiki embed, its name in
+/// the vault without a fragment.
+pub fn image_src(dest: &str, wiki: bool) -> String {
     if wiki {
-        dest.strip_suffix('\\').unwrap_or(dest).trim()
+        without_fragment(&link_dest(dest, true)).to_string()
     } else {
-        dest
+        dest.to_string()
     }
 }
 
-/// `name` without a `#heading` or `#^block` after it, or the space before
-/// one.
+/// Where a link or embed goes, as the parser gives it. A wiki link's name
+/// loses a backslash at its end, which is left there when the pipe before an
+/// alias is escaped, `\|`, as it must be in a table. The rest is
+/// [`tidy_dest`].
+pub fn link_dest(dest: &str, wiki: bool) -> Cow<'_, str> {
+    let dest = if wiki {
+        dest.strip_suffix('\\').unwrap_or(dest)
+    } else {
+        dest
+    };
+    tidy_dest(dest, wiki)
+}
+
+/// A link's destination without spaces around it, and for a wiki link
+/// without the space before a `#` fragment, `[[Note #Heading]]`. Tidying it
+/// again changes nothing, so a link can be tidied where it is read and where
+/// it is followed.
+pub fn tidy_dest(dest: &str, wiki: bool) -> Cow<'_, str> {
+    let dest = dest.trim();
+    if !wiki {
+        return Cow::Borrowed(dest);
+    }
+    match dest.split_once('#') {
+        Some((name, fragment)) if name.ends_with(char::is_whitespace) => {
+            Cow::Owned(format!("{}#{fragment}", name.trim_end()))
+        }
+        _ => Cow::Borrowed(dest),
+    }
+}
+
+/// `name` without a `#heading` or `#^block` after it.
 fn without_fragment(name: &str) -> &str {
-    name.split_once('#')
-        .map_or(name, |(name, _)| name.trim_end())
+    name.split_once('#').map_or(name, |(name, _)| name)
 }
 
 pub fn parse(source: &str) -> Document {
@@ -397,7 +423,7 @@ impl<'a> Builder<'a> {
             } => {
                 let wiki = is_wiki(link_type);
                 self.links.push(Link {
-                    dest: link_dest(&dest_url, wiki).to_string(),
+                    dest: link_dest(&dest_url, wiki).into_owned(),
                     wiki,
                 });
             }
@@ -453,14 +479,11 @@ impl<'a> Builder<'a> {
     }
 
     fn start_image(&mut self, wiki: bool, dest: &str, range: Range<usize>) {
-        let src = match embed(dest, wiki) {
-            Embed::Note(link) => {
-                self.embeds.push(true);
-                self.links.push(link);
-                return;
-            }
-            Embed::Image(src) => src,
-        };
+        if let Embed::Note(link) = embed(dest, wiki) {
+            self.embeds.push(true);
+            self.links.push(link);
+            return;
+        }
         self.embeds.push(false);
         // A linked image stays inline so it keeps its link.
         if !self.links.is_empty() {
@@ -469,7 +492,7 @@ impl<'a> Builder<'a> {
         self.push_text("[image: ", self.style(), range);
         self.image_depth += 1;
         if self.image_depth == 1 {
-            self.image = Some((src, String::new(), wiki));
+            self.image = Some((image_src(dest, wiki), String::new(), wiki));
         }
     }
 

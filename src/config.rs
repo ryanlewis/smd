@@ -181,30 +181,27 @@ impl Key {
     fn parse(name: &str) -> Result<Key, String> {
         let (ctrl, alt, rest) = modifiers(name);
         let code = key_code(rest).ok_or_else(|| format!("unknown key \"{name}\""))?;
-        // Control letters arrive in lower case.
+        Ok(Key::new(code, ctrl, alt))
+    }
+
+    /// The key a key press is. Shift is part of the character it makes, so
+    /// it is not kept.
+    fn of(event: KeyEvent) -> Key {
+        Key::new(
+            event.code,
+            event.modifiers.contains(KeyModifiers::CONTROL),
+            event.modifiers.contains(KeyModifiers::ALT),
+        )
+    }
+
+    /// A key, with a control letter in lower case, so a config's `ctrl-C`
+    /// and a terminal's ctrl-c sent as `c` or `C` are all the same key.
+    fn new(code: KeyCode, ctrl: bool, alt: bool) -> Key {
         let code = match code {
             KeyCode::Char(c) if ctrl => KeyCode::Char(c.to_ascii_lowercase()),
             code => code,
         };
-        Ok(Key { code, ctrl, alt })
-    }
-
-    /// The key a key press is. Shift is part of the character it makes, so
-    /// it is not kept. A control letter is kept in lower case, as [`parse`]
-    /// keeps it, since terminals send ctrl-c as `c` or `C`.
-    ///
-    /// [`parse`]: Key::parse
-    fn of(event: KeyEvent) -> Key {
-        let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
-        let code = match event.code {
-            KeyCode::Char(c) if ctrl => KeyCode::Char(c.to_ascii_lowercase()),
-            code => code,
-        };
-        Key {
-            code,
-            ctrl,
-            alt: event.modifiers.contains(KeyModifiers::ALT),
-        }
+        Key { code, ctrl, alt }
     }
 }
 
@@ -396,6 +393,18 @@ mod tests {
             Some(Action::Top)
         );
         assert_eq!(c.action(press(KeyCode::Char('G'), KeyModifiers::ALT)), None);
+        // With alt as well.
+        let c = Config::from_str("[keys]\nback = [\"ctrl-alt-x\"]\n").unwrap();
+        let alt = KeyModifiers::ALT;
+        assert_eq!(
+            c.action(press(KeyCode::Char('X'), ctrl | alt)),
+            Some(Action::Back)
+        );
+        assert_eq!(
+            c.action(press(KeyCode::Char('x'), ctrl | alt)),
+            Some(Action::Back)
+        );
+        assert_eq!(c.action(press(KeyCode::Char('X'), alt)), None);
     }
 
     #[test]

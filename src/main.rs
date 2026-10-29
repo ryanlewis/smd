@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
-/// A terminal markdown reader
+/// A sexy markdown reader for the terminal
 #[derive(Parser)]
 #[command(version, after_help = KEYS)]
 struct Args {

@@ -130,7 +130,10 @@ fn exit_code(result: Result<(), Failure>, err: &mut impl Write) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            let _ = writeln!(err, "smd: {}", failure.message);
+            // Panics when it cannot write, as `eprintln!` does.
+            if let Err(e) = writeln!(err, "smd: {}", failure.message) {
+                panic!("failed printing to stderr: {e}");
+            }
             ExitCode::from(failure.code)
         }
     }
@@ -205,6 +208,7 @@ fn smd(args: Args) -> Result<(), Failure> {
     let mut terminal = opened(ratatui::try_init())?;
     let mouse = config.mouse;
     set_mouse(&mut io::stdout(), mouse, true);
+    // After ratatui's hook, so it runs first.
     set_panic_hook(images.uploaded(), mouse);
     // Started once the hook is set, like the jobs below.
     highlight::load_in_background();

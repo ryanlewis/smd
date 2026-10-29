@@ -16,6 +16,8 @@ static THEME: OnceLock<Theme> = OnceLock::new();
 
 static BACKGROUND: OnceLock<Rgb> = OnceLock::new();
 
+static FALLBACK_PANEL: OnceLock<Rgb> = OnceLock::new();
+
 /// A colour as red, green and blue, each 0 to 255.
 pub type Rgb = (u8, u8, u8);
 
@@ -37,10 +39,20 @@ pub fn set_background(rgb: Rgb) {
     let _ = BACKGROUND.set(rgb);
 }
 
-/// The colour to draw code blocks on, if the terminal said what its
-/// background is.
+/// Keep the colour to draw code blocks on when the terminal does not say
+/// what its background is. Only the first call counts.
+pub fn set_fallback_panel(rgb: Rgb) {
+    let _ = FALLBACK_PANEL.set(rgb);
+}
+
+/// The colour to draw code blocks on: shaded from the background if the
+/// terminal said what it is, or else the fallback, if there is one.
 pub fn code_panel() -> Option<Color> {
-    BACKGROUND.get().map(|&rgb| panel(rgb))
+    match (BACKGROUND.get(), FALLBACK_PANEL.get()) {
+        (Some(&rgb), _) => Some(panel(rgb)),
+        (None, Some(&(r, g, b))) => Some(Color::Rgb(r, g, b)),
+        (None, None) => None,
+    }
 }
 
 /// The background moved a little towards white when it is dark, or towards

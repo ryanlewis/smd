@@ -6,6 +6,9 @@
 //! home = "~/notes/HOME.md"
 //! # What following a web link does: "open", "copy" or "ignore".
 //! web_links = "open"
+//! # The colour code blocks are drawn on when the terminal does not say
+//! # what its background is.
+//! code_background = "#20242a"
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -18,6 +21,8 @@ use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
+
+use crate::theme::Rgb;
 
 /// What the reader can do from the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -165,6 +170,7 @@ struct File {
     home: Option<String>,
     #[serde(default)]
     web_links: WebLinks,
+    code_background: Option<String>,
     #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
@@ -174,6 +180,9 @@ pub struct Config {
     /// The note to open when smd is given no file.
     pub home: Option<PathBuf>,
     pub web_links: WebLinks,
+    /// The colour to draw code blocks on when the terminal does not say
+    /// what its background is.
+    pub code_background: Option<Rgb>,
     keys: HashMap<Key, Action>,
 }
 
@@ -216,9 +225,16 @@ impl Config {
                 }
             }
         }
+        let code_background = match file.code_background.as_deref() {
+            Some(colour) => Some(parse_colour(colour).ok_or_else(|| {
+                format!("code_background \"{colour}\" is not a colour like \"#20242a\"")
+            })?),
+            None => None,
+        };
         Ok(Config {
             home: file.home.as_deref().map(expand_home),
             web_links: file.web_links,
+            code_background,
             keys,
         })
     }
@@ -236,6 +252,16 @@ fn path() -> Option<PathBuf> {
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
     };
     Some(base.join("smd").join("config.toml"))
+}
+
+/// A colour written as `#rrggbb`.
+fn parse_colour(s: &str) -> Option<Rgb> {
+    let hex = s.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let part = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some((part(0)?, part(2)?, part(4)?))
 }
 
 /// `path` with a leading `~/` made the home folder.
@@ -278,12 +304,13 @@ mod tests {
         assert_eq!(c.action(press(KeyCode::Char('x'), none)), None);
         assert_eq!(c.web_links, WebLinks::Open);
         assert_eq!(c.home, None);
+        assert_eq!(c.code_background, None);
     }
 
     #[test]
     fn naming_an_action_replaces_its_keys() {
         let c = Config::from_str(
-            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
+            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
         )
         .unwrap();
         let none = KeyModifiers::NONE;
@@ -298,6 +325,7 @@ mod tests {
         assert_eq!(c.action(press(KeyCode::Backspace, none)), None);
         assert_eq!(c.web_links, WebLinks::Copy);
         assert_eq!(c.home, Some(PathBuf::from("/n/HOME.md")));
+        assert_eq!(c.code_background, Some((0x20, 0x24, 0x2a)));
     }
 
     #[test]
@@ -308,6 +336,8 @@ mod tests {
             ("[keys]\nfly = [\"x\"]\n", "fly"),
             ("colour = 1\n", "colour"),
             ("web_links = \"shout\"\n", "shout"),
+            ("code_background = \"grey\"\n", "grey"),
+            ("code_background = \"#12345\"\n", "#12345"),
         ] {
             let err = Config::from_str(text).unwrap_err();
             assert!(err.contains(wanted), "{text}: {err}");

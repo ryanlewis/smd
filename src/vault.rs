@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::doc::{Block, BlockKind, Link, is_image};
+use crate::doc::{Block, BlockKind, Link, is_image, tidy_dest};
 
 /// The most files indexed, so a file outside a vault in a huge folder does
 /// not walk the whole disk.
@@ -68,7 +68,8 @@ impl Vault {
 
     /// Where `link`, in the note at `from`, leads.
     pub fn follow(&self, link: &Link, from: &Path) -> Target {
-        let dest = link.dest.trim();
+        let dest = tidy_dest(&link.dest, link.wiki);
+        let dest = dest.as_ref();
         if !link.wiki && is_web(dest) {
             return Target::Web(dest.to_string());
         }
@@ -118,7 +119,7 @@ impl Vault {
     /// The file a wiki link names: a path from the vault's top, or a file
     /// name anywhere in it. A name with no extension is a note.
     fn wiki(&self, name: &str, from: &Path) -> Option<PathBuf> {
-        let name = name.trim().trim_start_matches('/');
+        let name = name.trim_start_matches('/');
         let file = if has_extension(name) {
             name.to_string()
         } else {

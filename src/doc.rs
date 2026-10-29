@@ -511,21 +511,35 @@ impl<'a> Builder<'a> {
     /// Mark the open list item as a task. In a loose list the marker comes
     /// inside the item's paragraph, so the item is the frame below it.
     fn mark_task(&mut self, done: bool) {
-        for frame in self.stack.iter_mut().rev().take(2) {
-            if let FrameKind::Item { task } = &mut frame.kind {
-                *task = Some(done);
-                return;
-            }
+        let item = match self.top().kind {
+            FrameKind::Item { .. } => self.stack.last_mut(),
+            _ => self.under_top(),
+        };
+        if let Some(Frame {
+            kind: FrameKind::Item { task },
+            ..
+        }) = item
+        {
+            *task = Some(done);
         }
     }
 
+    /// Mark the list holding the item on top of the stack as loose.
     fn mark_list_loose(&mut self) {
-        let len = self.stack.len();
-        if len >= 2
-            && let FrameKind::List { tight, .. } = &mut self.stack[len - 2].kind
+        if let Some(Frame {
+            kind: FrameKind::List { tight, .. },
+            ..
+        }) = self.under_top()
         {
             *tight = false;
         }
+    }
+
+    /// The frame below the top one: the item holding a paragraph, or the
+    /// list holding an item.
+    fn under_top(&mut self) -> Option<&mut Frame> {
+        let len = self.stack.len();
+        len.checked_sub(2).map(|i| &mut self.stack[i])
     }
 
     fn text(&mut self, text: &str, style: InlineStyle, range: Range<usize>) {
@@ -571,19 +585,23 @@ fn is_wiki(link_type: LinkType) -> bool {
     matches!(link_type, LinkType::WikiLink { .. })
 }
 
-/// The language of a code block: the first word of a fence's info string.
+/// The language of a code block: the first word of a fence's info string,
+/// without attributes after a comma such as `rust,no_run`.
 fn code_lang(kind: CodeBlockKind) -> Option<String> {
     match kind {
-        CodeBlockKind::Fenced(info) => info.split_whitespace().next().map(str::to_string),
+        CodeBlockKind::Fenced(info) => info
+            .split_whitespace()
+            .next()
+            .and_then(|word| word.split(',').next())
+            .map(str::to_string),
         CodeBlockKind::Indented => None,
     }
 }
 
-/// A fenced block in `mermaid` or `math`, in any case and with any
-/// attributes after a comma, is a figure; any other is code.
+/// A fenced block in `mermaid` or `math`, in any case, is a figure; any
+/// other is code.
 fn code_block(lang: Option<String>, code: String) -> BlockKind {
-    let name = lang.as_deref().and_then(|l| l.split(',').next());
-    let figure = match name {
+    let figure = match lang.as_deref() {
         Some(n) if n.eq_ignore_ascii_case("mermaid") => FigureKind::Mermaid,
         Some(n) if n.eq_ignore_ascii_case("math") => FigureKind::Math,
         _ => return BlockKind::Code { lang, code },

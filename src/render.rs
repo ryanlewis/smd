@@ -471,8 +471,9 @@ impl Units {
         let style = inline_style(base, inline);
         self.open = self.link(inline.link.as_ref());
         for c in text.chars() {
-            // Code keeps its spaces and is not broken at them.
-            if c.is_whitespace() && !inline.code {
+            // Code keeps its spaces and is not broken at them, and nor is
+            // text at a no-break space.
+            if breaks_at(c) && !inline.code {
                 self.space(style);
             } else {
                 self.push(c, style);
@@ -523,6 +524,11 @@ impl Units {
         self.end_word();
         (self.units, self.links)
     }
+}
+
+/// Whether a line may break at `c`: any space but a no-break one.
+fn breaks_at(c: char) -> bool {
+    c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}')
 }
 
 /// Fill lines greedily with inline content, breaking at spaces. Returns
@@ -1065,6 +1071,12 @@ mod tests {
             spots("- [abcdefgh](x)\n", 6),
             vec![("x".to_string(), vec![(0, 2..6), (1, 2..6)])]
         );
+    }
+
+    #[test]
+    fn no_break_spaces_keep_words_together() {
+        assert_eq!(plain("go 10&nbsp;km\n", 6), vec!["go", "10\u{a0}km"]);
+        assert_eq!(plain("a\u{a0}\u{a0}b\n", 20), vec!["a\u{a0}\u{a0}b"]);
     }
 
     #[test]

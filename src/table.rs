@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{InlineStyle, Link};
+use crate::doc::{InlineStyle, Link, is_image};
 
 /// The longest word a column is widened to hold whole. A longer one, such as
 /// a URL, breaks.
@@ -411,6 +411,8 @@ struct Builder {
     style: InlineStyle,
     /// How deep in emphasis, strong and strikethrough spans, which nest.
     depth: [u32; 3],
+    /// For each image started and not yet ended, whether it embeds a note.
+    embeds: Vec<bool>,
 }
 
 impl Builder {
@@ -448,6 +450,32 @@ impl Builder {
                     wiki: matches!(link_type, LinkType::WikiLink { .. }),
                 });
             }
+            Tag::Image {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                // An embedded note is shown as a link to it, and an image as
+                // its alt text, as in a paragraph.
+                let wiki = matches!(link_type, LinkType::WikiLink { .. });
+                // In a table the pipe before an alias is escaped, `\|`, and
+                // the backslash is left on the name.
+                let dest = if wiki {
+                    dest_url.strip_suffix('\\').unwrap_or(&dest_url)
+                } else {
+                    &dest_url
+                };
+                let note = wiki && !is_image(dest);
+                self.embeds.push(note);
+                if note {
+                    self.style.link = Some(Link {
+                        dest: dest.to_string(),
+                        wiki: true,
+                    });
+                } else {
+                    self.push(("[image: ".to_string(), self.style.clone()));
+                }
+            }
             _ => {}
         }
     }
@@ -458,6 +486,13 @@ impl Builder {
             TagEnd::Strong => self.style.strong = nest(&mut self.depth[1], false),
             TagEnd::Strikethrough => self.style.strikethrough = nest(&mut self.depth[2], false),
             TagEnd::Link => self.style.link = None,
+            TagEnd::Image => {
+                if self.embeds.pop() == Some(true) {
+                    self.style.link = None;
+                } else {
+                    self.push(("]".to_string(), self.style.clone()));
+                }
+            }
             _ => {}
         }
     }
@@ -819,6 +854,61 @@ mod tests {
                 "            full VM",
                 "──────────────────────────────",
             ]
+        );
+    }
+
+    #[test]
+    fn images_and_note_embeds_in_a_cell_read_as_in_a_paragraph() {
+        let table = Table::parse(
+            "| ![a *b*](a.png) | ![[d.png]] | ![[Note]] | [![a](a.png)](u) |\n|-|-|-|-|",
+        );
+        let plain = InlineStyle::default();
+        let emphasis = InlineStyle {
+            emphasis: true,
+            ..InlineStyle::default()
+        };
+        let note = InlineStyle {
+            link: Some(Link {
+                dest: "Note".into(),
+                wiki: true,
+            }),
+            ..InlineStyle::default()
+        };
+        let outer = InlineStyle {
+            link: Some("u".into()),
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            table.rows,
+            vec![vec![
+                vec![
+                    ("[image: a ".into(), plain.clone()),
+                    ("b".into(), emphasis),
+                    ("]".into(), plain.clone()),
+                ],
+                vec![("[image: d.png]".into(), plain)],
+                vec![("Note".into(), note)],
+                vec![("[image: a]".into(), outer)],
+            ]]
+        );
+    }
+
+    #[test]
+    fn an_embed_in_a_cell_drops_the_escape_before_its_alias() {
+        let table = Table::parse("| ![[pic.png\\|200]] | ![[Note\\|alias]] |\n|-|-|");
+        let note = InlineStyle {
+            link: Some(Link {
+                dest: "Note".into(),
+                wiki: true,
+            }),
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            table.rows,
+            vec![vec![
+                vec![("[image: 200]".into(), InlineStyle::default())],
+                vec![("alias".into(), note)],
+            ]]
         );
     }
 

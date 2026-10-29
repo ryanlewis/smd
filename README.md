@@ -15,9 +15,23 @@ A terminal markdown reader that draws mermaid diagrams, maths and headings as im
 - **Links and notes.** Follow links with the keyboard or the mouse, with a back and forward toolbar. Links to other notes open in smd, and Obsidian wiki links work.
 - **Live reload.** smd reloads the file when it changes on disk.
 
+## Screenshots
+
+### Diagrams
+
+A mermaid code block, drawn as an image.
+
 ![A mermaid diagram drawn as an image](docs/images/diagram.png)
 
+### Maths
+
+Display maths, drawn as an image.
+
 ![Maths drawn as an image](docs/images/maths.png)
+
+### Tables
+
+A wide table, wrapped to fit the pane.
 
 ![A wide table wrapped to fit the pane](docs/images/table.png)
 

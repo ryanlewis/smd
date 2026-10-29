@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -159,6 +159,9 @@ pub struct Images {
     /// False when the terminal has no kitty graphics: every block is text.
     graphics: bool,
     entries: HashMap<Key, Entry>,
+    /// The directory of the note on screen, which the keys of its images
+    /// are relative to.
+    base: PathBuf,
     next_id: u32,
     /// Uploaded images that left the document, to delete on the next flush.
     deleted: Vec<u32>,
@@ -174,6 +177,7 @@ impl Images {
             cell: (cell.0.max(1), cell.1.max(1)),
             graphics: true,
             entries: HashMap::new(),
+            base: PathBuf::new(),
             // Start at a random id, so another program's images in the same
             // terminal, or another smd's, are unlikely to share one.
             next_id: (RandomState::new().hash_one(std::process::id()) % u64::from(kitty::MAX_ID))
@@ -207,8 +211,23 @@ impl Images {
         self.uploaded.clone()
     }
 
+    /// Take the keys of image files from now on as relative to `base`.
+    pub fn set_base(&mut self, base: &Path) {
+        self.base = base.to_path_buf();
+    }
+
+    /// `key` with an image file's path taken from the note's directory, so
+    /// two notes' files of the same name are told apart.
+    fn resolved(&self, key: &Key) -> Key {
+        match key.0.strip_prefix("file:") {
+            Some(src) => path_key(&self.base, src),
+            None => key.clone(),
+        }
+    }
+
     /// Ask for the image `key`, made by `job` unless it is already known.
     pub fn request(&mut self, key: Key, job: Job) {
+        let key = self.resolved(&key);
         if !self.graphics || self.entries.contains_key(&key) {
             return;
         }
@@ -236,6 +255,10 @@ impl Images {
     /// that failed, and forget the rest, deleting from the terminal any that
     /// were uploaded.
     pub fn want(&mut self, wanted: Vec<(Key, Job)>) {
+        let wanted: Vec<_> = wanted
+            .into_iter()
+            .map(|(key, job)| (self.resolved(&key), job))
+            .collect();
         let keep: HashSet<&Key> = wanted.iter().map(|(k, _)| k).collect();
         let deleted = &mut self.deleted;
         self.entries.retain(|key, entry| {
@@ -276,7 +299,7 @@ impl Images {
 
     /// The image `key`, if it is ready to lay out.
     pub fn ready(&self, key: &Key) -> Option<Ready> {
-        match self.entries.get(key)? {
+        match self.entries.get(&self.resolved(key))? {
             Entry {
                 id,
                 state: State::Ready { px, .. },
@@ -288,7 +311,7 @@ impl Images {
 
     /// Why making the image `key` failed, if it did.
     pub fn error(&self, key: &Key) -> Option<&str> {
-        match &self.entries.get(key)?.state {
+        match &self.entries.get(&self.resolved(key))?.state {
             State::Failed(e) => Some(e),
             _ => None,
         }
@@ -336,7 +359,8 @@ impl Images {
     }
 }
 
-/// The image a block is drawn as, if any.
+/// The image a block is drawn as, if any. An image file's key is relative to
+/// the note on screen.
 pub fn key(block: &Block) -> Option<Key> {
     match &block.kind {
         BlockKind::Image { src, .. } if is_local(src) => Some(Key(format!("file:{src}"))),
@@ -361,9 +385,10 @@ pub fn key(block: &Block) -> Option<Key> {
 /// The image a block is drawn as and how to make it. Relative paths are taken
 /// from `base`, the directory of the markdown file.
 pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
-    let key = key(block)?;
+    let mut key = key(block)?;
     let job: Job = match &block.kind {
         BlockKind::Image { src, .. } => {
+            key = path_key(base, src);
             let path = base.join(src);
             let decoded = percent_decode(src).map(|src| base.join(src));
             Box::new(move || match (load(&path), decoded) {
@@ -387,6 +412,11 @@ pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
         _ => return None,
     };
     Some((key, job))
+}
+
+/// The key of the image file `src` in the directory `base`.
+fn path_key(base: &Path, src: &str) -> Key {
+    Key(format!("path:{}", base.join(src).display()))
 }
 
 /// Every image the blocks, and the blocks inside them, are drawn as.
@@ -679,6 +709,7 @@ pub mod tests {
         std::fs::write(dir.join("a.png"), png(30, 40)).unwrap();
         let doc = parse("![a](a.png)\n\n![gone](missing.png)\n");
         let mut images = Images::new((10, 20));
+        images.set_base(&dir);
         images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
         settle(&mut images);
         let _ = std::fs::remove_dir_all(&dir);
@@ -697,6 +728,7 @@ pub mod tests {
             settle(images);
         };
         let mut images = Images::new((10, 20));
+        images.set_base(&dir);
         want(&mut images);
         assert_eq!(images.ready(&file_key("d.png")), None);
         std::fs::write(dir.join("d.png"), png(10, 20)).unwrap();
@@ -811,6 +843,7 @@ pub mod tests {
         std::fs::write(dir.join("my diagram.png"), png(10, 20)).unwrap();
         let doc = parse("![d](my%20diagram.png)\n");
         let mut images = Images::new((10, 20));
+        images.set_base(&dir);
         images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
         settle(&mut images);
         let _ = std::fs::remove_dir_all(&dir);

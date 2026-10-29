@@ -156,6 +156,7 @@ impl View {
         for (doc, base) in &self.kept {
             images::wanted_in(&doc.blocks, base, &mut wanted);
         }
+        self.images.set_base(&self.base);
         self.images.want(wanted);
     }
 
@@ -1846,6 +1847,46 @@ mod tests {
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(b.path, dir.join("HOME.md"));
         assert_eq!(b.view.layout.placements().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_in_different_folders_show_their_own_image_of_the_same_name() {
+        use crate::images::tests::png;
+        let (mut b, dir) = loaded(
+            "same-src",
+            &[
+                ("a/Note.md", "![x](img.png)\n\n[[Other]]\n"),
+                ("b/Other.md", "![x](img.png)\n"),
+            ],
+        );
+        std::fs::write(dir.join("a/img.png"), png(20, 100)).unwrap();
+        std::fs::write(dir.join("b/img.png"), png(40, 40)).unwrap();
+        let key = images::key(&b.view.doc.blocks[0]).unwrap();
+        let wait = |b: &mut Browser| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while b.view.images.ready(&key).is_none() {
+                assert!(Instant::now() < deadline, "image not ready");
+                std::thread::sleep(Duration::from_millis(1));
+                b.view.receive_images();
+            }
+            b.view.images.ready(&key).unwrap().px
+        };
+        // Read again now the image is there, once the first try is done.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while b.view.images.error(&key).is_none() && b.view.images.ready(&key).is_none() {
+            assert!(Instant::now() < deadline, "first try not done");
+            std::thread::sleep(Duration::from_millis(1));
+            b.view.receive_images();
+        }
+        assert!(b.open(dir.join("a/Note.md")));
+        assert_eq!(wait(&mut b), (20, 100));
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("b/Other.md"));
+        assert_eq!(wait(&mut b), (40, 40));
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(wait(&mut b), (20, 100));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

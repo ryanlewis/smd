@@ -121,6 +121,41 @@ pub fn is_image(name: &str) -> bool {
         .any(|e| ext.eq_ignore_ascii_case(e))
 }
 
+/// What an image tag stands for.
+#[derive(Debug, PartialEq)]
+pub enum Embed {
+    /// An embedded note, shown as a link to it.
+    Note(Link),
+    /// An image, by its path or, for a wiki embed, its name in the vault.
+    Image(String),
+}
+
+/// What an image tag to `dest` stands for. A wiki embed of anything but an
+/// image file embeds a note. An embedded image is looked up by its name
+/// alone, without a fragment.
+pub fn embed(dest: &str, wiki: bool) -> Embed {
+    if !wiki {
+        Embed::Image(dest.to_string())
+    } else if is_image(dest) {
+        Embed::Image(without_fragment(dest).to_string())
+    } else {
+        Embed::Note(Link {
+            dest: dest.to_string(),
+            wiki: true,
+        })
+    }
+}
+
+/// Where a link or embed goes. In a table the pipe before a wiki link's
+/// alias is escaped, `\|`, and the backslash is left on the name.
+pub fn link_dest(dest: &str, wiki: bool) -> &str {
+    if wiki {
+        dest.strip_suffix('\\').unwrap_or(dest)
+    } else {
+        dest
+    }
+}
+
 /// `name` without a `#heading` or `#^block` after it.
 fn without_fragment(name: &str) -> &str {
     name.split_once('#').map_or(name, |(name, _)| name)
@@ -409,16 +444,15 @@ impl<'a> Builder<'a> {
     }
 
     fn start_image(&mut self, wiki: bool, dest: &str, range: Range<usize>) {
-        // An embedded note is shown as a link to it.
-        let note = wiki && !is_image(dest);
-        self.embeds.push(note);
-        if note {
-            self.links.push(Link {
-                dest: dest.to_string(),
-                wiki,
-            });
-            return;
-        }
+        let src = match embed(dest, wiki) {
+            Embed::Note(link) => {
+                self.embeds.push(true);
+                self.links.push(link);
+                return;
+            }
+            Embed::Image(src) => src,
+        };
+        self.embeds.push(false);
         // A linked image stays inline so it keeps its link.
         if !self.links.is_empty() {
             self.top().other_inline = true;
@@ -426,9 +460,7 @@ impl<'a> Builder<'a> {
         self.push_text("[image: ", self.style(), range);
         self.image_depth += 1;
         if self.image_depth == 1 {
-            // An embed is looked up by its name alone.
-            let src = if wiki { without_fragment(dest) } else { dest };
-            self.image = Some((src.to_string(), String::new(), wiki));
+            self.image = Some((src, String::new(), wiki));
         }
     }
 
@@ -590,7 +622,7 @@ impl<'a> Builder<'a> {
     }
 }
 
-fn is_wiki(link_type: LinkType) -> bool {
+pub fn is_wiki(link_type: LinkType) -> bool {
     matches!(link_type, LinkType::WikiLink { .. })
 }
 

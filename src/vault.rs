@@ -76,8 +76,10 @@ impl Vault {
             Some((name, heading)) => (name, Some(heading)),
             None => (dest, None),
         };
-        // A block reference, `#^id`, has no heading to go to.
+        // A block reference, `#^id`, has no heading to go to, and one after a
+        // heading, `Heading#^id`, goes to the heading.
         let heading = heading
+            .map(|h| h.split_once("#^").map_or(h, |(head, _)| head))
             .filter(|h| !h.is_empty() && !h.starts_with('^'))
             .map(|h| {
                 if link.wiki {
@@ -445,10 +447,23 @@ mod tests {
         let v = TempVault::new("wikihb", &["HOME.md", "Plan.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
-        // A block reference after a heading is kept in the heading text (not stripped).
+        // A block reference after a heading goes to the heading.
         assert_eq!(
             vault.follow(&wiki("Plan#Goals#^abc"), &home),
-            note(v.path("Plan.md"), Some("Goals#^abc"))
+            note(v.path("Plan.md"), Some("Goals"))
+        );
+        assert_eq!(
+            vault.follow(&md("Plan.md#Goals#^abc"), &home),
+            note(v.path("Plan.md"), Some("Goals"))
+        );
+        assert_eq!(
+            vault.follow(&wiki("#Goals#^abc"), &home),
+            Target::Heading("Goals".into())
+        );
+        // With no heading before it, the whole link is a block reference.
+        assert_eq!(
+            vault.follow(&wiki("Plan##^abc"), &home),
+            note(v.path("Plan.md"), None)
         );
         // An empty heading is no heading.
         assert_eq!(

@@ -19,21 +19,122 @@ A sexy markdown reader for the terminal that draws mermaid diagrams, maths and h
 
 ### Diagrams
 
-A mermaid code block, drawn as an image.
+A mermaid code block is drawn as an image.
 
-![A mermaid diagram drawn as an image](docs/images/diagram.png)
+````markdown
+```mermaid
+flowchart LR
+    S[Sensors] --> M[Microcontroller]
+    M -->|MQTT| B[(Broker)]
+    B --> D[Database]
+    D --> G[Graphs]
+```
+````
+
+![A mermaid flowchart drawn as an image](docs/images/diagram.png)
 
 ### Maths
 
-Display maths, drawn as an image.
+Display maths between `$$` lines is drawn as an image.
 
-![Maths drawn as an image](docs/images/maths.png)
+```markdown
+$$
+T_d = \frac{b\,\gamma(T, RH)}{a - \gamma(T, RH)},
+\qquad
+\gamma(T, RH) = \ln\frac{RH}{100} + \frac{a\,T}{b + T}
+$$
+```
+
+![A display formula drawn as an image](docs/images/maths.png)
+
+### Headings
+
+Headings are drawn as images in a larger font, with a colour for each level, and emoji in colour.
+
+```markdown
+# 🌦️ Weather station
+
+## Sensors
+
+### Wind vane
+```
+
+![Three heading levels, the first with an emoji](docs/images/headings.png)
+
+### Code
+
+A fenced code block is coloured by its language, on a panel.
+
+````markdown
+```rust
+fn dew_point(t: f64, rh: f64) -> f64 {
+    let (a, b) = (17.62, 243.12);
+    let gamma = (rh / 100.0).ln() + a * t / (b + t);
+    b * gamma / (a - gamma)
+}
+```
+````
+
+![A Rust function coloured on a panel](docs/images/code.png)
+
+### Diffs
+
+A `diff` code block shows added lines in green, removed lines in red and hunk headers in cyan.
+
+````markdown
+```diff
+--- a/src/station.rs
++++ b/src/station.rs
+@@ -12,6 +12,7 @@ fn read(sensor: &Sensor) -> Reading {
+     let raw = sensor.sample();
+-    let celsius = raw as f64 / 10.0;
+-    Reading { celsius }
++    let celsius = raw as f64 / 10.0 + sensor.offset;
++    let humidity = sensor.humidity();
++    Reading { celsius, humidity }
+ }
+ 
+ fn log(reading: &Reading) {
+```
+````
+
+![A diff with added and removed lines coloured](docs/images/diff.png)
 
 ### Tables
 
-A wide table, wrapped to fit the pane.
+A table wider than the pane wraps its cells to fit.
 
-![A wide table wrapped to fit the pane](docs/images/table.png)
+```markdown
+| Day | High (°C) | Low (°C) | Rain (mm) | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Monday | 17.2 | 9.1 | 0.0 | Clear morning, cloud building after lunch |
+| Tuesday | 15.8 | 10.4 | 6.4 | Showers through the afternoon, heavy at times |
+| Wednesday | 14.1 | 8.7 | 2.1 | Gusty; the vane needed a new bearing |
+```
+
+![A wide table with its cells wrapped to fit the pane](docs/images/table.png)
+
+In a narrow pane, each row becomes a card.
+
+![The same table drawn as one card per row](docs/images/table-cards.png)
+
+### Links
+
+Wiki links between notes can be followed: Tab selects a link, Enter follows it, and Back in the toolbar goes back.
+
+In `Station.md`:
+
+```markdown
+The offsets are in [[Calibration]].
+```
+
+In `Calibration.md`:
+
+```markdown
+Each sensor is checked against the reference station once a month. Back to [[Station]].
+```
+
+![The linked note, with Back lit in the toolbar](docs/images/links.png)
 
 ## Terminal support
 

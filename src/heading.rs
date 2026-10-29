@@ -19,6 +19,7 @@ use crate::doc::Inline;
 use crate::images::Job;
 use crate::kitty;
 use crate::raster::{self, Canvas, Emoji, Rgba};
+use crate::render::breaks_at;
 use crate::theme::Theme;
 
 /// Cell size used by heading jobs, set once at start-up.
@@ -49,7 +50,7 @@ const SIZES: [(u32, f32); 6] = [
 type Run = (String, bool);
 
 /// The heading's text as runs. Line breaks become spaces, and runs of spaces
-/// outside code become one.
+/// outside code become one, except no-break spaces, which are kept as written.
 fn runs(content: &[Inline]) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     for inline in content {
@@ -66,7 +67,7 @@ fn runs(content: &[Inline]) -> Vec<Run> {
         if !*code {
             let mut collapsed = String::with_capacity(s.len());
             for c in s.chars() {
-                let space = c.is_whitespace();
+                let space = breaks_at(c);
                 if !(space && collapsed.ends_with(' ')) {
                     collapsed.push(if space { ' ' } else { c });
                 }
@@ -75,10 +76,10 @@ fn runs(content: &[Inline]) -> Vec<Run> {
         }
     }
     if let Some((s, _)) = out.first_mut() {
-        *s = s.trim_start().to_string();
+        *s = s.trim_start_matches(breaks_at).to_string();
     }
     if let Some((s, _)) = out.last_mut() {
-        *s = s.trim_end().to_string();
+        *s = s.trim_end_matches(breaks_at).to_string();
     }
     out.retain(|(s, _)| !s.is_empty());
     out
@@ -381,6 +382,15 @@ mod tests {
                 ("smd --watch".to_string(), true),
                 (" now".to_string(), false),
             ]
+        );
+    }
+
+    #[test]
+    fn runs_keep_no_break_spaces() {
+        let (_, content) = heading("# 10&nbsp;km a&nbsp;&nbsp;b&nbsp;\n");
+        assert_eq!(
+            runs(&content),
+            vec![("10\u{a0}km a\u{a0}\u{a0}b\u{a0}".to_string(), false)]
         );
     }
 

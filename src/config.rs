@@ -9,6 +9,9 @@
 //! # The colour code blocks are drawn on when the terminal does not say
 //! # what its background is.
 //! code_background = "#20242a"
+//! # Whether smd takes the mouse, to follow clicked links and scroll with
+//! # the wheel. Without it, links are hyperlinks the terminal opens.
+//! mouse = true
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -41,6 +44,7 @@ pub enum Action {
     PrevLink,
     Follow,
     Back,
+    Forward,
 }
 
 impl Action {
@@ -59,11 +63,12 @@ impl Action {
             Action::NextLink => &["tab"],
             Action::PrevLink => &["shift-tab"],
             Action::Follow => &["enter"],
-            Action::Back => &["backspace"],
+            Action::Back => &["backspace", "H", "alt-left"],
+            Action::Forward => &["L", "alt-right"],
         }
     }
 
-    const ALL: [Action; 13] = [
+    const ALL: [Action; 14] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -77,6 +82,7 @@ impl Action {
         Action::PrevLink,
         Action::Follow,
         Action::Back,
+        Action::Forward,
     ];
 }
 
@@ -171,6 +177,7 @@ struct File {
     #[serde(default)]
     web_links: WebLinks,
     code_background: Option<String>,
+    mouse: Option<bool>,
     #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
@@ -183,6 +190,8 @@ pub struct Config {
     /// The colour to draw code blocks on when the terminal does not say
     /// what its background is.
     pub code_background: Option<Rgb>,
+    /// Whether smd takes the mouse, to follow clicked links and scroll.
+    pub mouse: bool,
     keys: HashMap<Key, Action>,
 }
 
@@ -235,6 +244,7 @@ impl Config {
             home: file.home.as_deref().map(expand_home),
             web_links: file.web_links,
             code_background,
+            mouse: file.mouse.unwrap_or(true),
             keys,
         })
     }
@@ -305,12 +315,13 @@ mod tests {
         assert_eq!(c.web_links, WebLinks::Open);
         assert_eq!(c.home, None);
         assert_eq!(c.code_background, None);
+        assert!(c.mouse);
     }
 
     #[test]
     fn naming_an_action_replaces_its_keys() {
         let c = Config::from_str(
-            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
+            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
         )
         .unwrap();
         let none = KeyModifiers::NONE;
@@ -326,6 +337,7 @@ mod tests {
         assert_eq!(c.web_links, WebLinks::Copy);
         assert_eq!(c.home, Some(PathBuf::from("/n/HOME.md")));
         assert_eq!(c.code_background, Some((0x20, 0x24, 0x2a)));
+        assert!(!c.mouse);
     }
 
     #[test]

@@ -8,10 +8,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::{Cell, CellDiffOption};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Text;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
@@ -21,6 +23,7 @@ use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
 use crate::render::{Layout, LinkSpot, render};
+use crate::theme;
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
 
@@ -53,6 +56,7 @@ pub enum Go {
     Quit,
     Follow(Link),
     Back,
+    Forward,
 }
 
 /// The block at the top of the view, found again after the document is laid
@@ -250,13 +254,18 @@ impl View {
 
     #[cfg(test)]
     pub fn draw(&mut self, frame: &mut Frame) {
-        self.draw_linked(frame, |_| None);
+        let area = frame.area();
+        self.draw_in(frame, area, |_| None);
     }
 
-    /// Draw the view. Each link that `href` gives an address for is marked
-    /// as a terminal hyperlink (OSC 8), so it can be clicked.
-    pub fn draw_linked(&mut self, frame: &mut Frame, href: impl Fn(&Link) -> Option<String>) {
-        let mut area = frame.area();
+    /// Draw the view in `area`. Each link that `href` gives an address for
+    /// is marked as a terminal hyperlink (OSC 8), so it can be clicked.
+    fn draw_in(
+        &mut self,
+        frame: &mut Frame,
+        mut area: Rect,
+        href: impl Fn(&Link) -> Option<String>,
+    ) {
         if let Some(notice) = &self.notice
             && area.height > 0
         {
@@ -308,6 +317,19 @@ impl View {
         }
     }
 
+    /// The link drawn at column `x` of row `y` of the view, if any.
+    fn link_at(&self, x: u16, y: u16) -> Option<usize> {
+        if y >= self.height {
+            return None;
+        }
+        let line = self.scroll + y as usize;
+        self.layout.links.iter().position(|spot| {
+            spot.cells
+                .iter()
+                .any(|(row, cols)| *row == line && cols.contains(&x))
+        })
+    }
+
     /// Do what an action says. Returns what the browser must do, if anything.
     pub fn act(&mut self, action: Action) -> Option<Go> {
         let page = (self.height as isize).max(1);
@@ -329,6 +351,7 @@ impl View {
                 return Some(Go::Follow(spot.link.clone()));
             }
             Action::Back => return Some(Go::Back),
+            Action::Forward => return Some(Go::Forward),
         }
         None
     }
@@ -469,7 +492,10 @@ pub struct Browser {
     watcher: Watcher,
     vault: Vault,
     config: Config,
+    /// Where Back goes, the last place last.
     history: Vec<Visited>,
+    /// Where Forward goes, after going back.
+    ahead: Vec<Visited>,
     /// The notice on screen is about the last key, and goes at the next.
     passing: bool,
 }
@@ -483,6 +509,7 @@ impl Browser {
             vault,
             config,
             history: Vec::new(),
+            ahead: Vec::new(),
             passing: false,
         }
     }
@@ -491,6 +518,37 @@ impl Browser {
     fn say(&mut self, notice: String) {
         self.view.set_notice(Some(notice));
         self.passing = true;
+    }
+
+    /// Handle a mouse event: a click on a link follows it, and the wheel
+    /// scrolls.
+    fn mouse(&mut self, event: MouseEvent) {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) if event.modifiers.is_empty() => {
+                if std::mem::take(&mut self.passing) {
+                    self.view.set_notice(None);
+                }
+                // The toolbar is the top row; the note is below it.
+                let Some(row) = event.row.checked_sub(1) else {
+                    let x = event.column as usize;
+                    let back = BACK_BUTTON.width();
+                    if x < back {
+                        self.back();
+                    } else if x < back + FORWARD_BUTTON.width() {
+                        self.forward();
+                    }
+                    return;
+                };
+                if let Some(i) = self.view.link_at(event.column, row) {
+                    self.view.selected = Some(i);
+                    let link = self.view.layout.links[i].link.clone();
+                    self.follow(&link);
+                }
+            }
+            MouseEventKind::ScrollDown => self.view.scroll_by(WHEEL_LINES),
+            MouseEventKind::ScrollUp => self.view.scroll_by(-WHEEL_LINES),
+            _ => {}
+        }
     }
 
     /// Handle a key press. Returns true when the reader should quit.
@@ -505,6 +563,7 @@ impl Browser {
             Some(Go::Quit) => return true,
             Some(Go::Follow(link)) => self.follow(&link),
             Some(Go::Back) => self.back(),
+            Some(Go::Forward) => self.forward(),
             None => {}
         }
         false
@@ -518,13 +577,10 @@ impl Browser {
                 }
             }
             Target::Note { path, heading } => {
-                let here = Visited {
-                    path: self.path.clone(),
-                    scroll: self.view.scroll,
-                    selected: self.view.selected,
-                };
+                let here = self.here();
                 if self.open(path) {
                     self.history.push(here);
+                    self.ahead.clear();
                     if let Some(h) = heading {
                         self.jump(&h);
                     }
@@ -545,14 +601,94 @@ impl Browser {
 
     /// Go back to the note the last link was followed from, where it was.
     fn back(&mut self) {
-        let Some(visited) = self.history.pop() else {
-            return;
-        };
-        if self.open(visited.path) {
-            self.view.scroll = visited.scroll.min(self.view.max_scroll());
-            self.view.selected = visited.selected;
-            self.view.relayout(None);
+        if let Some(visited) = self.history.pop() {
+            let here = self.here();
+            if self.revisit(visited) {
+                self.ahead.push(here);
+            }
         }
+    }
+
+    /// Go forward again to the note Back left.
+    fn forward(&mut self) {
+        if let Some(visited) = self.ahead.pop() {
+            let here = self.here();
+            if self.revisit(visited) {
+                self.history.push(here);
+            }
+        }
+    }
+
+    /// Where the reader is now, to come back to.
+    fn here(&self) -> Visited {
+        Visited {
+            path: self.path.clone(),
+            scroll: self.view.scroll,
+            selected: self.view.selected,
+        }
+    }
+
+    /// Open a note again where it was left. Returns false when it cannot
+    /// be read.
+    fn revisit(&mut self, visited: Visited) -> bool {
+        if !self.open(visited.path) {
+            return false;
+        }
+        self.view.scroll = visited.scroll.min(self.view.max_scroll());
+        self.view.selected = visited.selected;
+        self.view.relayout(None);
+        true
+    }
+
+    /// Draw the toolbar on the top row and the note below it.
+    fn draw(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let bar = Rect::new(area.x, area.y, area.width, area.height.min(1));
+        let rest = Rect::new(
+            area.x,
+            area.y + bar.height,
+            area.width,
+            area.height - bar.height,
+        );
+        // Styled as a whole, so the bar reaches the right edge.
+        let toolbar = self.toolbar();
+        let style = toolbar.style;
+        frame.render_widget(Paragraph::new(toolbar).style(style), bar);
+        let (vault, path) = (&self.vault, &self.path);
+        // With the mouse, smd follows clicks itself; without it, links are
+        // hyperlinks for the terminal to open.
+        let mouse = self.config.mouse;
+        self.view.draw_in(frame, rest, |link| {
+            (!mouse).then(|| href(vault, link, path))?
+        });
+    }
+
+    /// The toolbar: Back and Forward, dimmed when there is nowhere to go,
+    /// then the note's name.
+    fn toolbar(&self) -> Line<'static> {
+        let base = match theme::code_panel() {
+            Some(bg) => Style::new().bg(bg),
+            None => Style::new().add_modifier(Modifier::REVERSED),
+        };
+        let button = |label: &'static str, enabled: bool| {
+            let style = if enabled {
+                base.add_modifier(Modifier::BOLD)
+            } else {
+                base.add_modifier(Modifier::DIM)
+            };
+            Span::styled(label, style)
+        };
+        let name = self
+            .path
+            .strip_prefix(&self.vault.root)
+            .unwrap_or(&self.path);
+        let name = name.with_extension("");
+        Line::from(vec![
+            button(BACK_BUTTON, !self.history.is_empty()),
+            button(FORWARD_BUTTON, !self.ahead.is_empty()),
+            Span::styled(format!(" {}", name.display()), base),
+        ])
+        .style(base)
     }
 
     /// Show the note at `path`, watching it from now on. Returns false, with
@@ -629,9 +765,20 @@ fn open_with_system(target: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The toolbar's buttons, as drawn from its left edge.
+const BACK_BUTTON: &str = " ← Back ";
+const FORWARD_BUTTON: &str = " Forward → ";
+
+/// How far one step of the mouse wheel scrolls.
+const WHEEL_LINES: isize = 3;
+
+/// Asks the terminal to report mouse presses and releases (not movement),
+/// in the SGR form, and to stop.
+pub const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+
 /// Run the browser until the reader quits, reloading the note when its file
-/// changes. Mouse capture stays off so the terminal's own selection keeps
-/// working. Images are deleted from the terminal however it ends.
+/// changes. Images are deleted from the terminal however it ends.
 pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<()> {
     let result = run_browser(terminal, &mut browser);
     let deleted = browser.view.images.delete_all(terminal.backend_mut());
@@ -643,23 +790,19 @@ fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Res
     let mut redraw = true;
     loop {
         if redraw {
-            let (vault, path) = (&browser.vault, &browser.path);
-            terminal.draw(|frame| {
-                browser
-                    .view
-                    .draw_linked(frame, |link| href(vault, link, path))
-            })?;
+            terminal.draw(|frame| browser.draw(frame))?;
             browser.view.flush_images(terminal.backend_mut())?;
             redraw = false;
         }
         if event::poll(CHECK_EVERY.saturating_sub(last_check.elapsed()))? {
             // A resize needs no handling beyond the redraw.
             redraw = true;
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && browser.key(key)
-            {
-                return Ok(());
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press && browser.key(key) => {
+                    return Ok(());
+                }
+                Event::Mouse(mouse) => browser.mouse(mouse),
+                _ => {}
             }
         }
         if last_check.elapsed() >= CHECK_EVERY {
@@ -1058,7 +1201,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(30, 2)).unwrap();
         v.resize(30, 2);
         let href = |link: &Link| (!link.wiki).then(|| link.dest.clone());
-        terminal.draw(|f| v.draw_linked(f, href)).unwrap();
+        terminal.draw(|f| v.draw_in(f, f.area(), href)).unwrap();
         let buf = terminal.backend().buffer();
         let open = "\x1b]8;id=smd0;https://e.com\x1b\\";
         let close = "\x1b]8;;\x1b\\";
@@ -1070,6 +1213,106 @@ mod tests {
         // Each cell still takes one column.
         assert_eq!(buf[(5, 0)].symbol(), " ");
         assert_eq!(buf[(11, 0)].symbol(), "n");
+    }
+
+    #[test]
+    fn clicking_a_link_follows_it_and_the_wheel_scrolls() {
+        let home = format!("go [[Plan]] now\n\n{}", paragraphs(6));
+        let (mut b, dir) = browser("click", &[("HOME.md", &home), ("Plan.md", "# Plan\n")]);
+        let at = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let click = |column, row| at(MouseEventKind::Down(MouseButton::Left), column, row);
+        // Next to the link, nothing happens. The note starts on the row
+        // below the toolbar.
+        b.mouse(click(1, 1));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        b.mouse(at(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(b.view.scroll, 3);
+        b.mouse(at(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(b.view.scroll, 0);
+        b.mouse(click(4, 1));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        // The toolbar's Back and Forward buttons.
+        b.mouse(click(2, 0));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        assert_eq!(b.view.selected, Some(0));
+        b.mouse(click(BACK_BUTTON.width() as u16 + 2, 0));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forward_goes_back_to_where_back_left() {
+        let home = "[[A]] [[B]]\n";
+        let (mut b, dir) = browser(
+            "forward",
+            &[("HOME.md", home), ("A.md", "[[B]]\n"), ("B.md", "b\n")],
+        );
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("A.md"));
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        enter(&mut b, KeyCode::Char('L'));
+        assert_eq!(b.path, dir.join("A.md"));
+        // Nothing further ahead.
+        enter(&mut b, KeyCode::Char('L'));
+        assert_eq!(b.path, dir.join("A.md"));
+        // Following a new link forgets the way forward. Back leaves the
+        // first link selected, so one Tab gets to the second.
+        enter(&mut b, KeyCode::Char('H'));
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("B.md"));
+        assert!(b.ahead.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_toolbar_shows_the_buttons_and_the_note_name() {
+        let (mut b, dir) = browser(
+            "toolbar",
+            &[("HOME.md", "[[work/Plan]]\n"), ("work/Plan.md", "p\n")],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        let row = |t: &Terminal<TestBackend>, y| -> String {
+            let buf = t.backend().buffer();
+            (0..40).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        };
+        terminal.draw(|f| b.draw(f)).unwrap();
+        assert_eq!(row(&terminal, 0).trim_end(), " ← Back  Forward →  HOME");
+        // The bar reaches the right edge.
+        assert_eq!(
+            terminal.backend().buffer()[(39, 0)].bg,
+            terminal.backend().buffer()[(0, 0)].bg
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(39, 0)].modifier,
+            terminal.backend().buffer()[(0, 0)].modifier - Modifier::DIM
+        );
+        assert!(
+            terminal.backend().buffer()[(2, 0)]
+                .modifier
+                .contains(Modifier::DIM)
+        );
+        assert_eq!(row(&terminal, 1).trim_end(), "work/Plan");
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        terminal.draw(|f| b.draw(f)).unwrap();
+        assert_eq!(
+            row(&terminal, 0).trim_end(),
+            " ← Back  Forward →  work/Plan"
+        );
+        assert!(
+            terminal.backend().buffer()[(2, 0)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

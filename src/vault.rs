@@ -40,7 +40,7 @@ pub enum Target {
 
 pub struct Vault {
     /// The folder wiki links are looked up in.
-    root: PathBuf,
+    pub root: PathBuf,
     /// Lower-cased file name to every file with it, made on first use.
     index: OnceLock<HashMap<String, Vec<PathBuf>>>,
 }

@@ -23,9 +23,9 @@ A paragraph that holds only a local PNG, GIF (first frame) or JPEG image, such a
 
 ## Links and Obsidian notes
 
-Press Tab and Shift-Tab to move between links, Enter to follow one, and Backspace to go back to where you were. Following a link to another note opens it in smd. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
+Press Tab and Shift-Tab to move between links, Enter to follow one, Backspace (or `H`) to go back to where you were, and `L` to go forward again. The toolbar on the top row has Back and Forward buttons, dimmed when there is nowhere to go, and the name of the note. Following a link to another note opens it in smd. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
 
-Links are also marked as terminal hyperlinks (OSC 8), so in a terminal that supports them you can click one, usually with Cmd or Ctrl held. The terminal opens it, not smd: a web link opens in the browser, and a note opens in whatever app opens `.md` files. A link to a heading in the same note, or to a note smd cannot find, is not clickable.
+You can also click a link to follow it, and scroll with the mouse wheel. While smd has the mouse, dragging no longer selects text; most terminals let you select with Option (macOS) or Shift held. With `mouse = false` in the config, smd leaves the mouse to the terminal and marks links as terminal hyperlinks (OSC 8) instead, so the terminal opens them: a web link in the browser, and a note in whatever app opens `.md` files.
 
 Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]` and `[[#Heading]]`. smd finds the vault by looking up from the file for a folder with a `.obsidian` folder in it, and looks up a note by name anywhere in the vault, as Obsidian does. A note outside a vault looks in its own folder and the folders below it. An embedded image, `![[diagram.png]]`, is shown like any other image. An embedded note, `![[Note]]`, is shown as a link to it.
 
@@ -47,6 +47,10 @@ web_links = "open"
 # its background is. Without it, they are indented instead.
 code_background = "#20242a"
 
+# Whether smd takes the mouse, to follow clicked links and scroll with the
+# wheel (the default). With false, links are hyperlinks the terminal opens.
+mouse = true
+
 # Keys for each action. Naming an action replaces its default keys.
 [keys]
 next_link = ["tab", "n"]
@@ -64,6 +68,6 @@ The actions and their default keys:
 | `top`, `bottom` | `g`, `home`; `G`, `end` |
 | `next_link`, `prev_link` | `tab`; `shift-tab` |
 | `follow` | `enter` |
-| `back` | `backspace` |
+| `back`, `forward` | `backspace`, `H`, `alt-left`; `L`, `alt-right` |
 
 A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.

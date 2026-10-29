@@ -15,7 +15,7 @@ mod vault;
 mod watch;
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::panic;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -96,6 +96,10 @@ fn main() -> ExitCode {
     // Set after ratatui's hook, which restores the terminal, so it runs first.
     // A job's panic is caught and shown as a failed image, so it prints
     // nothing; any other deletes the images before the terminal is restored.
+    let mouse = config.mouse;
+    if mouse {
+        let _ = io::stdout().write_all(app::MOUSE_ON.as_bytes());
+    }
     let uploaded = images.uploaded();
     let restore = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -103,6 +107,9 @@ fn main() -> ExitCode {
             return;
         }
         let _ = uploaded.delete_all(&mut io::stdout());
+        if mouse {
+            let _ = io::stdout().write_all(app::MOUSE_OFF.as_bytes());
+        }
         restore(info);
     }));
     // Started once the hook is set, like the jobs below.
@@ -113,6 +120,9 @@ fn main() -> ExitCode {
     let view = app::View::new(doc, app::folder(&path), images);
     let browser = app::Browser::new(view, path, watcher, vault, config);
     let result = app::run(&mut terminal, browser);
+    if mouse {
+        let _ = io::stdout().write_all(app::MOUSE_OFF.as_bytes());
+    }
     ratatui::restore();
     match result {
         Ok(()) => ExitCode::SUCCESS,

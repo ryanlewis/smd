@@ -475,45 +475,12 @@ fn apply(view: &mut View, path: &Path, vault: &Vault, change: Change) {
 
 /// `source`, the note at `path`, parsed with its embedded images found.
 pub fn parse(vault: &Vault, source: &str, path: &Path) -> Document {
-    let mut doc = doc::parse(source);
-    vault.resolve_embeds(&mut doc.blocks, path);
     // Without a reported background the theme is a guess, and the logo
     // left out could be the right one.
-    if theme::reported() {
-        for_theme(&mut doc.blocks, theme::current());
-    }
+    let theme = theme::reported().then(theme::current);
+    let mut doc = doc::parse_for(source, theme);
+    vault.resolve_embeds(&mut doc.blocks, path);
     doc
-}
-
-/// Leave out the images a page on the web shows only on the other theme's
-/// background, such as one of a README's two logos, one for dark and one
-/// for light.
-fn for_theme(blocks: &mut Vec<doc::Block>, theme: theme::Theme) {
-    let other = match theme {
-        theme::Theme::Dark => "#gh-light-mode-only",
-        theme::Theme::Light => "#gh-dark-mode-only",
-    };
-    blocks.retain_mut(|b| kept(b, other));
-}
-
-/// Whether `block` stays when images ending with `other` are left out. A
-/// quote, list item or list left empty by that goes too.
-fn kept(block: &mut doc::Block, other: &str) -> bool {
-    let emptied = |blocks: &mut Vec<doc::Block>| {
-        let had = !blocks.is_empty();
-        blocks.retain_mut(|b| kept(b, other));
-        had && blocks.is_empty()
-    };
-    match &mut block.kind {
-        BlockKind::Image { src, .. } => !src.ends_with(other),
-        BlockKind::Quote(inner) => !emptied(inner),
-        BlockKind::List { items, .. } => {
-            let had = !items.is_empty();
-            items.retain_mut(|item| !emptied(&mut item.blocks));
-            !had || !items.is_empty()
-        }
-        _ => true,
-    }
 }
 
 /// The folder a note's relative image paths are read from.
@@ -1663,27 +1630,9 @@ mod tests {
                   > ![logo](light.png#gh-light-mode-only)\n\n![shot](shot.png)\n";
         let vault = Vault::for_file(Path::new("/n/README.md"));
         // The tests run with no background reported, so both logos stay.
+        // doc::parse_for's tests cover leaving one out.
         let doc = super::parse(&vault, md, Path::new("/n/README.md"));
         assert_eq!(image_srcs(&doc.blocks).len(), 4);
-        let mut blocks = doc::parse(md).blocks;
-        for_theme(&mut blocks, theme::Theme::Dark);
-        let dark = "dark.png#gh-dark-mode-only";
-        assert_eq!(image_srcs(&blocks), [dark, "shot.png"]);
-        let mut blocks = doc::parse(md).blocks;
-        for_theme(&mut blocks, theme::Theme::Light);
-        let light = "light.png#gh-light-mode-only";
-        assert_eq!(image_srcs(&blocks), [light, light, "shot.png"]);
-        // A quote, list item or list left with nothing goes too.
-        let md = "- ![logo](light.png#gh-light-mode-only)\n- one\n\n\
-                  > ![logo](light.png#gh-light-mode-only)\n\n\
-                  - ![logo](light.png#gh-light-mode-only)\n";
-        let mut blocks = doc::parse(md).blocks;
-        for_theme(&mut blocks, theme::Theme::Dark);
-        assert_eq!(blocks.len(), 1);
-        let BlockKind::List { items, .. } = &blocks[0].kind else {
-            panic!("{blocks:?}");
-        };
-        assert_eq!(items.len(), 1);
     }
 
     #[test]

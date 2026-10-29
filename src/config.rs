@@ -190,11 +190,19 @@ impl Key {
     }
 
     /// The key a key press is. Shift is part of the character it makes, so
-    /// it is not kept.
+    /// it is not kept. A control letter is kept in lower case, as [`parse`]
+    /// keeps it, since terminals send ctrl-c as `c` or `C`.
+    ///
+    /// [`parse`]: Key::parse
     fn of(event: KeyEvent) -> Key {
+        let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+        let code = match event.code {
+            KeyCode::Char(c) if ctrl => KeyCode::Char(c.to_ascii_lowercase()),
+            code => code,
+        };
         Key {
-            code: event.code,
-            ctrl: event.modifiers.contains(KeyModifiers::CONTROL),
+            code,
+            ctrl,
             alt: event.modifiers.contains(KeyModifiers::ALT),
         }
     }
@@ -362,6 +370,32 @@ mod tests {
         assert_eq!(c.home, None);
         assert_eq!(c.code_background, None);
         assert!(c.mouse);
+    }
+
+    #[test]
+    fn a_control_letter_matches_in_either_case() {
+        let c = Config::default();
+        let ctrl = KeyModifiers::CONTROL;
+        let shift = KeyModifiers::SHIFT;
+        // Some terminals send ctrl-c, and ctrl-shift-c, as an upper-case C.
+        assert_eq!(
+            c.action(press(KeyCode::Char('C'), ctrl)),
+            Some(Action::Quit)
+        );
+        assert_eq!(
+            c.action(press(KeyCode::Char('C'), ctrl | shift)),
+            Some(Action::Quit)
+        );
+        // Without control, the case is the key.
+        assert_eq!(
+            c.action(press(KeyCode::Char('G'), shift)),
+            Some(Action::Bottom)
+        );
+        assert_eq!(
+            c.action(press(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(Action::Top)
+        );
+        assert_eq!(c.action(press(KeyCode::Char('G'), KeyModifiers::ALT)), None);
     }
 
     #[test]

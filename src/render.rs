@@ -226,7 +226,10 @@ fn contents(
         BlockKind::Figure {
             kind: FigureKind::Table,
             source,
-        } => table(source, width, first, rest, out),
+        } => {
+            let links = table(source, width, first, rest, out);
+            ctx.layout.links.extend(links);
+        }
         // Without graphics an image block is never drawn, so it shows its
         // source as code.
         BlockKind::Figure { source, .. } if !graphics => {
@@ -292,23 +295,32 @@ fn code_indented(
     lines.finish_last();
 }
 
-/// A table drawn as text in the width its prefix leaves.
+/// A table drawn as text in the width its prefix leaves. Returns where the
+/// links in it landed.
 fn table(
     source: &str,
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
-) {
+) -> Vec<LinkSpot> {
     let prefix = spans_width(first).max(spans_width(rest));
     let avail = width.saturating_sub(prefix).max(1);
-    for (i, line) in Table::parse(source)
-        .lines(avail, inline_style)
-        .into_iter()
-        .enumerate()
-    {
-        emit(if i == 0 { first } else { rest }, line, out);
+    let drawn = Table::parse(source).lines(avail, inline_style);
+    let top = out.len();
+    let line_prefix = |i: usize| if i == 0 { first } else { rest };
+    for (i, line) in drawn.lines.into_iter().enumerate() {
+        emit(line_prefix(i), line, out);
     }
+    let place = |(row, cols): (usize, Range<u16>)| {
+        let indent = spans_width(line_prefix(row)) as u16;
+        (top + row, cols.start + indent..cols.end + indent)
+    };
+    let spot = |spot: LinkSpot| LinkSpot {
+        cells: spot.cells.into_iter().map(place).collect(),
+        ..spot
+    };
+    drawn.links.into_iter().map(spot).collect()
 }
 
 /// An image block's markdown as written, unless it spans lines, which in a
@@ -1123,6 +1135,58 @@ mod tests {
             spots("a [\u{a0}](x) b\n", 20),
             vec![("x".to_string(), vec![(0, 2..3)])]
         );
+    }
+
+    #[test]
+    fn a_link_in_a_table_cell_takes_its_cells() {
+        let md = "| a | [bb](x) |\n|---|---|\n| 1 | 2 |\n";
+        assert_eq!(spots(md, 40), vec![("x".to_string(), vec![(1, 6..8)])]);
+        // Under a quote, after its bar.
+        let quoted = "> | a | [bb](x) |\n> |---|---|\n";
+        assert_eq!(spots(quoted, 40), vec![("x".to_string(), vec![(1, 8..10)])]);
+    }
+
+    #[test]
+    fn a_link_wrapped_in_a_table_cell_takes_cells_on_each_line() {
+        let md = "| name | note |\n|---|---|\n| a | [one two three four](x) |\n";
+        assert_eq!(
+            plain(md, 22)[3..5],
+            ["│ a    │ one two     │", "│      │ three four  │"]
+        );
+        assert_eq!(
+            spots(md, 22),
+            vec![("x".to_string(), vec![(3, 9..16), (4, 9..19)])]
+        );
+    }
+
+    #[test]
+    fn a_link_in_a_card_takes_its_cells() {
+        let md = "| tool | isolation mechanism | credentials |\n|---|---|---|\n\
+                  | [srt](s) | seatbelt on macOS | runs as you |\n";
+        assert_eq!(plain(md, 30)[1], "tool:       srt");
+        assert_eq!(spots(md, 30), vec![("s".to_string(), vec![(1, 12..15)])]);
+    }
+
+    #[test]
+    fn a_tables_links_are_the_same_as_a_grid_or_as_cards() {
+        let md = "| [h](a) | b | c |\n|---|---|---|\n| [x](y) [ ](z) | w | [v](u) |\n";
+        for width in [12, 60] {
+            let dests: Vec<String> = spots(md, width).into_iter().map(|(d, _)| d).collect();
+            assert_eq!(dests, vec!["a", "y", "u"], "width {width}");
+        }
+    }
+
+    #[test]
+    fn a_table_link_with_nothing_drawn_is_left_out() {
+        // Spaces, even in code, are where a cell's lines break.
+        let md = "| [`  `](x) | a [`  `](y) b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n";
+        // A header over a column with nothing in it has no card to be on.
+        let empty = "| [h](a) | b | c |\n|---|---|---|\n|  | w | v |\n";
+        for width in [12, 60] {
+            assert_eq!(spots(md, width), vec![], "width {width}");
+            let dests: Vec<String> = spots(empty, width).into_iter().map(|(d, _)| d).collect();
+            assert_eq!(dests, Vec::<String>::new(), "width {width}");
+        }
     }
 
     #[test]

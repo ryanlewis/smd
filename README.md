@@ -267,7 +267,7 @@ A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `b
 
 ## Limitations
 
-- Links inside tables and in headings drawn as images cannot be selected or clicked yet.
+- Links in headings drawn as images cannot be selected or clicked yet.
 - Only the first frame of a GIF is shown.
 - Only local images are shown; images from the web are not fetched.
 - Each mermaid diagram starts `mmdc`, which starts a browser, so the first open of a file with many diagrams is slow. Later opens use the cache.

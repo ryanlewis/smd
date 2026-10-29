@@ -323,11 +323,7 @@ impl<'a> Builder<'a> {
             Event::SoftBreak => self.text(" ", self.style(), range),
             Event::HardBreak => self.inline(Inline::Break, range),
             Event::Rule => self.push_block(BlockKind::Rule, range),
-            Event::TaskListMarker(done) => {
-                if let FrameKind::Item { task } = &mut self.top().kind {
-                    *task = Some(done);
-                }
-            }
+            Event::TaskListMarker(done) => self.mark_task(done),
         }
     }
 
@@ -510,6 +506,17 @@ impl<'a> Builder<'a> {
         let top = self.top();
         top.flush_inlines();
         top.blocks.push(Block { kind, span });
+    }
+
+    /// Mark the open list item as a task. In a loose list the marker comes
+    /// inside the item's paragraph, so the item is the frame below it.
+    fn mark_task(&mut self, done: bool) {
+        for frame in self.stack.iter_mut().rev().take(2) {
+            if let FrameKind::Item { task } = &mut frame.kind {
+                *task = Some(done);
+                return;
+            }
+        }
     }
 
     fn mark_list_loose(&mut self) {
@@ -736,6 +743,25 @@ mod tests {
             &items[1].blocks[1].kind,
             BlockKind::List { items, .. } if items.len() == 1
         ));
+    }
+
+    #[test]
+    fn a_loose_list_keeps_its_task_markers() {
+        let blocks = kinds("- loose\n\n- [x] done\n");
+        let BlockKind::List {
+            tight: false,
+            items,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected a loose list, got {blocks:?}");
+        };
+        assert_eq!(items[0].task, None);
+        assert_eq!(items[1].task, Some(true));
+        assert_eq!(
+            items[1].blocks[0].kind,
+            BlockKind::Paragraph(vec![text("done")])
+        );
     }
 
     #[test]

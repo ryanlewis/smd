@@ -945,4 +945,283 @@ mod tests {
             vec![BlockKind::Rule, BlockKind::Html("<div>hi</div>\n".into())]
         );
     }
+
+    /// Every field of the parsed blocks as indented lines, one block or
+    /// inline per line, so a test can pin the whole of the builder's output.
+    fn outline(md: &str) -> String {
+        let mut out = String::new();
+        outline_blocks(&parse(md).blocks, 0, &mut out);
+        out
+    }
+
+    fn outline_blocks(blocks: &[Block], depth: usize, out: &mut String) {
+        for Block { kind, span } in blocks {
+            let pad = "  ".repeat(depth);
+            let head = match kind {
+                BlockKind::Heading { level, .. } => format!("heading {level}"),
+                BlockKind::Paragraph(_) => "paragraph".to_string(),
+                BlockKind::Code { lang, code } => format!("code {lang:?} {code:?}"),
+                BlockKind::Quote(_) => "quote".to_string(),
+                BlockKind::List { start, tight, .. } => format!("list {start:?} tight={tight}"),
+                BlockKind::Rule => "rule".to_string(),
+                BlockKind::Html(html) => format!("html {html:?}"),
+                BlockKind::Image { src, alt, wiki } => {
+                    format!("image {src:?} alt={alt:?} wiki={wiki}")
+                }
+                BlockKind::Figure { kind, source } => format!("figure {kind:?} {source:?}"),
+            };
+            out.push_str(&format!("{pad}{head} @{span:?}\n"));
+            match kind {
+                BlockKind::Heading { content, .. } | BlockKind::Paragraph(content) => {
+                    outline_inlines(content, depth + 1, out);
+                }
+                BlockKind::Quote(blocks) => outline_blocks(blocks, depth + 1, out),
+                BlockKind::List { items, .. } => {
+                    for ListItem { task, blocks } in items {
+                        out.push_str(&format!("{pad}  item task={task:?}\n"));
+                        outline_blocks(blocks, depth + 2, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn outline_inlines(inlines: &[Inline], depth: usize, out: &mut String) {
+        let pad = "  ".repeat(depth);
+        for inline in inlines {
+            let line = match inline {
+                Inline::Break => "break".to_string(),
+                Inline::Text { text, style } => {
+                    let InlineStyle {
+                        emphasis,
+                        strong,
+                        strikethrough,
+                        code,
+                        math,
+                        link,
+                    } = style;
+                    let mut line = format!("{text:?}");
+                    for (on, name) in [
+                        (emphasis, "em"),
+                        (strong, "strong"),
+                        (strikethrough, "strike"),
+                        (code, "code"),
+                        (math, "math"),
+                    ] {
+                        if *on {
+                            line.push_str(&format!(" {name}"));
+                        }
+                    }
+                    if let Some(Link { dest, wiki }) = link {
+                        line.push_str(&format!(" link={dest:?} wiki={wiki}"));
+                    }
+                    line
+                }
+            };
+            out.push_str(&format!("{pad}{line}\n"));
+        }
+    }
+
+    #[track_caller]
+    fn assert_outline(md: &str, expected: &str) {
+        assert_eq!(outline(md), expected, "markdown: {md:?}");
+    }
+
+    #[test]
+    fn pin_headings_atx_setext_and_inline_code() {
+        assert_outline(
+            "## Heading `code`\nSetext\n===\n",
+            r#"heading 2 @0..18
+  "Heading "
+  "code" code
+heading 1 @18..29
+  "Setext"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_nested_inline_styles() {
+        assert_outline(
+            "***strong em*** ~~*x*~~ [a **b** `c`](u)  \nend\n",
+            r#"paragraph @0..47
+  "strong em" em strong
+  " "
+  "x" em strike
+  " "
+  "a " link="u" wiki=false
+  "b" strong link="u" wiki=false
+  " " link="u" wiki=false
+  "c" code link="u" wiki=false
+  break
+  "end"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_wiki_links() {
+        assert_outline(
+            "# Wiki *a* [[Note]]\n\nsee [[Note#Part|the part]] and [[Other]]\n",
+            r#"heading 1 @0..20
+  "Wiki "
+  "a" em
+  " "
+  "Note" link="Note" wiki=true
+paragraph @21..62
+  "see "
+  "the part" link="Note#Part" wiki=true
+  " and "
+  "Other" link="Other" wiki=true
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_wiki_embeds_of_images_and_notes() {
+        assert_outline(
+            "![[pic.png]]\n",
+            "image \"pic.png\" alt=\"pic.png\" wiki=true @0..13\n",
+        );
+        assert_outline(
+            "![[Note]]\n",
+            r#"paragraph @0..10
+  "Note" link="Note" wiki=true
+"#,
+        );
+        assert_outline(
+            "text ![[Note|alias]] more\n",
+            r#"paragraph @0..26
+  "text "
+  "alias" link="Note" wiki=true
+  " more"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_images() {
+        assert_outline(
+            "![outer ![inner](i.png) alt](o.png)\n",
+            "image \"o.png\" alt=\"outer inner alt\" wiki=false @0..36\n",
+        );
+        assert_outline(
+            "- item\n\n  ![x](x.png)\n",
+            r#"list None tight=false @0..22
+  item task=None
+    paragraph @2..7
+      "item"
+    image "x.png" alt="x" wiki=false @10..22
+"#,
+        );
+        assert_outline(
+            "![a](a.png) ![b](b.png)\n",
+            r#"paragraph @0..24
+  "[image: a] [image: b]"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_nested_quotes_and_lists() {
+        assert_outline(
+            "> outer\n> > inner\n> > - item\n",
+            r#"quote @0..29
+  paragraph @2..8
+    "outer"
+  quote @10..29
+    paragraph @12..18
+      "inner"
+    list None tight=true @22..29
+      item task=None
+        paragraph @24..28
+          "item"
+"#,
+        );
+        assert_outline(
+            "1. a\n   - [ ] b\n     > c\n2. d\n",
+            r#"list Some(1) tight=true @0..30
+  item task=None
+    paragraph @3..4
+      "a"
+    list None tight=true @8..25
+      item task=Some(false)
+        paragraph @14..15
+          "b"
+        quote @21..25
+          paragraph @23..25
+            "c"
+  item task=None
+    paragraph @28..29
+      "d"
+"#,
+        );
+        assert_outline(
+            "- one\n\n  two\n- three\n",
+            r#"list None tight=false @0..21
+  item task=None
+    paragraph @2..6
+      "one"
+    paragraph @9..13
+      "two"
+  item task=None
+    paragraph @15..21
+      "three"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_code_fences() {
+        assert_outline(
+            "```\nplain\n```\n\n    indented\n\n``` rust  extra\nlet x;\n```\n",
+            r#"code None "plain\n" @0..13
+code None "indented\n" @19..28
+code Some("rust") "let x;\n" @29..55
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_maths_and_mermaid_figures() {
+        assert_outline(
+            "```math\nx^2\n```\n\n```mermaid\ngraph TD\n```\n\n$$a$$\n$$b$$\n",
+            r#"figure Math "x^2\n" @0..15
+figure Mermaid "graph TD\n" @17..40
+figure Math "a" @42..54
+figure Math "b" @42..54
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_tables() {
+        assert_outline(
+            "> | a |\n> |---|\n\nafter *x*\n",
+            r#"quote @0..16
+  figure Table "| a |\n|---|" @2..16
+paragraph @17..27
+  "after "
+  "x" em
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_footnotes_html_and_rules() {
+        assert_outline(
+            "Text[^1].\n\n[^1]: The note.\n\n<!-- c -->\n\na <b>bold</b> c\n\n***\n___\n",
+            r#"paragraph @0..10
+  "Text[^1]."
+paragraph @11..27
+  "[^1]: The note."
+html "<!-- c -->\n" @28..39
+paragraph @40..56
+  "a <b>bold</b> c"
+rule @57..61
+rule @61..65
+"#,
+        );
+    }
 }

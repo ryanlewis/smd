@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle, Link};
+use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle, Link, ListItem};
 use crate::highlight::{self, Segments};
 use crate::images::{self, Images, Placement};
 use crate::kitty;
@@ -203,6 +203,7 @@ fn contents(
     rest: &[Span<'static>],
     ctx: &mut Ctx,
 ) {
+    let graphics = ctx.images.graphics();
     let out = &mut ctx.layout.lines;
     match &block.kind {
         BlockKind::Paragraph(content) => {
@@ -219,78 +220,32 @@ fn contents(
                 .and_then(|lang| highlight::highlight(ctx.syntaxes, lang, code));
             match ctx.panel {
                 Some(bg) => code_panel(code, colours.as_deref(), bg, width, first, rest, out),
-                // With no colour to shade, indenting sets the code apart.
-                None => {
-                    let indent = Span::raw("  ");
-                    let first = with(first, indent.clone());
-                    let rest = with(rest, indent);
-                    let mut lines = Lines::new(width, &first, &rest, out);
-                    lines.code(code, colours.as_deref(), Style::new());
-                    lines.finish_last();
-                }
+                None => code_indented(code, colours.as_deref(), width, first, rest, out),
             }
         }
         BlockKind::Figure {
             kind: FigureKind::Table,
             source,
-        } => {
-            let prefix = spans_width(first).max(spans_width(rest));
-            let avail = width.saturating_sub(prefix).max(1);
-            for (i, line) in Table::parse(source)
-                .lines(avail, inline_style)
-                .into_iter()
-                .enumerate()
-            {
-                emit(if i == 0 { first } else { rest }, line, out);
-            }
-        }
+        } => table(source, width, first, rest, out),
         // Without graphics an image block is never drawn, so it shows its
         // source as code.
-        BlockKind::Figure { source, .. } if !ctx.images.graphics() => {
+        BlockKind::Figure { source, .. } if !graphics => {
             preformatted(source, CODE, width, first, rest, out);
         }
-        BlockKind::Image { src, alt, .. } if !ctx.images.graphics() => {
-            // As written, unless it spans lines, which in a quote or list
-            // would bring their markers along.
-            let text = match ctx.source.get(block.span.clone()).map(str::trim) {
-                Some(text) if !text.contains('\n') => text.to_string(),
-                _ => format!("![{alt}]({src})"),
-            };
+        BlockKind::Image { src, alt, .. } if !graphics => {
+            let text = image_source(ctx.source, block, src, alt);
             preformatted(&text, CODE, width, first, rest, out);
         }
         BlockKind::Figure { source, .. } => {
-            // A figure that could not be drawn says why above its source.
             let error = images::key(block).and_then(|key| ctx.images.error(&key));
-            let first = match error {
-                Some(error) => {
-                    let note = Inline::Text {
-                        text: format!("{error}; showing the source"),
-                        style: InlineStyle::default(),
-                    };
-                    let dim = Style::new().add_modifier(Modifier::DIM);
-                    wrap(&[note], dim, width, first, rest, out);
-                    rest
-                }
-                None => first,
-            };
-            let style = Style::new().fg(Color::Cyan);
-            preformatted(source, style, width, first, rest, out);
+            figure(source, error, width, first, rest, out);
         }
         BlockKind::Html(html) => {
-            preformatted(
-                html,
-                Style::new().add_modifier(Modifier::DIM),
-                width,
-                first,
-                rest,
-                out,
-            );
+            let dim = Style::new().add_modifier(Modifier::DIM);
+            preformatted(html, dim, width, first, rest, out);
         }
         BlockKind::Image { alt, .. } => {
-            let text = Inline::Text {
-                text: format!("[image: {alt}]"),
-                style: InlineStyle::default(),
-            };
+            let text = note(format!("[image: {alt}]"));
             wrap(&[text], Style::default(), width, first, rest, out);
         }
         BlockKind::Rule => {
@@ -308,35 +263,135 @@ fn contents(
             start,
             tight,
             items,
-        } => {
-            let markers: Vec<String> = (0..items.len() as u64)
-                .map(|n| match start {
-                    Some(s) => format!("{}. ", s + n),
-                    None => "• ".to_string(),
-                })
-                .collect();
-            let marker_width = markers.iter().map(|m| m.width()).max().unwrap_or(0);
-            for (i, (item, marker)) in items.iter().zip(markers).enumerate() {
-                if i > 0 && !tight {
-                    emit(rest, Vec::new(), &mut ctx.layout.lines);
-                }
-                let mut marker = format!("{marker:>marker_width$}");
-                let mut indent = marker_width;
-                if let Some(done) = item.task {
-                    marker.push_str(if done { "[x] " } else { "[ ] " });
-                    indent += 4;
-                }
-                let item_first = with(
-                    if i == 0 { first } else { rest },
-                    Span::styled(marker, Style::new().fg(Color::Blue)),
-                );
-                let item_rest = with(rest, Span::raw(" ".repeat(indent)));
-                if item.blocks.is_empty() {
-                    emit(&item_first, Vec::new(), &mut ctx.layout.lines);
-                }
-                blocks(&item.blocks, width, &item_first, &item_rest, *tight, ctx);
-            }
+        } => list(*start, *tight, items, width, first, rest, ctx),
+    }
+}
+
+/// Plain text as inline content.
+fn note(text: String) -> Inline {
+    Inline::Text {
+        text,
+        style: InlineStyle::default(),
+    }
+}
+
+/// Code with no panel, where indenting sets it apart instead.
+fn code_indented(
+    code: &str,
+    colours: Option<&[Segments]>,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    let indent = Span::raw("  ");
+    let first = with(first, indent.clone());
+    let rest = with(rest, indent);
+    let mut lines = Lines::new(width, &first, &rest, out);
+    lines.code(code, colours, Style::new());
+    lines.finish_last();
+}
+
+/// A table drawn as text in the width its prefix leaves.
+fn table(
+    source: &str,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    let prefix = spans_width(first).max(spans_width(rest));
+    let avail = width.saturating_sub(prefix).max(1);
+    for (i, line) in Table::parse(source)
+        .lines(avail, inline_style)
+        .into_iter()
+        .enumerate()
+    {
+        emit(if i == 0 { first } else { rest }, line, out);
+    }
+}
+
+/// An image block's markdown as written, unless it spans lines, which in a
+/// quote or list would bring their markers along.
+fn image_source(source: &str, block: &Block, src: &str, alt: &str) -> String {
+    match source.get(block.span.clone()).map(str::trim) {
+        Some(text) if !text.contains('\n') => text.to_string(),
+        _ => format!("![{alt}]({src})"),
+    }
+}
+
+/// A figure not drawn as an image shows its source, and when drawing it
+/// failed, says why above it.
+fn figure(
+    source: &str,
+    error: Option<&str>,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    let first = match error {
+        Some(error) => {
+            let dim = Style::new().add_modifier(Modifier::DIM);
+            wrap(
+                &[note(format!("{error}; showing the source"))],
+                dim,
+                width,
+                first,
+                rest,
+                out,
+            );
+            rest
         }
+        None => first,
+    };
+    preformatted(
+        source,
+        Style::new().fg(Color::Cyan),
+        width,
+        first,
+        rest,
+        out,
+    );
+}
+
+/// List items, each under a marker: a number counting from `start` for an
+/// ordered list, a bullet otherwise, and a checkbox for a task.
+fn list(
+    start: Option<u64>,
+    tight: bool,
+    items: &[ListItem],
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) {
+    let markers: Vec<String> = (0..items.len() as u64)
+        .map(|n| match start {
+            Some(s) => format!("{}. ", s + n),
+            None => "• ".to_string(),
+        })
+        .collect();
+    let marker_width = markers.iter().map(|m| m.width()).max().unwrap_or(0);
+    for (i, (item, marker)) in items.iter().zip(markers).enumerate() {
+        if i > 0 && !tight {
+            emit(rest, Vec::new(), &mut ctx.layout.lines);
+        }
+        let mut marker = format!("{marker:>marker_width$}");
+        let mut indent = marker_width;
+        if let Some(done) = item.task {
+            marker.push_str(if done { "[x] " } else { "[ ] " });
+            indent += 4;
+        }
+        let item_first = with(
+            if i == 0 { first } else { rest },
+            Span::styled(marker, Style::new().fg(Color::Blue)),
+        );
+        let item_rest = with(rest, Span::raw(" ".repeat(indent)));
+        if item.blocks.is_empty() {
+            emit(&item_first, Vec::new(), &mut ctx.layout.lines);
+        }
+        blocks(&item.blocks, width, &item_first, &item_rest, tight, ctx);
     }
 }
 

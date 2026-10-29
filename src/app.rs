@@ -1457,4 +1457,327 @@ mod tests {
         assert_eq!(b.path, dir.join("HOME.md"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A browser as `browser` makes, with the syntaxes loaded first, so
+    /// they cannot arrive part way through a test and cause a redraw.
+    fn loaded(name: &str, files: &[(&str, &str)]) -> (Browser, PathBuf) {
+        highlight::syntax_set();
+        browser(name, files)
+    }
+
+    /// One step of a scripted run: an event that arrives a while into a
+    /// poll, a poll that times out with nothing, or polls that time out
+    /// until something new is drawn, for work on other threads.
+    enum Step {
+        After(Duration, Event),
+        Wait,
+        Drawn,
+    }
+
+    /// Input from a script, with a clock that moves only when it says.
+    struct Script {
+        now: Instant,
+        steps: std::collections::VecDeque<Step>,
+        /// How long each poll was asked to wait.
+        timeouts: Vec<Duration>,
+        /// What the terminal was sent.
+        out: Shared,
+        /// How much had been sent when the `Drawn` in front was reached, and
+        /// when.
+        sent: Option<(usize, Instant)>,
+    }
+
+    impl Input for Script {
+        fn now(&self) -> Instant {
+            self.now
+        }
+
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            self.timeouts.push(timeout);
+            match self.steps.front() {
+                Some(Step::After(after, _)) => {
+                    assert!(*after <= timeout, "{after:?} is past the {timeout:?} poll");
+                    self.now += *after;
+                    Ok(true)
+                }
+                Some(Step::Wait) => {
+                    self.steps.pop_front();
+                    self.now += timeout;
+                    Ok(false)
+                }
+                Some(Step::Drawn) => {
+                    let len = self.out.0.borrow().len();
+                    match self.sent {
+                        Some((sent, _)) if len > sent => {
+                            self.steps.pop_front();
+                            self.sent = None;
+                        }
+                        Some((_, since)) => {
+                            assert!(
+                                since.elapsed() < Duration::from_secs(5),
+                                "nothing new was drawn"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        None => self.sent = Some((len, Instant::now())),
+                    }
+                    self.now += timeout;
+                    Ok(false)
+                }
+                None => Err(io::Error::other("the script ran out")),
+            }
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            match self.steps.pop_front() {
+                Some(Step::After(_, event)) => Ok(event),
+                _ => panic!("read with no event polled"),
+            }
+        }
+    }
+
+    fn pressed(code: KeyCode) -> Step {
+        Step::After(
+            Duration::ZERO,
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+        )
+    }
+
+    fn quit() -> Step {
+        pressed(KeyCode::Char('q'))
+    }
+
+    /// The result of running `b` on `steps` in a 30x7 terminal, how many
+    /// frames were drawn, and how long each poll waited.
+    fn run_script(b: &mut Browser, steps: Vec<Step>) -> (io::Result<()>, usize, Vec<Duration>) {
+        let out = Shared::default();
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 30, 7)),
+        };
+        let mut terminal =
+            Terminal::with_options(CrosstermBackend::new(out.clone()), options).unwrap();
+        let mut script = Script {
+            now: Instant::now(),
+            steps: steps.into(),
+            timeouts: Vec::new(),
+            out,
+            sent: None,
+        };
+        let result = run_browser(&mut terminal, b, &mut script);
+        (result, terminal.get_frame().count(), script.timeouts)
+    }
+
+    #[test]
+    fn the_loop_draws_once_and_quits_on_a_quit_key() {
+        let (mut b, dir) = loaded("loop-quit", &[("a.md", "one\n")]);
+        let (result, frames, timeouts) = run_script(&mut b, vec![quit()]);
+        assert!(result.is_ok());
+        assert_eq!(frames, 1);
+        assert_eq!(timeouts, [CHECK_EVERY]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_redraws_after_events_but_not_while_nothing_changes() {
+        let (mut b, dir) = loaded("loop-idle", &[("a.md", "one\n")]);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        let steps = vec![
+            Step::Wait,
+            Step::Wait,
+            // Only a press quits; a release is one more event to draw after.
+            Step::After(Duration::ZERO, Event::Key(release)),
+            // A key with no action, part way into the wait for a check.
+            Step::After(
+                Duration::from_millis(100),
+                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            ),
+            Step::Wait,
+            Step::After(Duration::ZERO, Event::Resize(30, 7)),
+            quit(),
+        ];
+        let (result, frames, timeouts) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 4);
+        let ms = Duration::from_millis;
+        // The poll after the key waits only for the rest of the check's time.
+        assert_eq!(
+            timeouts,
+            [
+                CHECK_EVERY,
+                CHECK_EVERY,
+                CHECK_EVERY,
+                CHECK_EVERY,
+                ms(50),
+                CHECK_EVERY,
+                CHECK_EVERY
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_ends_with_an_error_from_the_input() {
+        let (mut b, dir) = loaded("loop-error", &[("a.md", "one\n")]);
+        let (result, frames, _) = run_script(&mut b, vec![Step::Wait]);
+        assert_eq!(result.unwrap_err().to_string(), "the script ran out");
+        assert_eq!(frames, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_scrolls_with_the_wheel() {
+        let (mut b, dir) = loaded("loop-mouse", &[("a.md", &paragraphs(10))]);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let steps = vec![Step::After(Duration::ZERO, Event::Mouse(wheel)), quit()];
+        let (result, frames, _) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert_eq!(b.view.scroll, WHEEL_LINES as usize);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_reloads_the_note_when_its_file_changes() {
+        let (mut b, dir) = loaded("loop-change", &[("a.md", "one\n")]);
+        std::fs::write(dir.join("a.md"), "something else\n").unwrap();
+        // The change shows once two checks agree on it.
+        let steps = vec![Step::Wait, Step::Wait, Step::Wait, quit()];
+        let (result, frames, _) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert_eq!(top(&b.view), "something else");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_redraws_when_an_image_arrives() {
+        use crate::images::tests::png;
+        let (mut b, dir) = loaded("loop-image", &[("a.md", "one\n")]);
+        std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
+        b.view.show(parse("![a](a.png)\n"), dir.clone());
+        let lines = b.view.layout.lines.len();
+        let (result, frames, _) = run_script(&mut b, vec![Step::Drawn, quit()]);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert!(b.view.layout.lines.len() > lines, "the image took no rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_redraws_when_the_syntaxes_arrive() {
+        let (mut b, dir) = loaded("loop-syntaxes", &[("a.md", "```rust\nfn main() {}\n```\n")]);
+        highlight::syntax_set();
+        // As if the note were laid out before the syntaxes had loaded.
+        b.view.highlighted = false;
+        let (result, frames, _) = run_script(&mut b, vec![Step::Wait, quit()]);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert!(b.view.highlighted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn syntaxes_lay_out_again_only_once_and_only_after_a_layout() {
+        highlight::syntax_set();
+        let mut v = View::new(parse("one\n"), ".".into(), Images::text());
+        // Not laid out yet: there is nothing to redo.
+        v.highlighted = false;
+        assert!(!v.receive_syntaxes());
+        v.resize(20, 5);
+        assert!(v.highlighted);
+        assert!(!v.receive_syntaxes());
+        v.highlighted = false;
+        assert!(v.receive_syntaxes());
+        assert!(v.highlighted);
+    }
+
+    /// A writer whose bytes the test can read after handing it over.
+    #[derive(Clone, Default)]
+    struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that always fails.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("no terminal"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn handing_on(name: &str, web_links: WebLinks) -> (Browser, PathBuf) {
+        let (mut b, dir) = browser(name, &[("a.md", "one\n")]);
+        b.config.web_links = web_links;
+        b.opener = |target| panic!("opened {target}");
+        b.clipboard = Box::new(Broken);
+        (b, dir)
+    }
+
+    #[test]
+    fn handing_on_opens_with_the_opener() {
+        let (mut b, dir) = handing_on("hand-open", WebLinks::Open);
+        b.opener = |target| {
+            assert_eq!(target, "https://example.com/");
+            Ok(())
+        };
+        b.hand_on("https://example.com/");
+        assert_eq!(b.view.notice, None);
+        b.opener = |target| Err(io::Error::other(format!("nothing opens {target}")));
+        b.hand_on("https://example.com/");
+        assert_eq!(
+            b.view.notice.as_deref(),
+            Some("cannot open https://example.com/: nothing opens https://example.com/")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handing_on_copies_through_the_terminal() {
+        let (mut b, dir) = handing_on("hand-copy", WebLinks::Copy);
+        let out = Shared::default();
+        b.clipboard = Box::new(out.clone());
+        b.hand_on("https://example.com/");
+        assert_eq!(
+            String::from_utf8(out.0.borrow().clone()).unwrap(),
+            "\x1b]52;c;aHR0cHM6Ly9leGFtcGxlLmNvbS8=\x1b\\"
+        );
+        assert_eq!(
+            b.view.notice.as_deref(),
+            Some("copied https://example.com/")
+        );
+        b.clipboard = Box::new(Broken);
+        b.hand_on("https://example.com/");
+        assert_eq!(b.view.notice.as_deref(), Some("cannot copy: no terminal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handing_on_can_do_nothing() {
+        let (mut b, dir) = handing_on("hand-ignore", WebLinks::Ignore);
+        b.hand_on("https://example.com/");
+        assert_eq!(b.view.notice, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

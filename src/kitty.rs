@@ -172,7 +172,7 @@ fn query() -> Option<Vec<u8>> {
     if !was_raw {
         terminal::enable_raw_mode().ok()?;
     }
-    let reply = exchange(&mut io::stdout(), libc::STDIN_FILENO);
+    let reply = exchange(&mut io::stdout(), libc::STDIN_FILENO, REPLY_TIMEOUT);
     if !was_raw {
         let _ = terminal::disable_raw_mode();
     }
@@ -180,16 +180,16 @@ fn query() -> Option<Vec<u8>> {
 }
 
 /// Send the queries to `out` and read the replies from `fd` until the DA1
-/// reply or the timeout.
+/// reply or until `timeout` has passed since they were sent.
 #[cfg(unix)]
-fn exchange(out: &mut impl Write, fd: libc::c_int) -> Vec<u8> {
+fn exchange(out: &mut impl Write, fd: libc::c_int, timeout: Duration) -> Vec<u8> {
     // On the alternate screen, so a terminal that prints the graphics query
     // as text (Terminal.app does) leaves nothing behind once it is left.
     let sent = write!(out, "\x1b[?1049h{}", queries())
         .and_then(|()| out.flush())
         .is_ok();
     let reply = if sent {
-        read_replies(Instant::now() + REPLY_TIMEOUT, |left| read_chunk(fd, left))
+        read_replies(Instant::now() + timeout, |left| read_chunk(fd, left))
     } else {
         Vec::new()
     };
@@ -565,9 +565,10 @@ mod tests {
         // Left open, so only the DA1 reply can end the wait in time.
         let pipe = Pipe::new(reply, false);
         let mut out = Vec::new();
+        let timeout = Duration::from_secs(10);
         let start = Instant::now();
-        assert_eq!(exchange(&mut out, pipe.read), reply);
-        assert!(start.elapsed() < REPLY_TIMEOUT);
+        assert_eq!(exchange(&mut out, pipe.read, timeout), reply);
+        assert!(start.elapsed() < timeout);
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!("\x1b[?1049h{}\x1b[?1049l", queries())
@@ -577,11 +578,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exchange_gives_up_on_a_silent_terminal() {
+        // Waits in whole milliseconds, so it can give up a fraction of one
+        // before the timeout: only the outcome is checked, not the time.
         let pipe = Pipe::new(b"", false);
         let mut out = Vec::new();
-        let start = Instant::now();
-        assert!(exchange(&mut out, pipe.read).is_empty());
-        assert!(start.elapsed() >= REPLY_TIMEOUT);
+        assert!(exchange(&mut out, pipe.read, Duration::from_millis(20)).is_empty());
         assert!(out.ends_with(b"\x1b[?1049l"));
     }
 
@@ -605,7 +606,7 @@ mod tests {
     fn exchange_reads_nothing_when_the_queries_cannot_be_sent() {
         // The replies would be there, but no query went out to ask for them.
         let pipe = Pipe::new(b"\x1b[?62c", true);
-        assert!(exchange(&mut Broken, pipe.read).is_empty());
+        assert!(exchange(&mut Broken, pipe.read, REPLY_TIMEOUT).is_empty());
         assert_eq!(
             read_chunk(pipe.read, REPLY_TIMEOUT).as_deref(),
             Some(&b"\x1b[?62c"[..])

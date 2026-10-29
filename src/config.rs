@@ -109,6 +109,63 @@ pub enum WebLinks {
     Ignore,
 }
 
+/// The named keys, as the config spells them in lower case.
+const NAMED_KEYS: &[(&str, KeyCode)] = &[
+    ("enter", KeyCode::Enter),
+    ("return", KeyCode::Enter),
+    ("tab", KeyCode::Tab),
+    ("shift-tab", KeyCode::BackTab),
+    ("backtab", KeyCode::BackTab),
+    ("backspace", KeyCode::Backspace),
+    ("esc", KeyCode::Esc),
+    ("escape", KeyCode::Esc),
+    ("space", KeyCode::Char(' ')),
+    ("up", KeyCode::Up),
+    ("down", KeyCode::Down),
+    ("left", KeyCode::Left),
+    ("right", KeyCode::Right),
+    ("home", KeyCode::Home),
+    ("end", KeyCode::End),
+    ("pageup", KeyCode::PageUp),
+    ("pagedown", KeyCode::PageDown),
+    ("delete", KeyCode::Delete),
+    ("insert", KeyCode::Insert),
+];
+
+/// Whether a key name starts with `ctrl-` and `alt-`, in any order, and the
+/// rest of it.
+fn modifiers(name: &str) -> (bool, bool, &str) {
+    let (mut ctrl, mut alt, mut rest) = (false, false, name);
+    loop {
+        if let Some(r) = rest.strip_prefix("ctrl-") {
+            ctrl = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("alt-") {
+            alt = true;
+            rest = r;
+        } else {
+            return (ctrl, alt, rest);
+        }
+    }
+}
+
+/// The key code a name without modifiers stands for: a character, a named
+/// key in any case, or `f1` to `f24`.
+fn key_code(name: &str) -> Option<KeyCode> {
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return Some(KeyCode::Char(c));
+    }
+    let lower = name.to_ascii_lowercase();
+    if let Some(&(_, code)) = NAMED_KEYS.iter().find(|(n, _)| *n == lower) {
+        return Some(code);
+    }
+    match lower.strip_prefix('f')?.parse::<u8>().ok()? {
+        n @ 1..=24 => Some(KeyCode::F(n)),
+        _ => None,
+    }
+}
+
 /// A key as the config names it: a key code and the modifiers that matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
@@ -122,45 +179,8 @@ impl Key {
     /// `tab`, `space`, `pagedown`, `f1`…), either after `ctrl-` or `alt-`,
     /// and `shift-tab`.
     fn parse(name: &str) -> Result<Key, String> {
-        let mut rest = name;
-        let (mut ctrl, mut alt) = (false, false);
-        loop {
-            if let Some(r) = rest.strip_prefix("ctrl-") {
-                ctrl = true;
-                rest = r;
-            } else if let Some(r) = rest.strip_prefix("alt-") {
-                alt = true;
-                rest = r;
-            } else {
-                break;
-            }
-        }
-        let mut chars = rest.chars();
-        let code = match (chars.next(), chars.next()) {
-            (Some(c), None) => KeyCode::Char(c),
-            _ => match rest.to_ascii_lowercase().as_str() {
-                "enter" | "return" => KeyCode::Enter,
-                "tab" => KeyCode::Tab,
-                "shift-tab" | "backtab" => KeyCode::BackTab,
-                "backspace" => KeyCode::Backspace,
-                "esc" | "escape" => KeyCode::Esc,
-                "space" => KeyCode::Char(' '),
-                "up" => KeyCode::Up,
-                "down" => KeyCode::Down,
-                "left" => KeyCode::Left,
-                "right" => KeyCode::Right,
-                "home" => KeyCode::Home,
-                "end" => KeyCode::End,
-                "pageup" => KeyCode::PageUp,
-                "pagedown" => KeyCode::PageDown,
-                "delete" => KeyCode::Delete,
-                "insert" => KeyCode::Insert,
-                f => match f.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
-                    Some(n @ 1..=24) => KeyCode::F(n),
-                    _ => return Err(format!("unknown key \"{name}\"")),
-                },
-            },
-        };
+        let (ctrl, alt, rest) = modifiers(name);
+        let code = key_code(rest).ok_or_else(|| format!("unknown key \"{name}\""))?;
         // Control letters arrive in lower case.
         let code = match code {
             KeyCode::Char(c) if ctrl => KeyCode::Char(c.to_ascii_lowercase()),

@@ -1,0 +1,116 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  # renovate: datasource=github-releases depName=rust-lang/rust
+  RUST_TOOLCHAIN: 1.99.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Protected environment restricted to v* tags. The signing keys and the
+    # tap token live there, so runs on other refs never see them.
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # This job holds signing keys and the tap token, so it may only reach
+      # the hosts below. If a step fails on a blocked connection, the
+      # harden-runner report linked from the run names the host.
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            appstoreconnect.apple.com:443
+            codeload.github.com:443
+            fulcio.githubapp.com:443
+            fulcio.sigstore.dev:443
+            github.com:443
+            goreleaser.com:443
+            index.crates.io:443
+            notary-submissions-prod.s3.us-west-2.amazonaws.com:443
+            objects.githubusercontent.com:443
+            pkg.hexops.org:443
+            pkg.machengine.org:443
+            raw.githubusercontent.com:443
+            rekor.sigstore.dev:443
+            release-assets.githubusercontent.com:443
+            static.crates.io:443
+            static.rust-lang.org:443
+            timestamp.apple.com:80
+            timestamp.githubapp.com:443
+            tuf-repo-cdn.sigstore.dev:443
+            uploads.github.com:443
+            *.actions.githubusercontent.com:443
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # No build cache here: a poisoned cache entry written from another ref
+      # would flow straight into the published binaries.
+      - run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --target aarch64-apple-darwin,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+          rustup default "$RUST_TOOLCHAIN"
+
+      # cargo-zigbuild links every target with zig. The pinned mirror avoids
+      # the random mirror pick, which block mode could not allow for; the
+      # download is checked against zig's minisign key.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          mirror: https://pkg.machengine.org/zig
+          use-cache: false
+
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-zigbuild@0.24.0
+
+      # goreleaser only signs when MACOS_SIGN_P12 is set, so a missing secret
+      # would quietly publish an unsigned binary. Fail instead.
+      - name: Check the signing secrets are present
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$MACOS_SIGN_P12" ] || [ -z "$MACOS_NOTARY_KEY" ] || [ -z "$HOMEBREW_TAP_GITHUB_TOKEN" ]; then
+            echo "::error::release secrets missing from the release environment; see RELEASING.md"
+            exit 1
+          fi
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          # Notarization waits on Apple's queue, which can pass the 30m default.
+          args: release --clean --timeout 60m
+        # Secrets go to this step only, so other steps and what they download
+        # cannot read them.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt

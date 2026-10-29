@@ -1,0 +1,82 @@
+version: 2
+
+project_name: smd
+
+builds:
+  - id: smd
+    builder: rust
+    binary: smd
+    # cargo-zigbuild cross-compiles every target from the one Linux runner.
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+
+archives:
+  - id: smd
+    name_template: "smd_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - README.md
+      - LICENSE-*
+
+# Sign and notarize the darwin binary in place before archiving, so the
+# tarball, checksums and provenance attestation all cover the signed Mach-O.
+# quill does this from the Linux runner. Skipped when MACOS_SIGN_P12 is unset
+# so local snapshot builds work; the release workflow refuses to run without
+# the secrets.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids:
+        - smd
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        # Wait for Apple, so a rejected submission fails the release before
+        # anything is published. 20m is the most goreleaser allows.
+        wait: true
+        timeout: 20m
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github-native
+
+release:
+  draft: false
+  prerelease: auto
+  mode: replace
+
+homebrew_casks:
+  - name: smd
+    binaries:
+      - smd
+    repository:
+      owner: ryanlewis
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: https://github.com/ryanlewis/smd
+    description: Markdown reader for the terminal that draws diagrams, maths and headings as images.
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "chore(brew): {{ .ProjectName }} {{ .Tag }}"
+    # No de-quarantine hook: the binary is signed and notarized.
+    caveats: |
+      Diagrams need mermaid-cli (`mmdc`) on your PATH:
+        npm install -g @mermaid-js/mermaid-cli
+      Images, diagrams and maths need a terminal with kitty graphics, such as Ghostty.

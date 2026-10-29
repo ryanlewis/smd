@@ -382,6 +382,83 @@ mod tests {
         }
     }
 
+    fn key(code: KeyCode, ctrl: bool, alt: bool) -> Result<Key, String> {
+        Ok(Key { code, ctrl, alt })
+    }
+
+    #[test]
+    fn every_key_name_is_read() {
+        for (name, code) in [
+            ("enter", KeyCode::Enter),
+            ("return", KeyCode::Enter),
+            ("tab", KeyCode::Tab),
+            ("shift-tab", KeyCode::BackTab),
+            ("backtab", KeyCode::BackTab),
+            ("backspace", KeyCode::Backspace),
+            ("esc", KeyCode::Esc),
+            ("escape", KeyCode::Esc),
+            ("space", KeyCode::Char(' ')),
+            ("up", KeyCode::Up),
+            ("down", KeyCode::Down),
+            ("left", KeyCode::Left),
+            ("right", KeyCode::Right),
+            ("home", KeyCode::Home),
+            ("end", KeyCode::End),
+            ("pageup", KeyCode::PageUp),
+            ("pagedown", KeyCode::PageDown),
+            ("delete", KeyCode::Delete),
+            ("insert", KeyCode::Insert),
+            ("f1", KeyCode::F(1)),
+            ("f24", KeyCode::F(24)),
+            ("PageDown", KeyCode::PageDown),
+            ("F5", KeyCode::F(5)),
+            ("f", KeyCode::Char('f')),
+            ("j", KeyCode::Char('j')),
+            ("G", KeyCode::Char('G')),
+            ("?", KeyCode::Char('?')),
+            ("-", KeyCode::Char('-')),
+            ("é", KeyCode::Char('é')),
+        ] {
+            assert_eq!(Key::parse(name), key(code, false, false), "{name}");
+        }
+    }
+
+    #[test]
+    fn modifiers_come_before_the_key_in_any_order() {
+        assert_eq!(Key::parse("ctrl-o"), key(KeyCode::Char('o'), true, false));
+        // Control letters are kept in lower case, others as written.
+        assert_eq!(Key::parse("ctrl-O"), key(KeyCode::Char('o'), true, false));
+        assert_eq!(Key::parse("alt-O"), key(KeyCode::Char('O'), false, true));
+        assert_eq!(Key::parse("alt-left"), key(KeyCode::Left, false, true));
+        assert_eq!(
+            Key::parse("ctrl-alt-x"),
+            key(KeyCode::Char('x'), true, true)
+        );
+        assert_eq!(
+            Key::parse("alt-ctrl-X"),
+            key(KeyCode::Char('x'), true, true)
+        );
+        assert_eq!(Key::parse("ctrl-ctrl-f2"), key(KeyCode::F(2), true, false));
+        assert_eq!(
+            Key::parse("ctrl-shift-tab"),
+            key(KeyCode::BackTab, true, false)
+        );
+        assert_eq!(Key::parse("ctrl--"), key(KeyCode::Char('-'), true, false));
+    }
+
+    #[test]
+    fn an_unknown_key_is_named_in_the_error() {
+        for name in [
+            "", "ctrl-", "hyper-x", "f0", "f25", "fx", "f-1", "Ctrl-x", "shift-x",
+        ] {
+            assert_eq!(
+                Key::parse(name),
+                Err(format!("unknown key \"{name}\"")),
+                "{name}"
+            );
+        }
+    }
+
     fn os(s: &str) -> Option<OsString> {
         Some(OsString::from(s))
     }

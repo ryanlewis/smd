@@ -66,7 +66,7 @@ trim=()
 # until the GIF fits: split panes need the width to stay readable.
 max=$(( max_mb * 1000000 ))
 tmp=$(mktemp -t smd-demo).gif
-for width fps colours in 1000 12 256  1000 10 256  1000 8 256  900 8 256  900 8 128  800 8 128  700 8 128  640 8 128; do
+for width fps colours in 1000 12 256  1000 10 256  1000 8 256  1000 8 128  900 8 128  800 8 128  700 8 128  640 8 128; do
   (( width > cw )) && width=$cw
   dither=bayer:bayer_scale=5
   (( colours < 256 )) && dither=none

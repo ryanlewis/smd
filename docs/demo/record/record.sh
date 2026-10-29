@@ -1,6 +1,8 @@
 #!/bin/zsh -f
 # Records the README media from a real Ghostty window on macOS.
-# Usage: docs/demo/record/record.sh [video|stills|all]   (default: all)
+# Usage: docs/demo/record/record.sh [stills|video|all]   (default: stills)
+# video and all overwrite docs/images/demo.gif, which is now recorded by hand
+# (open.sh and to-gif.sh).
 # See docs/demo/README.md.
 set -e
 setopt pipefail
@@ -147,7 +149,7 @@ stills() {
   close_window
 }
 
-case ${1:-all} in
+case ${1:-stills} in
   video) video ;;
   stills) stills ;;
   all) stills; video ;;

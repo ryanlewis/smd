@@ -50,7 +50,8 @@ const SIZES: [(u32, f32); 6] = [
 type Run = (String, bool);
 
 /// The heading's text as runs. Line breaks become spaces, and runs of spaces
-/// outside code become one, except no-break spaces, which are kept as written.
+/// outside code become one, except no-break spaces, which are kept as written
+/// but for any at the ends, which draw nothing in an image.
 fn runs(content: &[Inline]) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     for inline in content {
@@ -76,10 +77,10 @@ fn runs(content: &[Inline]) -> Vec<Run> {
         }
     }
     if let Some((s, _)) = out.first_mut() {
-        *s = s.trim_start_matches(breaks_at).to_string();
+        *s = s.trim_start().to_string();
     }
     if let Some((s, _)) = out.last_mut() {
-        *s = s.trim_end_matches(breaks_at).to_string();
+        *s = s.trim_end().to_string();
     }
     out.retain(|(s, _)| !s.is_empty());
     out
@@ -136,7 +137,8 @@ fn pieces<'a>(
     emoji: Option<&'a Emoji>,
     (text, code): (Rgba, Rgba),
 ) -> Option<Vec<Piece<'a>>> {
-    let has = |font: &FontVec, c: char| c.is_whitespace() || font.glyph_id(c).0 != 0;
+    // A no-break space is drawn from the font, so it needs a glyph there.
+    let has = |font: &FontVec, c: char| breaks_at(c) || font.glyph_id(c).0 != 0;
     let mut out: Vec<Piece> = Vec::new();
     for (s, is_code) in runs {
         let colour = if *is_code { code } else { text };
@@ -390,8 +392,11 @@ mod tests {
         let (_, content) = heading("# 10&nbsp;km a&nbsp;&nbsp;b&nbsp;\n");
         assert_eq!(
             runs(&content),
-            vec![("10\u{a0}km a\u{a0}\u{a0}b\u{a0}".to_string(), false)]
+            vec![("10\u{a0}km a\u{a0}\u{a0}b".to_string(), false)]
         );
+        // Only at the ends are they trimmed, so a heading of them is empty.
+        let (_, content) = heading("# &nbsp;&nbsp;\n");
+        assert_eq!(runs(&content), vec![]);
     }
 
     #[test]

@@ -45,10 +45,10 @@ docs/demo/record/record.sh          # the stills, by features.sh; record.sh vide
 
 The script:
 
-1. Opens smd on `Weather station.md` in a new Ghostty window with a clean config (`record/ghostty.conf`): 100x32 cells, no user Ghostty or smd settings, and smd as the only process, so no prompt or path shows.
+1. For the video, opens smd on `Weather station.md` in a new Ghostty window with a clean config (`record/ghostty.conf`): 100x32 cells, no user Ghostty or smd settings, and smd as the only process, so no prompt or path shows.
 2. For the stills, runs `features.sh`, which takes them with `screencapture -l <window id>`.
 3. Records the window's area with `screencapture -V 30 -R ...` while it scrolls through the note, presses Tab and Enter to follow the last link, and clicks the toolbar's Back button.
-4. Trims the start to 2 seconds before the first scroll, crops off the title bar, and writes `docs/images/demo.gif` (1000 px wide, 12 fps) with ffmpeg. The PNGs are cropped the same way, in 256 colours.
+4. Trims the start to 2 seconds before the first scroll, crops off the title bar, and writes `docs/images/demo.gif` (1000 px wide, 12 fps) with ffmpeg.
 
 It drives keys with `osascript` and clicks with a small Swift helper, so the terminal you run it from needs Accessibility and Screen Recording permission (System Settings > Privacy & Security). Leave the mouse and keyboard alone while it runs, about a minute. The Ghostty window moves to the front and closes when it is done.
 

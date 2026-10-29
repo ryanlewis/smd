@@ -65,7 +65,8 @@ open_window() {
     -e "s|^window-height = .*|window-height = $3|" $here/ghostty.conf > $conf
   open -na /Applications/Ghostty.app --args --config-default-files=false --config-file=$conf
   sleep 3
-  pid=$(pgrep -f "config-file=$conf" | head -1)
+  pid=$(pgrep -f "config-file=$conf" | head -1 || true)
+  [[ -n $pid ]] || { echo "Ghostty did not start" >&2; exit 1; }
   read id rest <<< "$($work/winid $pid | head -1)"
   [[ -n $id ]] || { echo "no Ghostty window found" >&2; exit 1; }
   # Mermaid and maths take a moment to draw.
@@ -81,7 +82,7 @@ close_window() {
     kill -0 $pid 2>/dev/null || return 0
     sleep 0.2
   done
-  kill $pid
+  kill $pid 2>/dev/null || true
   for i in {1..50}; do
     kill -0 $pid 2>/dev/null || return 0
     sleep 0.2
@@ -121,8 +122,11 @@ links() {
 }
 
 all=(diagram maths headings code diff table table-cards links)
+# Check every name before any shot overwrites its picture.
 for f in ${@:-$all}; do
   (( ${all[(Ie)$f]} )) || { echo "unknown feature: $f (one of: $all)" >&2; exit 2; }
+done
+for f in ${@:-$all}; do
   $f
 done
 ls -l $images/*.png

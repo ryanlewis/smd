@@ -46,91 +46,11 @@ impl Table {
             | Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_MATH
             | Options::ENABLE_WIKILINKS;
-        let mut aligns = Vec::new();
-        let mut rows: Vec<Vec<Cell>> = Vec::new();
-        let mut style = InlineStyle::default();
-        // How deep in emphasis, strong and strikethrough spans, which nest.
-        let mut depth = [0u32; 3];
+        let mut builder = Builder::default();
         for event in Parser::new_ext(source, options) {
-            let (text, style) = match event {
-                Event::Start(Tag::Table(a)) => {
-                    aligns = a;
-                    continue;
-                }
-                Event::Start(Tag::TableHead | Tag::TableRow) => {
-                    rows.push(Vec::new());
-                    continue;
-                }
-                Event::Start(Tag::TableCell) => {
-                    if let Some(row) = rows.last_mut() {
-                        row.push(Vec::new());
-                    }
-                    continue;
-                }
-                Event::Start(Tag::Emphasis) | Event::End(TagEnd::Emphasis) => {
-                    style.emphasis = nest(&mut depth[0], &event);
-                    continue;
-                }
-                Event::Start(Tag::Strong) | Event::End(TagEnd::Strong) => {
-                    style.strong = nest(&mut depth[1], &event);
-                    continue;
-                }
-                Event::Start(Tag::Strikethrough) | Event::End(TagEnd::Strikethrough) => {
-                    style.strikethrough = nest(&mut depth[2], &event);
-                    continue;
-                }
-                Event::Start(Tag::Link {
-                    link_type,
-                    dest_url,
-                    ..
-                }) => {
-                    style.link = Some(Link {
-                        dest: dest_url.to_string(),
-                        wiki: matches!(link_type, LinkType::WikiLink { .. }),
-                    });
-                    continue;
-                }
-                Event::End(TagEnd::Link) => {
-                    style.link = None;
-                    continue;
-                }
-                Event::Text(t) | Event::InlineHtml(t) | Event::Html(t) => {
-                    (t.to_string(), style.clone())
-                }
-                Event::Code(t) => (
-                    t.to_string(),
-                    InlineStyle {
-                        code: true,
-                        ..style.clone()
-                    },
-                ),
-                Event::InlineMath(t) | Event::DisplayMath(t) => (
-                    t.to_string(),
-                    InlineStyle {
-                        math: true,
-                        ..style.clone()
-                    },
-                ),
-                Event::SoftBreak | Event::HardBreak => (" ".to_string(), style.clone()),
-                _ => continue,
-            };
-            let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) else {
-                continue;
-            };
-            match cell.last_mut() {
-                Some((s, last)) if *last == style => s.push_str(&text),
-                _ => cell.push((text, style)),
-            }
+            builder.event(event);
         }
-        let columns = aligns
-            .len()
-            .max(rows.iter().map(Vec::len).max().unwrap_or(0))
-            .max(1);
-        aligns.resize(columns, Alignment::None);
-        for row in &mut rows {
-            row.resize_with(columns, Vec::new);
-        }
-        Table { aligns, rows }
+        builder.finish()
     }
 
     /// The table drawn in `avail` columns: as it is when it fits, with its
@@ -482,9 +402,125 @@ fn chars_width(chars: &[(char, usize)]) -> usize {
     chars.iter().map(|(c, _)| c.width().unwrap_or(0)).sum()
 }
 
+/// A table read from parser events, one at a time.
+#[derive(Default)]
+struct Builder {
+    aligns: Vec<Alignment>,
+    rows: Vec<Vec<Cell>>,
+    /// The style of the text read next.
+    style: InlineStyle,
+    /// How deep in emphasis, strong and strikethrough spans, which nest.
+    depth: [u32; 3],
+}
+
+impl Builder {
+    fn event(&mut self, event: Event) {
+        match event {
+            Event::Start(tag) => self.start(tag),
+            Event::End(tag) => self.end(tag),
+            event => {
+                if let Some(run) = self.run(event) {
+                    self.push(run);
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, tag: Tag) {
+        match tag {
+            Tag::Table(aligns) => self.aligns = aligns,
+            Tag::TableHead | Tag::TableRow => self.rows.push(Vec::new()),
+            Tag::TableCell => {
+                if let Some(row) = self.rows.last_mut() {
+                    row.push(Vec::new());
+                }
+            }
+            Tag::Emphasis => self.style.emphasis = nest(&mut self.depth[0], true),
+            Tag::Strong => self.style.strong = nest(&mut self.depth[1], true),
+            Tag::Strikethrough => self.style.strikethrough = nest(&mut self.depth[2], true),
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                self.style.link = Some(Link {
+                    dest: dest_url.to_string(),
+                    wiki: matches!(link_type, LinkType::WikiLink { .. }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Emphasis => self.style.emphasis = nest(&mut self.depth[0], false),
+            TagEnd::Strong => self.style.strong = nest(&mut self.depth[1], false),
+            TagEnd::Strikethrough => self.style.strikethrough = nest(&mut self.depth[2], false),
+            TagEnd::Link => self.style.link = None,
+            _ => {}
+        }
+    }
+
+    /// The text an event adds to a cell, and its style.
+    fn run(&self, event: Event) -> Option<(String, InlineStyle)> {
+        let run = match event {
+            Event::Text(t) | Event::InlineHtml(t) | Event::Html(t) => {
+                (t.to_string(), self.style.clone())
+            }
+            Event::Code(t) => (
+                t.to_string(),
+                InlineStyle {
+                    code: true,
+                    ..self.style.clone()
+                },
+            ),
+            Event::InlineMath(t) | Event::DisplayMath(t) => (
+                t.to_string(),
+                InlineStyle {
+                    math: true,
+                    ..self.style.clone()
+                },
+            ),
+            Event::SoftBreak | Event::HardBreak => (" ".to_string(), self.style.clone()),
+            _ => return None,
+        };
+        Some(run)
+    }
+
+    /// Add a run to the last cell, joined to its last run when their styles
+    /// match. Text outside a cell is dropped.
+    fn push(&mut self, (text, style): (String, InlineStyle)) {
+        let Some(cell) = self.rows.last_mut().and_then(|row| row.last_mut()) else {
+            return;
+        };
+        match cell.last_mut() {
+            Some((s, last)) if *last == style => s.push_str(&text),
+            _ => cell.push((text, style)),
+        }
+    }
+
+    /// The table, with an alignment and a cell in every row for each column.
+    fn finish(mut self) -> Table {
+        let columns = self
+            .aligns
+            .len()
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0))
+            .max(1);
+        self.aligns.resize(columns, Alignment::None);
+        for row in &mut self.rows {
+            row.resize_with(columns, Vec::new);
+        }
+        Table {
+            aligns: self.aligns,
+            rows: self.rows,
+        }
+    }
+}
+
 /// Go in or out of a span that nests. Returns whether still inside one.
-fn nest(depth: &mut u32, event: &Event) -> bool {
-    if matches!(event, Event::Start(_)) {
+fn nest(depth: &mut u32, start: bool) -> bool {
+    if start {
         *depth += 1;
     } else {
         *depth = depth.saturating_sub(1);

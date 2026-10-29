@@ -23,7 +23,7 @@ A terminal markdown reader that draws mermaid diagrams, maths and headings as im
 
 ## Terminal support
 
-Images, diagrams, maths and headings need a terminal that supports the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) with Unicode placeholders. smd has been tested in [Ghostty](https://ghostty.org) and Rex. Other terminals with Unicode-placeholder support should work but have not been tested.
+Images, diagrams, maths and headings need a terminal that supports the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) with Unicode placeholders. [Ghostty](https://ghostty.org) is the recommended terminal and the one smd is tested in. Other terminals with Unicode-placeholder support should work but have not been tested.
 
 smd asks the terminal what it supports at start-up. In a terminal without kitty graphics, or with `--no-graphics`, images, diagrams and maths are shown as their markdown source, and headings as styled text. Everything else works the same.
 

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::{Cell, CellDiffOption};
 use ratatui::crossterm::event::{
-    self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -510,6 +510,9 @@ pub struct Browser {
     ahead: Vec<Visited>,
     /// The notice on screen is about the last key, and goes at the next.
     passing: bool,
+    /// When the last key of a terminal reply arriving as keys came, while
+    /// inside one.
+    replying: Option<Instant>,
     /// Where a copied link's OSC 52 sequence is written: the terminal.
     clipboard: Box<dyn Write>,
     /// What opens a link that is handed on.
@@ -527,6 +530,7 @@ impl Browser {
             history: Vec::new(),
             ahead: Vec::new(),
             passing: false,
+            replying: None,
             clipboard: Box::new(io::stdout()),
             opener: open_with_system,
         }
@@ -571,6 +575,9 @@ impl Browser {
 
     /// Handle a key press. Returns true when the reader should quit.
     fn key(&mut self, key: event::KeyEvent) -> bool {
+        if self.reply(key) {
+            return false;
+        }
         if std::mem::take(&mut self.passing) {
             self.view.set_notice(None);
         }
@@ -585,6 +592,39 @@ impl Browser {
             None => {}
         }
         false
+    }
+
+    /// Whether `key` is part of a terminal reply. A reply to a start-up
+    /// query that comes after smd stopped waiting for it reaches crossterm
+    /// as keys: an OSC or APC reply starts with Alt+] or Alt+_, has one key
+    /// per character and ends with Alt+\ (ST) or Ctrl+G (BEL). A key that
+    /// cannot be in a reply, such as Esc or an arrow, ends it and is handled
+    /// as usual. A reply comes all at once, so so does a pause between keys:
+    /// the key after one is the reader's.
+    fn reply(&mut self, key: event::KeyEvent) -> bool {
+        let now = Instant::now();
+        let alt = key.modifiers == KeyModifiers::ALT;
+        let inside = self
+            .replying
+            .take()
+            .is_some_and(|last| now - last < REPLY_GAP);
+        if !inside {
+            let starts = alt && matches!(key.code, KeyCode::Char(']' | '_'));
+            if starts && self.config.action(key).is_none() {
+                self.replying = Some(now);
+                return true;
+            }
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('\\') if alt => {}
+            KeyCode::Char('g') if key.modifiers == KeyModifiers::CONTROL => {}
+            KeyCode::Char(_) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+                self.replying = Some(now);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn follow(&mut self, link: &Link) {
@@ -801,6 +841,9 @@ const FORWARD_BUTTON: &str = " Forward → ";
 
 /// How many notes each way along Back and Forward keep their images.
 const KEEP_IMAGES_OF: usize = 8;
+
+/// The longest pause between two keys of a terminal reply.
+const REPLY_GAP: Duration = Duration::from_millis(50);
 
 /// How far one step of the mouse wheel scrolls.
 const WHEEL_LINES: isize = 3;
@@ -1892,6 +1935,57 @@ mod tests {
         assert_eq!(wait(&mut b), (40, 40));
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(wait(&mut b), (20, 100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The keys crossterm makes of `reply`, a terminal's reply to a query
+    /// sent at start-up, as seen through a pty: ESC and the next character
+    /// become one key with Alt, and every other character a key of its own.
+    fn reply_keys(reply: &str) -> Vec<KeyEvent> {
+        let mut keys = Vec::new();
+        let mut chars = reply.chars();
+        while let Some(c) = chars.next() {
+            keys.push(match c {
+                '\x1b' => KeyEvent::new(KeyCode::Char(chars.next().unwrap()), KeyModifiers::ALT),
+                '\x07' => KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                c if c.is_ascii_uppercase() => KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT),
+                c => KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            });
+        }
+        keys
+    }
+
+    #[test]
+    fn late_terminal_replies_are_not_taken_as_keys() {
+        let (mut b, dir) = browser("replies", &[("a.md", &paragraphs(20))]);
+        b.view.scroll_by(5);
+        let replies = [
+            // The background colour, ended by ST and by BEL.
+            "\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\",
+            "\x1b]11;rgb:ffff/ffff/ffff\x07",
+            // Whether the terminal has kitty graphics.
+            "\x1b_Gi=31;OK\x1b\\",
+        ];
+        for key in replies.iter().flat_map(|r| reply_keys(r)) {
+            assert!(!b.key(key), "{key:?} quit");
+        }
+        // Not moved by the g, G, f or b in them.
+        assert_eq!(b.view.scroll, 5);
+        // Keys after a reply still work, Esc on its own among them.
+        enter(&mut b, KeyCode::Char('j'));
+        assert_eq!(b.view.scroll, 6);
+        assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keys_after_the_readers_own_alt_bracket_still_work() {
+        let (mut b, dir) = browser("alt-bracket", &[("a.md", &paragraphs(20))]);
+        b.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
+        // Later than any part of a reply would come.
+        std::thread::sleep(REPLY_GAP);
+        enter(&mut b, KeyCode::Char('j'));
+        assert_eq!(b.view.scroll, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

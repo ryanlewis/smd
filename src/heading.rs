@@ -123,8 +123,11 @@ fn needs_shaping(c: char) -> bool {
 }
 
 /// The runs split by face: text in `sans`, code in `mono` where it has the
-/// glyph and in `sans` where only that does, and emoji in `emoji`. Variation
-/// selectors are dropped. `None` when a character is in none of them.
+/// glyph and in `sans` where only that does, and emoji in `emoji`. A
+/// character with U+FE0F after it asks to be an emoji, so it is drawn in
+/// `emoji` when that has it, even if the text font has it too, as many have
+/// ❤. Variation selectors are dropped. `None` when a character is in none of
+/// them.
 fn pieces<'a>(
     runs: &[Run],
     sans: &'a FontVec,
@@ -136,14 +139,18 @@ fn pieces<'a>(
     let mut out: Vec<Piece> = Vec::new();
     for (s, is_code) in runs {
         let colour = if *is_code { code } else { text };
-        for c in s.chars() {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
             if matches!(c, '\u{FE0E}' | '\u{FE0F}') {
                 continue;
             }
             if needs_shaping(c) {
                 return None;
             }
-            let face = if *is_code && has(mono, c) {
+            let as_emoji = chars.peek() == Some(&'\u{FE0F}');
+            let face = if let Some(e) = emoji.filter(|e| as_emoji && e.has(c)) {
+                Face::Emoji(e)
+            } else if *is_code && has(mono, c) {
                 Face::Outline(mono)
             } else if has(sans, c) {
                 Face::Outline(sans)

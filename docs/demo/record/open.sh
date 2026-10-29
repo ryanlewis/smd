@@ -34,6 +34,8 @@ if pgrep -f "config-file=$conf" >/dev/null; then
   echo "a demo window is already open; quit it with q first" >&2
   exit 1
 fi
+# A window.txt from an earlier run must not stand in for this one.
+rm -f $dir/window.txt
 open -na /Applications/Ghostty.app --args --config-default-files=false --config-file=$conf
 for i in {1..50}; do
   pid=$(pgrep -f "config-file=$conf" | head -1 || true)

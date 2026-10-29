@@ -29,7 +29,7 @@ Asciinema and vhs cannot show kitty graphics, so `record.sh` records a real Ghos
 
 ```sh
 cargo build --release
-docs/demo/record/record.sh          # or: record.sh stills, record.sh video
+docs/demo/record/record.sh          # the stills; record.sh video or all also replaces demo.gif
 ```
 
 The script:

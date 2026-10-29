@@ -488,6 +488,9 @@ pub fn folder(path: &Path) -> PathBuf {
     }
 }
 
+/// Back's or Forward's list of places, from a browser.
+type Stack = fn(&mut Browser) -> &mut Vec<Visited>;
+
 /// A note left by following a link, to come back to.
 struct Visited {
     path: PathBuf,
@@ -510,6 +513,9 @@ pub struct Browser {
     ahead: Vec<Visited>,
     /// The notice on screen is about the last key, and goes at the next.
     passing: bool,
+    /// The note Back or Forward could not read last, unless a note has been
+    /// opened since.
+    missed: Option<PathBuf>,
     /// Where a copied link's OSC 52 sequence is written: the terminal.
     clipboard: Box<dyn Write>,
     /// What opens a link that is handed on.
@@ -527,6 +533,7 @@ impl Browser {
             history: Vec::new(),
             ahead: Vec::new(),
             passing: false,
+            missed: None,
             clipboard: Box::new(io::stdout()),
             opener: open_with_system,
         }
@@ -623,20 +630,32 @@ impl Browser {
 
     /// Go back to the note the last link was followed from, where it was.
     fn back(&mut self) {
-        if let Some(visited) = self.history.pop() {
-            let here = self.here();
-            if self.revisit(visited) {
-                self.ahead.push(here);
-            }
-        }
+        self.step(|b| &mut b.history, |b| &mut b.ahead);
     }
 
     /// Go forward again to the note Back left.
     fn forward(&mut self) {
-        if let Some(visited) = self.ahead.pop() {
-            let here = self.here();
-            if self.revisit(visited) {
-                self.history.push(here);
+        self.step(|b| &mut b.ahead, |b| &mut b.history);
+    }
+
+    /// Go to the last place on `from`, leaving this one on `to`. A note that
+    /// cannot be read stays on `from`, as it may be back in a moment, such as
+    /// after an editor's save; if it still cannot be read on the next try,
+    /// with nothing opened in between, it is passed for the place before it.
+    fn step(&mut self, from: Stack, to: Stack) {
+        let Some(visited) = from(self).pop() else {
+            return;
+        };
+        let here = self.here();
+        if self.revisit(&visited) {
+            to(self).push(here);
+        } else if self.missed.as_ref() != Some(&visited.path) {
+            self.missed = Some(visited.path.clone());
+            from(self).push(visited);
+        } else {
+            self.step(from, to);
+            if self.path != here.path {
+                self.say(format!("passed {}: cannot read it", visited.path.display()));
             }
         }
     }
@@ -653,8 +672,8 @@ impl Browser {
 
     /// Open a note again where it was left. Returns false when it cannot
     /// be read.
-    fn revisit(&mut self, visited: Visited) -> bool {
-        if !self.open(visited.path) {
+    fn revisit(&mut self, visited: &Visited) -> bool {
+        if !self.open(visited.path.clone()) {
             return false;
         }
         self.view.scroll = visited.scroll.min(self.view.max_scroll());
@@ -739,6 +758,7 @@ impl Browser {
         self.view.kept = kept;
         self.view.show(doc, folder(&path));
         self.view.set_notice(None);
+        self.missed = None;
         self.watcher = watcher;
         self.path = path;
         true
@@ -1892,6 +1912,98 @@ mod tests {
         assert_eq!(wait(&mut b), (40, 40));
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(wait(&mut b), (20, 100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_that_cannot_be_read_stays_on_the_way_back_and_forward() {
+        let (mut b, dir) = browser(
+            "unreadable",
+            &[("HOME.md", "[[Other]]\n"), ("Other.md", "other\n")],
+        );
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("Other.md"));
+        // Gone for a moment, as during an editor's save.
+        std::fs::rename(dir.join("HOME.md"), dir.join("away")).unwrap();
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("Other.md"));
+        assert!(
+            b.view
+                .notice
+                .as_deref()
+                .unwrap()
+                .starts_with("cannot read file")
+        );
+        std::fs::rename(dir.join("away"), dir.join("HOME.md")).unwrap();
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        // And the same going forward.
+        std::fs::rename(dir.join("Other.md"), dir.join("away")).unwrap();
+        enter(&mut b, KeyCode::Char('L'));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        std::fs::rename(dir.join("away"), dir.join("Other.md")).unwrap();
+        enter(&mut b, KeyCode::Char('L'));
+        assert_eq!(b.path, dir.join("Other.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_gone_for_good_is_passed_on_the_second_try() {
+        let (mut b, dir) = browser(
+            "gone-for-good",
+            &[("A.md", "[[B]]\n"), ("B.md", "[[C]]\n"), ("C.md", "c\n")],
+        );
+        for _ in 0..2 {
+            enter(&mut b, KeyCode::Tab);
+            enter(&mut b, KeyCode::Enter);
+        }
+        assert_eq!(b.path, dir.join("C.md"));
+        std::fs::remove_file(dir.join("B.md")).unwrap();
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("C.md"));
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("A.md"));
+        let notice = b.view.notice.clone().unwrap();
+        assert!(
+            notice.starts_with("passed") && notice.contains("B.md"),
+            "{notice}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_missed_once_is_not_passed_after_going_elsewhere() {
+        let (mut b, dir) = browser(
+            "missed-once",
+            &[
+                ("A.md", "[[B]]\n"),
+                ("B.md", "[[C]]\n"),
+                ("C.md", "[[D]]\n"),
+                ("D.md", "d\n"),
+            ],
+        );
+        for _ in 0..3 {
+            enter(&mut b, KeyCode::Tab);
+            enter(&mut b, KeyCode::Enter);
+        }
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("C.md"));
+        // Back from C while B is being saved, then forward to D and back.
+        std::fs::rename(dir.join("B.md"), dir.join("away")).unwrap();
+        enter(&mut b, KeyCode::Backspace);
+        std::fs::rename(dir.join("away"), dir.join("B.md")).unwrap();
+        enter(&mut b, KeyCode::Char('L'));
+        assert_eq!(b.path, dir.join("D.md"));
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("C.md"));
+        // B is being saved again: one miss keeps it.
+        std::fs::rename(dir.join("B.md"), dir.join("away")).unwrap();
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("C.md"));
+        std::fs::rename(dir.join("away"), dir.join("B.md")).unwrap();
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("B.md"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

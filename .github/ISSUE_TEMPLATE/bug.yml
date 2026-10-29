@@ -1,0 +1,30 @@
+name: Bug
+description: Something smd shows or does wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: markdown
+    attributes:
+      label: Markdown that shows it
+      description: The smallest piece of a file that does it.
+      render: markdown
+  - type: input
+    id: version
+    attributes:
+      label: smd version
+      description: The output of `smd --version`.
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and operating system
+      placeholder: Ghostty 1.2 on macOS 15
+    validations:
+      required: true

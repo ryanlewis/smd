@@ -1,5 +1,15 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["github>ryanlewis/renovate-config"],
-  "enabledManagers": ["github-actions", "cargo"]
+  "enabledManagers": ["github-actions", "cargo", "custom.regex"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Rust toolchain CI runs on, marked with a renovate comment.",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+RUST_TOOLCHAIN: (?<currentValue>\\S+)"
+      ]
+    }
+  ]
 }

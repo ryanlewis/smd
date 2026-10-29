@@ -8,25 +8,56 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its older run. Each push to main runs.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
+env:
+  # The toolchain the checks run on. The msrv job checks Cargo.toml's
+  # rust-version on its own.
+  # renovate: datasource=github-releases depName=rust-lang/rust
+  RUST_TOOLCHAIN: 1.99.1
+  CARGO_TERM_COLOR: always
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup component add rustfmt clippy
+      - run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy && rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
 
-  coverage:
+  msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup component add llvm-tools-preview
+      # Cargo.toml's rust-version, as 1.99.0 when it is written 1.99.
+      - run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          [[ $msrv == *.*.* ]] || msrv=$msrv.0
+          rustup toolchain install "$msrv" --profile minimal && rustup default "$msrv"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --locked --all-targets
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component llvm-tools-preview && rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov@0.9.1

@@ -260,6 +260,7 @@ fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && let Some(hex) = s.get(i + 1..i + 3)
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
             && let Ok(b) = u8::from_str_radix(hex, 16)
         {
             out.push(b);
@@ -629,6 +630,9 @@ mod tests {
         // Escapes that are not UTF-8 are kept as written.
         assert_eq!(percent_decode("%ff%fe"), "%ff%fe");
         assert_eq!(percent_decode("a%2"), "a%2");
+        // A sign is not a hex digit, though `from_str_radix` takes one.
+        assert_eq!(percent_decode("a%+1b"), "a%+1b");
+        assert_eq!(percent_decode("%-1"), "%-1");
         assert_eq!(percent_decode("%"), "%");
     }
 

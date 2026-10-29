@@ -558,7 +558,7 @@ impl Units {
 }
 
 /// Whether a line may break at `c`: any space but a no-break one.
-fn breaks_at(c: char) -> bool {
+pub(crate) fn breaks_at(c: char) -> bool {
     c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}')
 }
 

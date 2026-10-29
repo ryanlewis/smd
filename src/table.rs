@@ -445,9 +445,10 @@ impl Builder {
                 dest_url,
                 ..
             } => {
+                let wiki = matches!(link_type, LinkType::WikiLink { .. });
                 self.style.link = Some(Link {
-                    dest: dest_url.to_string(),
-                    wiki: matches!(link_type, LinkType::WikiLink { .. }),
+                    dest: link_dest(wiki, &dest_url).to_string(),
+                    wiki,
                 });
             }
             Tag::Image {
@@ -458,13 +459,7 @@ impl Builder {
                 // An embedded note is shown as a link to it, and an image as
                 // its alt text, as in a paragraph.
                 let wiki = matches!(link_type, LinkType::WikiLink { .. });
-                // In a table the pipe before an alias is escaped, `\|`, and
-                // the backslash is left on the name.
-                let dest = if wiki {
-                    dest_url.strip_suffix('\\').unwrap_or(&dest_url)
-                } else {
-                    &dest_url
-                };
+                let dest = link_dest(wiki, &dest_url);
                 let note = wiki && !is_image(dest);
                 self.embeds.push(note);
                 if note {
@@ -550,6 +545,16 @@ impl Builder {
             aligns: self.aligns,
             rows: self.rows,
         }
+    }
+}
+
+/// Where a link or embed goes. In a table the pipe before a wiki link's
+/// alias is escaped, `\|`, and the backslash is left on the name.
+fn link_dest(wiki: bool, dest: &str) -> &str {
+    if wiki {
+        dest.strip_suffix('\\').unwrap_or(dest)
+    } else {
+        dest
     }
 }
 
@@ -669,6 +674,19 @@ mod tests {
             ..InlineStyle::default()
         };
         assert_eq!(table.rows[0][0], vec![("a b c".to_string(), emphasis)]);
+    }
+
+    #[test]
+    fn a_wiki_link_in_a_cell_drops_the_escape_before_its_alias() {
+        let table = Table::parse("| [[Note\\|alias]] |\n|-|");
+        let note = InlineStyle {
+            link: Some(Link {
+                dest: "Note".into(),
+                wiki: true,
+            }),
+            ..InlineStyle::default()
+        };
+        assert_eq!(table.rows, vec![vec![vec![("alias".into(), note)]]]);
     }
 
     #[test]

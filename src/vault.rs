@@ -404,6 +404,17 @@ mod tests {
             vault.follow(&wiki("Plan#^abc123"), &home),
             note(v.path("Plan.md"), None)
         );
+        // A backslash ending a name is kept: the parser has already dropped
+        // the one that escapes an alias's pipe.
+        assert_eq!(
+            vault.follow(&wiki("Nope\\"), &home),
+            Target::Missing("Nope\\".into())
+        );
+        // Spaces around the name and before the heading are dropped.
+        assert_eq!(
+            vault.follow(&wiki(" Plan #Next steps "), &home),
+            note(v.path("Plan.md"), Some("Next steps"))
+        );
         assert!(heading_matches("✅ Next steps!", "next-steps"));
         assert!(!heading_matches("Next", "next-steps"));
     }
@@ -442,6 +453,13 @@ mod tests {
         };
         assert_eq!(Path::new(src), v.path("attachments/pic.png"));
         assert!(!wiki);
+        // Spaces around the name and a fragment after it are dropped.
+        let mut doc = crate::doc::parse("![[ pic.png #small|300]]\n");
+        vault.resolve_embeds(&mut doc.blocks, &v.path("HOME.md"));
+        let BlockKind::Image { src, .. } = &doc.blocks[0].kind else {
+            panic!("not an image: {:?}", doc.blocks[0]);
+        };
+        assert_eq!(Path::new(src), v.path("attachments/pic.png"));
     }
 
     fn md(dest: &str) -> Link {

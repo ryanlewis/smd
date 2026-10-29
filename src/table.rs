@@ -321,7 +321,8 @@ fn wrap(cell: &Cell, width: usize) -> Wrapped {
                 if !word.is_empty() {
                     words.push((std::mem::take(&mut gap), std::mem::take(&mut word)));
                 }
-                gap.push((c, i));
+                // As in `plain_spaces`, for a cell not read by `parse`.
+                gap.push((' ', i));
             } else {
                 word.push((c, i));
             }
@@ -516,7 +517,7 @@ impl Builder {
             Event::SoftBreak | Event::HardBreak => (" ".to_string(), self.style.clone()),
             _ => return None,
         };
-        Some(run)
+        Some((plain_spaces(&run.0), run.1))
     }
 
     /// Add a run to the last cell, joined to its last run when their styles
@@ -561,6 +562,15 @@ fn nest(depth: &mut u32, start: bool) -> bool {
 
 fn text_width(cell: &[(String, InlineStyle)]) -> usize {
     cell.iter().map(|(text, _)| text.width()).sum()
+}
+
+/// `text` with each space a line may break at made an ordinary space, so a
+/// tab is not drawn as nothing and a wide space not wider. Runs of spaces
+/// are kept.
+fn plain_spaces(text: &str) -> String {
+    text.chars()
+        .map(|c| if breaks_at(c) { ' ' } else { c })
+        .collect()
 }
 
 /// Space before and after a cell's text to fill `extra` columns.
@@ -785,14 +795,29 @@ mod tests {
     fn cells_wrap_at_any_space_but_a_no_break_one() {
         assert_eq!(wrapped("a\u{3000}b", 1), (vec!["a".into(), "b".into()], 0));
         assert_eq!(wrapped("a\tb", 1), (vec!["a".into(), "b".into()], 0));
-        // A wide space counts at its width.
-        assert_eq!(wrapped("a\u{3000}b", 3), (vec!["a".into(), "b".into()], 0));
+        // Any breakable space is drawn as one ordinary space.
+        assert_eq!(wrapped("a\u{3000}b", 3), (vec!["a b".into()], 0));
+        assert_eq!(wrapped("a\tb", 3), (vec!["a b".into()], 0));
         assert_eq!(
             wrapped("10\u{a0}km x", 5),
             (vec!["10\u{a0}km".into(), "x".into()], 0)
         );
         let table = Table::parse("| aaaa\u{3000}bbbb | 10\u{a0}km |\n|-|-|");
         assert_eq!(table.words(), vec![4, 5]);
+        let table = Table::parse("| a\tb | 10\u{a0}km |\n|-|-|");
+        assert_eq!(
+            plain(&table, 80),
+            vec!["┌─────┬───────┐", "│ a b │ 10\u{a0}km │", "└─────┴───────┘",]
+        );
+    }
+
+    #[test]
+    fn a_card_header_with_a_tab_or_wide_space_lines_up() {
+        for header in ["h\tx", "h\u{3000}x"] {
+            let table = Table::parse(&format!("| {header} | bb | cc |\n|-|-|-|\n| 1 | 2 | 3 |"));
+            let lines = plain(&table, 12);
+            assert_eq!(lines[1..4], ["h x: 1", "bb:  2", "cc:  3"], "{header:?}");
+        }
     }
 
     #[test]

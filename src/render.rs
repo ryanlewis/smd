@@ -948,6 +948,117 @@ mod tests {
         assert_eq!(plain("run `a  b c` now\n", 8), vec!["run", "a  b c", "now"]);
     }
 
+    type Cells = Vec<(usize, Range<u16>)>;
+
+    /// Each link in the layout as its destination and the cells it takes.
+    fn spots(md: &str, width: u16) -> Vec<(String, Cells)> {
+        render(&parse(md), width, &no_images())
+            .links
+            .into_iter()
+            .map(|l| (l.link.dest, l.cells))
+            .collect()
+    }
+
+    fn styled_md(md: &str, width: u16) -> Vec<String> {
+        styled(&render(&parse(md), width, &no_images()).lines)
+    }
+
+    #[test]
+    fn a_hard_break_ends_the_line_and_drops_the_space_before_it() {
+        assert_eq!(plain("one  \ntwo three\n", 20), vec!["one", "two three"]);
+        assert_eq!(plain("ab\\\ncd\n", 20), vec!["ab", "cd"]);
+        assert_eq!(plain("a  \n  \nb\n", 20), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn a_hard_break_inside_a_link_splits_it_in_two() {
+        assert_eq!(
+            spots("[one  \ntwo](x)\n", 20),
+            vec![
+                ("x".to_string(), vec![(0, 0..3)]),
+                ("x".to_string(), vec![(1, 0..3)])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_is_one_link_across_style_changes_and_spaces() {
+        assert_eq!(
+            spots("go [a **b** c](x) now\n", 20),
+            vec![("x".to_string(), vec![(0, 3..8)])]
+        );
+        assert_eq!(
+            styled_md("go [a **b** c](x) now\n", 20),
+            vec![
+                "[go |][a |fg=Blue,UNDERLINED][b|fg=Blue,BOLD | UNDERLINED][ c|fg=Blue,UNDERLINED][ now|]"
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbouring_links_merge_only_when_they_are_the_same() {
+        assert_eq!(
+            spots("[a](x)[b](x) [c](y)[d](z)\n", 20),
+            vec![
+                ("x".to_string(), vec![(0, 0..2)]),
+                ("y".to_string(), vec![(0, 3..4)]),
+                ("z".to_string(), vec![(0, 4..5)])
+            ]
+        );
+        // The same link again after other text is a second link.
+        assert_eq!(
+            spots("[a](x) b [c](x)\n", 20),
+            vec![
+                ("x".to_string(), vec![(0, 0..1)]),
+                ("x".to_string(), vec![(0, 4..5)])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_link_takes_cells_on_each_line_without_the_broken_space() {
+        assert_eq!(
+            spots("see [one two three](x)\n", 9),
+            vec![("x".to_string(), vec![(0, 4..7), (1, 0..9)])]
+        );
+        assert_eq!(
+            spots("- [abcdefgh](x)\n", 6),
+            vec![("x".to_string(), vec![(0, 2..6), (1, 2..6)])]
+        );
+    }
+
+    #[test]
+    fn a_style_change_inside_a_word_does_not_break_it() {
+        assert_eq!(plain("xx a**b**c\n", 4), vec!["xx", "abc"]);
+        assert_eq!(styled_md("a**b**c\n", 4), vec!["[a|][b|BOLD][c|]"]);
+    }
+
+    #[test]
+    fn runs_of_space_become_one_space_in_the_first_style() {
+        assert_eq!(
+            styled_md("a\n*b* **c** d\n", 20),
+            vec!["[a |][b|ITALIC][ |][c|BOLD][ d|]"]
+        );
+        // A space ending a link and the one after it: the link keeps it.
+        assert_eq!(
+            styled_md("[a ](x)  b\n", 20),
+            vec!["[a |fg=Blue,UNDERLINED][b|]"]
+        );
+        assert_eq!(
+            spots("[a ](x)  b\n", 20),
+            vec![("x".to_string(), vec![(0, 0..2)])]
+        );
+    }
+
+    #[test]
+    fn code_spans_keep_their_spaces_in_links_too() {
+        assert_eq!(
+            spots("x [`a  b`](y) z\n", 20),
+            vec![("y".to_string(), vec![(0, 2..6)])]
+        );
+        assert_eq!(plain("x `a  b` z\n", 5), vec!["x", "a  b", "z"]);
+    }
+
     #[test]
     fn figures_show_their_source() {
         assert_eq!(

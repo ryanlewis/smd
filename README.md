@@ -25,6 +25,8 @@ A paragraph that holds only a local PNG, GIF (first frame) or JPEG image, such a
 
 Press Tab and Shift-Tab to move between links, Enter to follow one, and Backspace to go back to where you were. Following a link to another note opens it in smd. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
 
+Links are also marked as terminal hyperlinks (OSC 8), so in a terminal that supports them you can click one, usually with Cmd or Ctrl held. The terminal opens it, not smd: a web link opens in the browser, and a note opens in whatever app opens `.md` files. A link to a heading in the same note, or to a note smd cannot find, is not clickable.
+
 Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]` and `[[#Heading]]`. smd finds the vault by looking up from the file for a folder with a `.obsidian` folder in it, and looks up a note by name anywhere in the vault, as Obsidian does. A note outside a vault looks in its own folder and the folders below it. An embedded image, `![[diagram.png]]`, is shown like any other image. An embedded note, `![[Note]]`, is shown as a link to it.
 
 Links inside tables and in headings drawn as images cannot be selected yet.

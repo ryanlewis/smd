@@ -2,10 +2,12 @@
 //! the browser that moves it from note to note along links.
 
 use std::io::{self, Write};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use ratatui::buffer::{Cell, CellDiffOption};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -18,9 +20,11 @@ use crate::doc::{self, BlockKind, Document, Inline, Link};
 use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
-use crate::render::{Layout, render};
+use crate::render::{Layout, LinkSpot, render};
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
+
+use unicode_width::UnicodeWidthStr;
 
 /// How often to look at the file on disk. A change shows after two checks.
 const CHECK_EVERY: Duration = Duration::from_millis(150);
@@ -244,7 +248,14 @@ impl View {
             .min(self.max_scroll());
     }
 
+    #[cfg(test)]
     pub fn draw(&mut self, frame: &mut Frame) {
+        self.draw_linked(frame, |_| None);
+    }
+
+    /// Draw the view. Each link that `href` gives an address for is marked
+    /// as a terminal hyperlink (OSC 8), so it can be clicked.
+    pub fn draw_linked(&mut self, frame: &mut Frame, href: impl Fn(&Link) -> Option<String>) {
         let mut area = frame.area();
         if let Some(notice) = &self.notice
             && area.height > 0
@@ -259,15 +270,39 @@ impl View {
         let end = (self.scroll + area.height as usize).min(lines.len());
         let visible = Text::from(lines[self.scroll..end].to_vec());
         frame.render_widget(Paragraph::new(visible), area);
+        // The cells of a link that are in view.
+        let scroll = self.scroll;
+        let cells = |spot: &LinkSpot| -> Vec<Rect> {
+            spot.cells
+                .iter()
+                .filter(|(row, cols)| (scroll..end).contains(row) && cols.start < area.width)
+                .map(|(row, cols)| {
+                    let y = area.y + (row - scroll) as u16;
+                    let width = cols.end.min(area.width) - cols.start;
+                    Rect::new(area.x + cols.start, y, width, 1)
+                })
+                .collect()
+        };
+        let buf = frame.buffer_mut();
         // The selected link is shown in reverse.
         if let Some(spot) = self.selected.and_then(|i| self.layout.links.get(i)) {
-            let buf = frame.buffer_mut();
-            for (row, cols) in &spot.cells {
-                if (self.scroll..end).contains(row) && cols.start < area.width {
-                    let y = area.y + (row - self.scroll) as u16;
-                    let width = cols.end.min(area.width) - cols.start;
-                    let cells = Rect::new(area.x + cols.start, y, width, 1);
-                    buf.set_style(cells, Style::new().add_modifier(Modifier::REVERSED));
+            for rect in cells(spot) {
+                buf.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
+            }
+        }
+        for (i, spot) in self.layout.links.iter().enumerate() {
+            let rects = cells(spot);
+            if rects.is_empty() {
+                continue;
+            }
+            let Some(url) = href(&spot.link) else {
+                continue;
+            };
+            // Control characters would end the escape early.
+            let url: String = url.chars().filter(|c| !c.is_control()).collect();
+            for rect in rects {
+                for x in rect.left()..rect.right() {
+                    hyperlink(&mut buf[(x, rect.y)], i, &url);
                 }
             }
         }
@@ -355,6 +390,35 @@ fn heading_start(blocks: &[doc::Block], wanted: &str) -> Option<usize> {
             .find_map(|item| heading_start(&item.blocks, wanted)),
         _ => None,
     })
+}
+
+/// Make `cell` part of link `id` to `url`. Each cell opens and closes the
+/// link around its own text, so a cell redrawn alone is still right, and
+/// the shared id lets the terminal treat them as one link.
+fn hyperlink(cell: &mut Cell, id: usize, url: &str) {
+    let text = cell.symbol();
+    // The second column of a wide character holds nothing to wrap.
+    let Some(width) = NonZeroU16::new(text.width() as u16) else {
+        return;
+    };
+    let symbol = format!("\x1b]8;id=smd{id};{url}\x1b\\{text}\x1b]8;;\x1b\\");
+    cell.set_symbol(&symbol);
+    // The escapes take no room on screen.
+    cell.set_diff_option(CellDiffOption::ForcedWidth(width));
+}
+
+/// A `file://` address for `path`, with the bytes a URL cannot hold as is
+/// escaped.
+fn file_url(path: &Path) -> String {
+    let mut url = String::from("file://");
+    for &b in path.as_os_str().as_encoded_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
 }
 
 /// Apply what the watcher saw to the view.
@@ -536,6 +600,17 @@ impl Browser {
     }
 }
 
+/// Where clicking a link in the note at `from` goes: a web address, or the
+/// file a note or other local link leads to. A heading in the same note
+/// and a link that leads nowhere have none.
+fn href(vault: &Vault, link: &Link, from: &Path) -> Option<String> {
+    match vault.follow(link, from) {
+        Target::Web(url) => Some(url),
+        Target::Note { path, .. } | Target::Other(path) => Some(file_url(&path)),
+        Target::Heading(_) | Target::Missing(_) => None,
+    }
+}
+
 /// Open `target` with the system's opener, without waiting for it.
 fn open_with_system(target: &str) -> io::Result<()> {
     let opener = if cfg!(target_os = "macos") {
@@ -568,7 +643,12 @@ fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Res
     let mut redraw = true;
     loop {
         if redraw {
-            terminal.draw(|frame| browser.view.draw(frame))?;
+            let (vault, path) = (&browser.vault, &browser.path);
+            terminal.draw(|frame| {
+                browser
+                    .view
+                    .draw_linked(frame, |link| href(vault, link, path))
+            })?;
             browser.view.flush_images(terminal.backend_mut())?;
             redraw = false;
         }
@@ -970,6 +1050,60 @@ mod tests {
             .map(|x| buf[(x, 0)].symbol().to_string())
             .collect();
         assert_eq!(reversed, "far away");
+    }
+
+    #[test]
+    fn links_are_drawn_as_terminal_hyperlinks() {
+        let mut v = new_view("go [ab](https://e.com) [[none]] now\n");
+        let mut terminal = Terminal::new(TestBackend::new(30, 2)).unwrap();
+        v.resize(30, 2);
+        let href = |link: &Link| (!link.wiki).then(|| link.dest.clone());
+        terminal.draw(|f| v.draw_linked(f, href)).unwrap();
+        let buf = terminal.backend().buffer();
+        let open = "\x1b]8;id=smd0;https://e.com\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        assert_eq!(buf[(3, 0)].symbol(), format!("{open}a{close}"));
+        assert_eq!(buf[(4, 0)].symbol(), format!("{open}b{close}"));
+        assert_eq!(buf[(2, 0)].symbol(), " ");
+        // A link with no address is left as text.
+        assert_eq!(buf[(6, 0)].symbol(), "n");
+        // Each cell still takes one column.
+        assert_eq!(buf[(5, 0)].symbol(), " ");
+        assert_eq!(buf[(11, 0)].symbol(), "n");
+    }
+
+    #[test]
+    fn file_urls_escape_what_a_url_cannot_hold() {
+        assert_eq!(
+            file_url(Path::new("/n/betty (G3).md")),
+            "file:///n/betty%20%28G3%29.md"
+        );
+    }
+
+    #[test]
+    fn notes_and_web_links_have_addresses_but_headings_do_not() {
+        let (b, dir) = browser(
+            "href",
+            &[
+                ("HOME.md", "[[Plan]] [[#Top]] [[gone]]\n"),
+                ("work/Plan.md", "x\n"),
+            ],
+        );
+        let addr = |dest: &str, wiki| {
+            let link = Link {
+                dest: dest.into(),
+                wiki,
+            };
+            href(&b.vault, &link, &b.path)
+        };
+        assert_eq!(
+            addr("Plan", true),
+            Some(file_url(&dir.join("work/Plan.md")))
+        );
+        assert_eq!(addr("https://e.com", false), Some("https://e.com".into()));
+        assert_eq!(addr("#Top", true), None);
+        assert_eq!(addr("gone", true), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

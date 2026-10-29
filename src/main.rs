@@ -14,32 +14,45 @@ mod theme;
 mod vault;
 mod watch;
 
-use std::ffi::OsString;
 use std::io::{self, Write};
 use std::panic;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 
-fn version_line() -> String {
-    format!("smd {VERSION}")
+/// A terminal markdown reader
+#[derive(Parser)]
+#[command(version, after_help = KEYS)]
+struct Args {
+    /// Show images, diagrams and maths as their markdown source
+    #[arg(long)]
+    no_graphics: bool,
+    /// The markdown file; with none, the `home` note from the config
+    file: Option<PathBuf>,
 }
 
-/// Remove every `flag` from `args`, returning whether there was one.
-fn take_flag(args: &mut Vec<OsString>, flag: &str) -> bool {
-    let before = args.len();
-    args.retain(|a| a != flag);
-    args.len() != before
-}
+const KEYS: &str = "\
+The config file is ~/.config/smd/config.toml (or under $XDG_CONFIG_HOME).
+
+Keys:
+  j, k, arrows          scroll a line
+  space, PgDn, PgUp     scroll a page
+  ctrl-d, ctrl-u        scroll half a page
+  g, G                  go to the top or bottom
+  tab, shift-tab        select the next or previous link
+  enter                 follow the selected link
+  backspace, H          go back
+  L                     go forward
+  q, esc                quit
+
+Click a link to follow it, and the toolbar's buttons to go back and forward.
+The keys can be changed in the config file; see the README.";
 
 fn main() -> ExitCode {
-    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("{}", version_line());
-        return ExitCode::SUCCESS;
-    }
-    let no_graphics = take_flag(&mut args, "--no-graphics");
+    let args = Args::parse();
+    let no_graphics = args.no_graphics;
     let config = match config::Config::load() {
         Ok(config) => config,
         Err(err) => {
@@ -48,14 +61,13 @@ fn main() -> ExitCode {
         }
     };
     // With no file, the home note from the config.
-    let path: PathBuf = match (args.as_slice(), &config.home) {
-        ([path], _) => path.into(),
-        ([], Some(home)) => home.clone(),
-        _ => {
-            eprintln!("usage: smd [--no-graphics] [<file.md>]");
-            eprintln!("With no file, smd opens `home` from ~/.config/smd/config.toml.");
-            return ExitCode::from(2);
-        }
+    let Some(path) = args.file.or_else(|| config.home.clone()) else {
+        Args::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "no file given, and no `home` in ~/.config/smd/config.toml",
+            )
+            .exit();
     };
     let watcher = watch::Watcher::new(path.clone());
     let source = match std::fs::read_to_string(&path) {
@@ -138,17 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_line_has_name_and_version() {
-        assert_eq!(version_line(), format!("smd {}", env!("CARGO_PKG_VERSION")));
-    }
-
-    #[test]
-    fn take_flag_removes_the_flag_wherever_it_is() {
-        let mut args: Vec<OsString> = vec!["--no-graphics".into(), "a.md".into()];
-        assert!(take_flag(&mut args, "--no-graphics"));
-        assert_eq!(args, vec![OsString::from("a.md")]);
-        let mut args: Vec<OsString> = vec!["a.md".into()];
-        assert!(!take_flag(&mut args, "--no-graphics"));
-        assert_eq!(args.len(), 1);
+    fn the_arguments_are_valid() {
+        Args::command().debug_assert();
     }
 }

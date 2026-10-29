@@ -100,6 +100,10 @@ pub fn base64(data: &[u8]) -> String {
 /// How long to wait for the terminal to answer the start-up queries.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// How much longer to wait for a terminal that has started to answer but has
+/// not sent the DA1 reply by the timeout.
+const LATE_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Cell size used when the terminal reports none.
 const FALLBACK_CELL: (u16, u16) = (8, 16);
 
@@ -125,7 +129,8 @@ pub struct Probe {
 /// The queries end with `CSI c` (DA1). Terminals answer in order, and nearly
 /// all answer DA1, so the DA1 reply ends the wait: a terminal that sends it
 /// without a graphics reply has no graphics. One that answers nothing is given
-/// up on after a short timeout. The cell size falls back to the pixel size the
+/// up on after a short timeout, and one that has started to answer by then is
+/// given a little longer to send DA1. The cell size falls back to the pixel size the
 /// tty reports. The queries are sent on the alternate screen, which is left
 /// again before this returns. Call it before the key reader starts: it reads
 /// the replies from the terminal itself.
@@ -188,20 +193,29 @@ fn exchange(out: &mut impl Write, fd: libc::c_int, timeout: Duration) -> Vec<u8>
     let sent = write!(out, "\x1b[?1049h{}", queries())
         .and_then(|()| out.flush())
         .is_ok();
-    let reply = if sent {
-        read_replies(Instant::now() + timeout, |left| read_chunk(fd, left))
-    } else {
-        Vec::new()
-    };
+    let read = move |left| read_chunk(fd, left);
+    let mut reply = Vec::new();
+    if sent {
+        reply = read_replies(reply, Instant::now() + timeout, read);
+    }
+    // A slow terminal, over ssh say, is given a little longer once it has
+    // started to answer, so its last replies are read here and do not reach
+    // the key reader as key presses.
+    if !reply.is_empty() && !has_da1_reply(&reply) {
+        reply = read_replies(reply, Instant::now() + LATE_REPLY_TIMEOUT, read);
+    }
     let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
     reply
 }
 
-/// Collect chunks from `next` until they hold the DA1 reply or `deadline`
+/// Add chunks from `next` to `buf` until it holds the DA1 reply or `deadline`
 /// passes. `next` is given the time left and returns `None` when nothing came
 /// in that time or the input ended.
-fn read_replies(deadline: Instant, mut next: impl FnMut(Duration) -> Option<Vec<u8>>) -> Vec<u8> {
-    let mut buf = Vec::new();
+fn read_replies(
+    mut buf: Vec<u8>,
+    deadline: Instant,
+    mut next: impl FnMut(Duration) -> Option<Vec<u8>>,
+) -> Vec<u8> {
     while !has_da1_reply(&buf) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -426,7 +440,7 @@ mod tests {
     /// how many chunks it asked for.
     fn replies(chunks: &[&[u8]]) -> (Vec<u8>, usize) {
         let mut calls = 0;
-        let buf = read_replies(Instant::now() + REPLY_TIMEOUT, |left| {
+        let buf = read_replies(Vec::new(), Instant::now() + REPLY_TIMEOUT, |left| {
             assert!(!left.is_zero() && left <= REPLY_TIMEOUT);
             calls += 1;
             chunks.get(calls - 1).map(|c| c.to_vec())
@@ -496,7 +510,9 @@ mod tests {
 
     #[test]
     fn a_passed_deadline_reads_nothing() {
-        let buf = read_replies(Instant::now(), |_| panic!("read after the deadline"));
+        let buf = read_replies(Vec::new(), Instant::now(), |_| {
+            panic!("read after the deadline")
+        });
         assert!(buf.is_empty());
     }
 
@@ -504,7 +520,7 @@ mod tests {
     fn replies_stop_at_the_deadline() {
         // Input that never ends and never holds DA1 is cut off by the clock.
         let start = Instant::now();
-        let buf = read_replies(start + Duration::from_millis(20), |_| {
+        let buf = read_replies(Vec::new(), start + Duration::from_millis(20), |_| {
             std::thread::sleep(Duration::from_millis(2));
             Some(b"x".to_vec())
         });
@@ -591,6 +607,25 @@ mod tests {
             String::from_utf8(out).unwrap(),
             format!("\x1b[?1049h{}\x1b[?1049l", queries())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_terminals_late_replies_are_read() {
+        // The cell size comes in time, DA1 only after the timeout: DA1 is
+        // still read here, and nothing is left for the key reader.
+        let pipe = Pipe::new(b"\x1b[6;16;8t", false);
+        let write = pipe.write.unwrap();
+        let timeout = Duration::from_millis(100);
+        let terminal = std::thread::spawn(move || {
+            std::thread::sleep(timeout * 2);
+            // SAFETY: writes the reply from a live buffer to an open pipe.
+            unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
+        });
+        let reply = exchange(&mut Vec::new(), pipe.read, timeout);
+        terminal.join().unwrap();
+        assert_eq!(reply, b"\x1b[6;16;8t\x1b[?62c");
+        assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
     }
 
     #[cfg(unix)]

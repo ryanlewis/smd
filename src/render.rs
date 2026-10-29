@@ -520,9 +520,39 @@ impl Units {
         }
     }
 
+    /// The units and links. A link with no text drawn but spaces is left
+    /// out, as its spaces may merge away or fall at a line break, and is left
+    /// out at every width so the links keep their indices across a resize.
     fn finish(mut self) -> (Vec<Unit>, Vec<Link>) {
         self.end_word();
-        (self.units, self.links)
+        let mut drawn = vec![false; self.links.len()];
+        for unit in &self.units {
+            if let Unit::Word(segments) = unit {
+                for (s, _, link) in segments {
+                    if let Some(i) = link.filter(|_| s.width() > 0) {
+                        drawn[i] = true;
+                    }
+                }
+            }
+        }
+        // Each link's new index, if it is kept.
+        let mut index = Vec::with_capacity(drawn.len());
+        let mut links = Vec::new();
+        for (link, drawn) in self.links.into_iter().zip(drawn) {
+            index.push(drawn.then_some(links.len()));
+            if drawn {
+                links.push(link);
+            }
+        }
+        let renumber = |link: &mut Option<usize>| *link = link.and_then(|i| index[i]);
+        for unit in &mut self.units {
+            match unit {
+                Unit::Word(segments) => segments.iter_mut().for_each(|(.., l)| renumber(l)),
+                Unit::Space(_, l) => renumber(l),
+                Unit::Break => {}
+            }
+        }
+        (self.units, links)
     }
 }
 
@@ -568,9 +598,6 @@ fn wrap(
         }
     }
     lines.finish_last();
-    // A link whose only text was a space dropped at a line start or merged
-    // into the one before it has nothing drawn, so nothing to select.
-    spots.retain(|spot| !spot.cells.is_empty());
     spots
 }
 
@@ -1090,6 +1117,15 @@ mod tests {
             vec![("y".to_string(), vec![(0, 2..3)])]
         );
         assert_eq!(spots("[ ](x) b\n", 20), vec![]);
+    }
+
+    #[test]
+    fn the_links_are_the_same_at_every_width() {
+        let md = "[c](y) aaaa[ ](x)bbbb [d](z) [\u{200b}](w)\n";
+        for width in [6, 20] {
+            let dests: Vec<String> = spots(md, width).into_iter().map(|(d, _)| d).collect();
+            assert_eq!(dests, vec!["y", "z"], "width {width}");
+        }
     }
 
     #[test]

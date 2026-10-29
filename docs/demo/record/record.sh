@@ -32,7 +32,20 @@ chmod +x $work/run.sh
 conf=$work/ghostty.conf
 sed "s|@COMMAND@|$work/run.sh|" $here/ghostty.conf > $conf
 
-keys() { osascript -e 'tell application "System Events"' -e "$1" -e 'end tell'; }
+# Sends key events to this script's Ghostty: brings it to the front by pid, not
+# by name (so keys never go to another Ghostty, such as the one the script runs
+# in), and stops if it does not come to the front.
+keys() {
+  osascript -e 'tell application "System Events"' \
+    -e "set p to first process whose unix id is $pid" \
+    -e 'set frontmost of p to true' \
+    -e 'repeat 30 times
+if frontmost of p then exit repeat
+delay 0.1
+end repeat' \
+    -e 'if not frontmost of p then error "the demo Ghostty is not at the front"' \
+    -e "$1" -e 'end tell'
+}
 down() { keys "repeat $1 times
 key code 38
 delay ${2:-0.02}
@@ -46,19 +59,22 @@ crop=crop=1772:1242:12:66
 open_window() {
   open -na /Applications/Ghostty.app --args --config-default-files=false --config-file=$conf
   sleep 3
-  local pid=$(pgrep -f "config-file=$conf" | head -1)
+  pid=$(pgrep -f "config-file=$conf" | head -1)
   read id x y w h rest <<< "$($work/winid $pid | head -1)"
   [[ -n $id ]] || { echo "no Ghostty window found" >&2; exit 1; }
-  osascript -e 'tell application "Ghostty" to activate'
   sleep 2
 }
 
-# Quits smd, which closes the window and this Ghostty instance.
+# Quits smd, which closes the window and this Ghostty instance, and waits for
+# it to exit so the next open_window cannot find it.
 close_window() {
-  osascript -e 'tell application "Ghostty" to activate'
-  sleep 0.5
   keys 'keystroke "q"'
-  sleep 2
+  for i in {1..50}; do
+    kill -0 $pid 2>/dev/null || return 0
+    sleep 0.2
+  done
+  echo "Ghostty $pid did not exit" >&2
+  exit 1
 }
 
 video() {
@@ -73,7 +89,9 @@ video() {
     sleep 1.6
   done
   sleep 0.5
-  keys 'key code 48'                  # tab: select the last link
+  # Tab selects the first link in view; at the bottom of the note that is
+  # the reference station link in the to-do list.
+  keys 'key code 48'
   sleep 1.6
   keys 'key code 36'                  # enter: follow it to Calibration
   sleep 3.5
@@ -104,7 +122,7 @@ stills() {
   down 16; shot maths
   down 24; shot table
   keys 'keystroke "G"'; sleep 0.3     # bottom
-  keys 'key code 48'; sleep 0.3       # tab: the last link
+  keys 'key code 48'; sleep 0.3       # tab: first link in view, the reference station
   keys 'key code 36'; sleep 1.5       # enter: Calibration
   keys 'key code 48'                  # tab: select a link there
   shot links

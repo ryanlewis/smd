@@ -1518,6 +1518,91 @@ mod tests {
         b.key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
+    fn wiki(dest: &str) -> Link {
+        Link {
+            dest: dest.into(),
+            wiki: true,
+        }
+    }
+
+    #[test]
+    fn following_each_kind_of_link() {
+        let home = format!("# Top\n\n{0}## Later\n\n{0}", paragraphs(8));
+        let (mut b, dir) = browser(
+            "kinds",
+            &[
+                ("HOME.md", &home),
+                ("Plan.md", "# Plan\n"),
+                ("doc.pdf", "%PDF"),
+            ],
+        );
+        // A heading in this note, by its name and on its own.
+        b.follow(&wiki("HOME#Later"));
+        assert_eq!(top(&b.view), "Later");
+        b.view.act(Action::Top);
+        b.follow(&wiki("#Later"));
+        assert_eq!(top(&b.view), "Later");
+        // This note with no heading goes nowhere.
+        b.follow(&wiki("HOME"));
+        assert_eq!(top(&b.view), "Later");
+        assert!(b.history.is_empty());
+        b.follow(&wiki("#nowhere"));
+        assert_eq!(b.view.notice.as_deref(), Some("no heading found: nowhere"));
+        // Web links and files smd does not show go to the opener.
+        b.opener = |target| Err(io::Error::other(format!("asked for {target}")));
+        b.follow(&Link::from("https://example.com/"));
+        let notice = b.view.notice.clone().unwrap();
+        assert!(
+            notice.ends_with("asked for https://example.com/"),
+            "{notice}"
+        );
+        b.follow(&Link::from("doc.pdf"));
+        let notice = b.view.notice.clone().unwrap();
+        let pdf = dir.join("doc.pdf");
+        assert!(
+            notice.ends_with(&format!("asked for {}", pdf.display())),
+            "{notice}"
+        );
+        // Another note opens even when its heading is not there.
+        b.follow(&wiki("Plan#Missing"));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        assert_eq!(b.view.notice.as_deref(), Some("no heading found: Missing"));
+        assert_eq!(b.history.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_link_drops_forward_unless_its_note_cannot_be_read() {
+        let (mut b, dir) = browser(
+            "drop-forward",
+            &[("A.md", "a\n"), ("B.md", "b\n"), ("C.md", "c\n")],
+        );
+        b.follow(&wiki("B"));
+        b.back();
+        assert_eq!(b.ahead.len(), 1);
+        // A note that cannot be read leaves the way forward as it was.
+        std::fs::write(dir.join("C.md"), b"\xff\xfe").unwrap();
+        b.follow(&wiki("C"));
+        assert_eq!(b.path, dir.join("A.md"));
+        assert!(
+            b.view
+                .notice
+                .as_deref()
+                .unwrap()
+                .starts_with("cannot read file")
+        );
+        assert_eq!(b.ahead.len(), 1);
+        assert!(b.history.is_empty());
+        // One that opens drops it.
+        std::fs::write(dir.join("C.md"), "c\n").unwrap();
+        b.follow(&wiki("C"));
+        assert_eq!(b.path, dir.join("C.md"));
+        assert!(b.ahead.is_empty());
+        b.forward();
+        assert_eq!(b.path, dir.join("C.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn following_links_and_coming_back() {
         let home = format!("{}[[Plan#Later]] [[gone]]\n", paragraphs(6));

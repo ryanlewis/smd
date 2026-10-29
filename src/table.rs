@@ -601,6 +601,48 @@ mod tests {
     }
 
     #[test]
+    fn cells_keep_strikethrough_math_html_and_wiki_links() {
+        let table = Table::parse("| ~~a ~b~ c~~ d | $x$ <br> [[n]] |\n|---|---|");
+        let plain = InlineStyle::default();
+        let struck = InlineStyle {
+            strikethrough: true,
+            ..InlineStyle::default()
+        };
+        let math = InlineStyle {
+            math: true,
+            ..InlineStyle::default()
+        };
+        let wiki = InlineStyle {
+            link: Some(Link {
+                dest: "n".into(),
+                wiki: true,
+            }),
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            table.rows,
+            vec![vec![
+                vec![("a b c".into(), struck), (" d".into(), plain.clone())],
+                vec![
+                    ("x".into(), math),
+                    (" <br> ".into(), plain),
+                    ("n".into(), wiki),
+                ],
+            ]]
+        );
+    }
+
+    #[test]
+    fn text_before_a_table_is_dropped() {
+        let table = Table::parse("<div>x</div>\n\n***\n\nsome\ntext $$y$$\n\n| a |\n|---|");
+        assert_eq!(table.aligns, vec![Alignment::None]);
+        assert_eq!(table.rows, vec![vec![cell("a")]]);
+        let empty = Table::parse("just\ntext");
+        assert_eq!(empty.aligns, vec![Alignment::None]);
+        assert!(empty.rows.is_empty());
+    }
+
+    #[test]
     fn the_header_is_bold() {
         let table = Table::parse("| h |\n|---|\n| b |");
         let lines = table.lines(80, |base, _| base);

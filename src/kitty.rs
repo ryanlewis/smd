@@ -384,4 +384,231 @@ mod tests {
             "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c"
         );
     }
+
+    #[test]
+    fn cell_size_divides_the_window_by_its_cells() {
+        use ratatui::crossterm::terminal::WindowSize;
+        let size = |columns, rows, width, height| WindowSize {
+            rows,
+            columns,
+            width,
+            height,
+        };
+        assert_eq!(cell_size(size(80, 24, 640, 384)), Some((8, 16)));
+        assert_eq!(cell_size(size(100, 30, 1705, 1023)), Some((17, 34)));
+        // No cells, no pixels, or fewer pixels than cells: no size.
+        assert_eq!(cell_size(size(0, 24, 640, 384)), None);
+        assert_eq!(cell_size(size(80, 0, 640, 384)), None);
+        assert_eq!(cell_size(size(80, 24, 0, 0)), None);
+        assert_eq!(cell_size(size(80, 24, 79, 384)), None);
+        assert_eq!(cell_size(size(80, 24, 640, 23)), None);
+    }
+
+    /// Feed `chunks` to `read_replies` one per call, then nothing, and say
+    /// how many chunks it asked for.
+    fn replies(chunks: &[&[u8]]) -> (Vec<u8>, usize) {
+        let mut calls = 0;
+        let buf = read_replies(Instant::now() + REPLY_TIMEOUT, |left| {
+            assert!(!left.is_zero() && left <= REPLY_TIMEOUT);
+            calls += 1;
+            chunks.get(calls - 1).map(|c| c.to_vec())
+        });
+        (buf, calls)
+    }
+
+    #[test]
+    fn replies_are_read_until_da1() {
+        let kitty: &[u8] =
+            b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[6;34;17t\x1b_Gi=31;OK\x1b\\\x1b[?62;22c";
+        let (buf, calls) = replies(&[kitty, b"after"]);
+        assert_eq!((buf.as_slice(), calls), (kitty, 1));
+    }
+
+    #[test]
+    fn replies_split_across_reads_are_joined() {
+        let (buf, calls) = replies(&[
+            b"\x1b[6;3",
+            b"4;17t\x1b_Gi=3",
+            b"1;OK\x1b\\\x1b[?6",
+            b"2;22c",
+            b"after",
+        ]);
+        assert_eq!(calls, 4);
+        assert_eq!(parse_cell_reply(&buf), Some((17, 34)));
+        assert!(parse_graphics_reply(&buf));
+        assert!(has_da1_reply(&buf));
+    }
+
+    #[test]
+    fn da1_alone_ends_the_wait() {
+        let (buf, calls) = replies(&[b"\x1b[?1;2c", b"after"]);
+        assert_eq!((buf.as_slice(), calls), (&b"\x1b[?1;2c"[..], 1));
+        assert!(!parse_graphics_reply(&buf));
+        assert_eq!(parse_cell_reply(&buf), None);
+    }
+
+    #[test]
+    fn garbage_before_the_replies_is_kept_and_skipped() {
+        let (buf, calls) = replies(&[b"jk\x1b[A\x1b[?1;2", b"t", b"\x1b[6;16;8t\x1b[?6c"]);
+        assert_eq!(calls, 3);
+        assert_eq!(parse_cell_reply(&buf), Some((8, 16)));
+        assert!(!parse_graphics_reply(&buf));
+    }
+
+    #[test]
+    fn replies_after_da1_are_not_waited_for() {
+        // A terminal that answers DA1 first: the graphics reply that follows
+        // in a later read is not waited for, one in the same read is kept.
+        let (buf, calls) = replies(&[b"\x1b[?62c", b"\x1b_Gi=31;OK\x1b\\"]);
+        assert_eq!(calls, 1);
+        assert!(!parse_graphics_reply(&buf));
+        let (buf, _) = replies(&[b"\x1b[?62c\x1b_Gi=31;OK\x1b\\\x1b[6;16;8t"]);
+        assert!(parse_graphics_reply(&buf));
+        assert_eq!(parse_cell_reply(&buf), Some((8, 16)));
+    }
+
+    #[test]
+    fn no_reply_gives_up() {
+        // Nothing within the time left, or the input ended.
+        let (buf, calls) = replies(&[]);
+        assert_eq!((buf, calls), (Vec::new(), 1));
+        let (buf, calls) = replies(&[b"\x1b[6;16;8t"]);
+        assert_eq!((buf.as_slice(), calls), (&b"\x1b[6;16;8t"[..], 2));
+    }
+
+    #[test]
+    fn a_passed_deadline_reads_nothing() {
+        let buf = read_replies(Instant::now(), |_| panic!("read after the deadline"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn replies_stop_at_the_deadline() {
+        // Input that never ends and never holds DA1 is cut off by the clock.
+        let start = Instant::now();
+        let buf = read_replies(start + Duration::from_millis(20), |_| {
+            std::thread::sleep(Duration::from_millis(2));
+            Some(b"x".to_vec())
+        });
+        assert!(!buf.is_empty());
+        assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    /// A pipe holding `input`, its write end closed when `close` is set.
+    #[cfg(unix)]
+    struct Pipe {
+        read: libc::c_int,
+        write: Option<libc::c_int>,
+    }
+
+    #[cfg(unix)]
+    impl Pipe {
+        fn new(input: &[u8], close: bool) -> Pipe {
+            let mut fds = [0; 2];
+            // SAFETY: pipe writes two descriptors into fds.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: writes input.len() bytes from input; a pipe buffer
+            // holds far more than these tests send.
+            let n = unsafe { libc::write(fds[1], input.as_ptr().cast(), input.len()) };
+            assert_eq!(n, input.len() as isize);
+            let mut pipe = Pipe {
+                read: fds[0],
+                write: Some(fds[1]),
+            };
+            if close {
+                pipe.close_write();
+            }
+            pipe
+        }
+
+        fn close_write(&mut self) {
+            if let Some(fd) = self.write.take() {
+                // SAFETY: fd is open and owned by this pipe.
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            self.close_write();
+            // SAFETY: the read end is open and owned by this pipe.
+            unsafe { libc::close(self.read) };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_chunk_reads_what_is_waiting_in_pieces() {
+        let input: Vec<u8> = (0..300).map(|i| i as u8).collect();
+        let pipe = Pipe::new(&input, true);
+        let first = read_chunk(pipe.read, REPLY_TIMEOUT).unwrap();
+        assert_eq!(first, input[..256]);
+        let second = read_chunk(pipe.read, REPLY_TIMEOUT).unwrap();
+        assert_eq!(second, input[256..]);
+        // The write end is closed: the input has ended.
+        assert_eq!(read_chunk(pipe.read, REPLY_TIMEOUT), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_chunk_gives_up_when_nothing_comes() {
+        let pipe = Pipe::new(b"", false);
+        assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exchange_sends_the_queries_on_the_alternate_screen() {
+        let reply = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[6;34;17t\x1b_Gi=31;OK\x1b\\\x1b[?62;22c";
+        // Left open, so only the DA1 reply can end the wait in time.
+        let pipe = Pipe::new(reply, false);
+        let mut out = Vec::new();
+        let start = Instant::now();
+        assert_eq!(exchange(&mut out, pipe.read), reply);
+        assert!(start.elapsed() < REPLY_TIMEOUT);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\x1b[?1049h{}\x1b[?1049l", queries())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exchange_gives_up_on_a_silent_terminal() {
+        let pipe = Pipe::new(b"", false);
+        let mut out = Vec::new();
+        let start = Instant::now();
+        assert!(exchange(&mut out, pipe.read).is_empty());
+        assert!(start.elapsed() >= REPLY_TIMEOUT);
+        assert!(out.ends_with(b"\x1b[?1049l"));
+    }
+
+    /// A writer that fails every write.
+    #[cfg(unix)]
+    struct Broken;
+
+    #[cfg(unix)]
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exchange_reads_nothing_when_the_queries_cannot_be_sent() {
+        // The replies would be there, but no query went out to ask for them.
+        let pipe = Pipe::new(b"\x1b[?62c", true);
+        assert!(exchange(&mut Broken, pipe.read).is_empty());
+        assert_eq!(
+            read_chunk(pipe.read, REPLY_TIMEOUT).as_deref(),
+            Some(&b"\x1b[?62c"[..])
+        );
+    }
 }

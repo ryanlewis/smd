@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -49,6 +50,9 @@ pub struct View {
     notice: Option<String>,
     /// The selected link, as an index into the layout's links.
     selected: Option<usize>,
+    /// Other notes, with their image directories, whose images are kept so
+    /// they show at once when the reader goes back to them.
+    kept: Vec<(Rc<Document>, PathBuf)>,
 }
 
 /// What an action asks of the browser around the view.
@@ -106,6 +110,7 @@ impl View {
             scroll: 0,
             notice: None,
             selected: None,
+            kept: Vec::new(),
         };
         view.want_images();
         view
@@ -148,6 +153,9 @@ impl View {
     fn want_images(&mut self) {
         let mut wanted = Vec::new();
         images::wanted_in(&self.doc.blocks, &self.base, &mut wanted);
+        for (doc, base) in &self.kept {
+            images::wanted_in(&doc.blocks, base, &mut wanted);
+        }
         self.images.want(wanted);
     }
 
@@ -481,6 +489,7 @@ pub fn folder(path: &Path) -> PathBuf {
 /// A note left by following a link, to come back to.
 struct Visited {
     path: PathBuf,
+    doc: Rc<Document>,
     scroll: usize,
     selected: Option<usize>,
 }
@@ -630,6 +639,7 @@ impl Browser {
     fn here(&self) -> Visited {
         Visited {
             path: self.path.clone(),
+            doc: Rc::new(self.view.doc.clone()),
             scroll: self.view.scroll,
             selected: self.view.selected,
         }
@@ -714,6 +724,13 @@ impl Browser {
             self.vault = Vault::for_file(&path);
         }
         let doc = parse(&self.vault, &source, &path);
+        // Keep the images of the nearest notes Back and Forward lead to, and
+        // of the one being left, which is about to join them.
+        let back = self.history.iter().rev().take(KEEP_IMAGES_OF);
+        let notes = back.chain(self.ahead.iter().rev().take(KEEP_IMAGES_OF));
+        let mut kept: Vec<_> = notes.map(|v| (v.doc.clone(), folder(&v.path))).collect();
+        kept.push((Rc::new(self.view.doc.clone()), folder(&self.path)));
+        self.view.kept = kept;
         self.view.show(doc, folder(&path));
         self.view.set_notice(None);
         self.watcher = watcher;
@@ -775,6 +792,9 @@ fn open_with_system(target: &str) -> io::Result<()> {
 /// The toolbar's buttons, as drawn from its left edge.
 const BACK_BUTTON: &str = " ← Back ";
 const FORWARD_BUTTON: &str = " Forward → ";
+
+/// How many notes each way along Back and Forward keep their images.
+const KEEP_IMAGES_OF: usize = 8;
 
 /// How far one step of the mouse wheel scrolls.
 const WHEEL_LINES: isize = 3;
@@ -1778,6 +1798,54 @@ mod tests {
         let (mut b, dir) = handing_on("hand-ignore", WebLinks::Ignore);
         b.hand_on("https://example.com/");
         assert_eq!(b.view.notice, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A browser that read `HOME.md`, with an image above a link to
+    /// `Other.md`, waited for the image, scrolled below it and followed the
+    /// link. Also the scroll it left `HOME.md` at.
+    fn gone_past_an_image(name: &str) -> (Browser, PathBuf, usize) {
+        use crate::images::tests::png;
+        let home = format!("![a](a.png)\n\n{0}[[Other]]\n\n{0}", paragraphs(6));
+        let (mut b, dir) = loaded(name, &[("HOME.md", "one\n"), ("Other.md", "other\n")]);
+        std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
+        std::fs::write(dir.join("HOME.md"), &home).unwrap();
+        assert!(b.open(dir.join("HOME.md")));
+        let (result, _, _) = run_script(&mut b, vec![Step::Drawn, quit()]);
+        assert!(result.is_ok());
+        // Below the image, with the link in view.
+        b.view.scroll_by(16);
+        let scroll = b.view.scroll;
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("Other.md"));
+        (b, dir, scroll)
+    }
+
+    #[test]
+    fn back_lands_where_the_reader_was_below_an_image() {
+        let (mut b, dir, scroll) = gone_past_an_image("back-scroll");
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        // Waits for the image, in case it has to be made again: the scroll
+        // must not move when it arrives.
+        let key = images::key(&b.view.doc.blocks[0]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while b.view.images.ready(&key).is_none() {
+            assert!(Instant::now() < deadline, "image not ready");
+            std::thread::sleep(Duration::from_millis(1));
+            b.view.receive_images();
+        }
+        assert_eq!(b.view.scroll, scroll);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_shows_the_images_at_once() {
+        let (mut b, dir, _) = gone_past_an_image("back-images");
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        assert_eq!(b.view.layout.placements().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

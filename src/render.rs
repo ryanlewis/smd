@@ -445,54 +445,84 @@ enum Unit {
 /// The content as units, and the links in it. Text next to text with the
 /// same link is one link, even when its style changes inside it.
 fn units(content: &[Inline], base: Style) -> (Vec<Unit>, Vec<Link>) {
-    let mut units = Vec::new();
-    let mut links: Vec<Link> = Vec::new();
-    let mut word: Vec<Segment> = Vec::new();
-    // The link the last inline was part of.
-    let mut open: Option<usize> = None;
+    let mut units = Units::default();
     for inline in content {
-        let (text, code, style, link) = match inline {
-            Inline::Text { text, style } => {
-                (text, style.code, inline_style(base, style), &style.link)
-            }
-            Inline::Break => {
-                if !word.is_empty() {
-                    units.push(Unit::Word(std::mem::take(&mut word)));
-                }
-                units.push(Unit::Break);
-                open = None;
-                continue;
-            }
-        };
-        open = match link {
-            Some(link) if open.is_some_and(|i| links[i] == *link) => open,
-            Some(link) => {
-                links.push(link.clone());
-                Some(links.len() - 1)
-            }
-            None => None,
-        };
+        match inline {
+            Inline::Text { text, style } => units.text(text, style, base),
+            Inline::Break => units.hard_break(),
+        }
+    }
+    units.finish()
+}
+
+/// Inline content turned into units so far.
+#[derive(Default)]
+struct Units {
+    units: Vec<Unit>,
+    links: Vec<Link>,
+    /// The word being built.
+    word: Vec<Segment>,
+    /// The link the last inline was part of.
+    open: Option<usize>,
+}
+
+impl Units {
+    fn text(&mut self, text: &str, inline: &InlineStyle, base: Style) {
+        let style = inline_style(base, inline);
+        self.open = self.link(inline.link.as_ref());
         for c in text.chars() {
             // Code keeps its spaces and is not broken at them.
-            if c.is_whitespace() && !code {
-                if !word.is_empty() {
-                    units.push(Unit::Word(std::mem::take(&mut word)));
-                }
-                if !matches!(units.last(), Some(Unit::Space(..))) {
-                    units.push(Unit::Space(style, open));
-                }
+            if c.is_whitespace() && !inline.code {
+                self.space(style);
             } else {
-                match word.last_mut() {
-                    Some((s, st, l)) if *st == style && *l == open => s.push(c),
-                    _ => word.push((c.to_string(), style, open)),
-                }
+                self.push(c, style);
             }
         }
     }
-    if !word.is_empty() {
-        units.push(Unit::Word(word));
+
+    /// The index of `link` in the links: the open one when it is the same,
+    /// otherwise a new one.
+    fn link(&mut self, link: Option<&Link>) -> Option<usize> {
+        let link = link?;
+        if self.open.is_some_and(|i| self.links[i] == *link) {
+            return self.open;
+        }
+        self.links.push(link.clone());
+        Some(self.links.len() - 1)
     }
-    (units, links)
+
+    /// End the word, and add a space unless one is already there.
+    fn space(&mut self, style: Style) {
+        self.end_word();
+        if !matches!(self.units.last(), Some(Unit::Space(..))) {
+            self.units.push(Unit::Space(style, self.open));
+        }
+    }
+
+    /// Add `c` to the word, in the last segment when its style and link match.
+    fn push(&mut self, c: char, style: Style) {
+        match self.word.last_mut() {
+            Some((s, st, l)) if *st == style && *l == self.open => s.push(c),
+            _ => self.word.push((c.to_string(), style, self.open)),
+        }
+    }
+
+    fn hard_break(&mut self) {
+        self.end_word();
+        self.units.push(Unit::Break);
+        self.open = None;
+    }
+
+    fn end_word(&mut self) {
+        if !self.word.is_empty() {
+            self.units.push(Unit::Word(std::mem::take(&mut self.word)));
+        }
+    }
+
+    fn finish(mut self) -> (Vec<Unit>, Vec<Link>) {
+        self.end_word();
+        (self.units, self.links)
+    }
 }
 
 /// Fill lines greedily with inline content, breaking at spaces. Returns
@@ -514,6 +544,8 @@ fn wrap(
         })
         .collect();
     let mut lines = Lines::new(width, first, rest, out);
+    // The space before the next word, held back until it is known whether
+    // the word fits on the line after it.
     let mut space: Option<(Style, Option<usize>)> = None;
     for unit in units {
         match unit {
@@ -526,29 +558,7 @@ fn wrap(
                     space = Some((style, link));
                 }
             }
-            Unit::Word(segments) => {
-                let word_width: usize = segments.iter().map(|(s, ..)| s.width()).sum();
-                if let Some((style, link)) = space.take() {
-                    if lines.used + 1 + word_width > lines.avail() {
-                        lines.finish();
-                    } else {
-                        lines.push_link(" ", style, link, &mut spots);
-                    }
-                }
-                let breaking = word_width > lines.avail();
-                for (s, style, link) in &segments {
-                    if breaking {
-                        // Longer than a whole line: break it anywhere.
-                        let mut buf = [0; 4];
-                        for c in s.chars() {
-                            lines.break_before(c.width().unwrap_or(0));
-                            lines.push_link(c.encode_utf8(&mut buf), *style, *link, &mut spots);
-                        }
-                    } else {
-                        lines.push_link(s, *style, *link, &mut spots);
-                    }
-                }
-            }
+            Unit::Word(segments) => lines.word(&segments, space.take(), &mut spots),
         }
     }
     lines.finish_last();
@@ -672,6 +682,36 @@ impl<'a> Lines<'a> {
         match spot.cells.last_mut() {
             Some((r, cols)) if *r == row && cols.end == start => cols.end = end,
             _ => spot.cells.push((row, start..end)),
+        }
+    }
+
+    /// Push a word, after `space` when it fits on the line after it and on a
+    /// new line when not. A word longer than a whole line is broken anywhere.
+    fn word(
+        &mut self,
+        segments: &[Segment],
+        space: Option<(Style, Option<usize>)>,
+        spots: &mut [LinkSpot],
+    ) {
+        let width: usize = segments.iter().map(|(s, ..)| s.width()).sum();
+        if let Some((style, link)) = space {
+            if self.used + 1 + width > self.avail() {
+                self.finish();
+            } else {
+                self.push_link(" ", style, link, spots);
+            }
+        }
+        let breaking = width > self.avail();
+        for (s, style, link) in segments {
+            if breaking {
+                let mut buf = [0; 4];
+                for c in s.chars() {
+                    self.break_before(c.width().unwrap_or(0));
+                    self.push_link(c.encode_utf8(&mut buf), *style, *link, spots);
+                }
+            } else {
+                self.push_link(s, *style, *link, spots);
+            }
         }
     }
 
@@ -946,6 +986,117 @@ mod tests {
     #[test]
     fn inline_code_keeps_its_spaces() {
         assert_eq!(plain("run `a  b c` now\n", 8), vec!["run", "a  b c", "now"]);
+    }
+
+    type Cells = Vec<(usize, Range<u16>)>;
+
+    /// Each link in the layout as its destination and the cells it takes.
+    fn spots(md: &str, width: u16) -> Vec<(String, Cells)> {
+        render(&parse(md), width, &no_images())
+            .links
+            .into_iter()
+            .map(|l| (l.link.dest, l.cells))
+            .collect()
+    }
+
+    fn styled_md(md: &str, width: u16) -> Vec<String> {
+        styled(&render(&parse(md), width, &no_images()).lines)
+    }
+
+    #[test]
+    fn a_hard_break_ends_the_line_and_drops_the_space_before_it() {
+        assert_eq!(plain("one  \ntwo three\n", 20), vec!["one", "two three"]);
+        assert_eq!(plain("ab\\\ncd\n", 20), vec!["ab", "cd"]);
+        assert_eq!(plain("a  \n  \nb\n", 20), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn a_hard_break_inside_a_link_splits_it_in_two() {
+        assert_eq!(
+            spots("[one  \ntwo](x)\n", 20),
+            vec![
+                ("x".to_string(), vec![(0, 0..3)]),
+                ("x".to_string(), vec![(1, 0..3)])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_is_one_link_across_style_changes_and_spaces() {
+        assert_eq!(
+            spots("go [a **b** c](x) now\n", 20),
+            vec![("x".to_string(), vec![(0, 3..8)])]
+        );
+        assert_eq!(
+            styled_md("go [a **b** c](x) now\n", 20),
+            vec![
+                "[go |][a |fg=Blue,UNDERLINED][b|fg=Blue,BOLD | UNDERLINED][ c|fg=Blue,UNDERLINED][ now|]"
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbouring_links_merge_only_when_they_are_the_same() {
+        assert_eq!(
+            spots("[a](x)[b](x) [c](y)[d](z)\n", 20),
+            vec![
+                ("x".to_string(), vec![(0, 0..2)]),
+                ("y".to_string(), vec![(0, 3..4)]),
+                ("z".to_string(), vec![(0, 4..5)])
+            ]
+        );
+        // The same link again after other text is a second link.
+        assert_eq!(
+            spots("[a](x) b [c](x)\n", 20),
+            vec![
+                ("x".to_string(), vec![(0, 0..1)]),
+                ("x".to_string(), vec![(0, 4..5)])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_link_takes_cells_on_each_line_without_the_broken_space() {
+        assert_eq!(
+            spots("see [one two three](x)\n", 9),
+            vec![("x".to_string(), vec![(0, 4..7), (1, 0..9)])]
+        );
+        assert_eq!(
+            spots("- [abcdefgh](x)\n", 6),
+            vec![("x".to_string(), vec![(0, 2..6), (1, 2..6)])]
+        );
+    }
+
+    #[test]
+    fn a_style_change_inside_a_word_does_not_break_it() {
+        assert_eq!(plain("xx a**b**c\n", 4), vec!["xx", "abc"]);
+        assert_eq!(styled_md("a**b**c\n", 4), vec!["[a|][b|BOLD][c|]"]);
+    }
+
+    #[test]
+    fn runs_of_space_become_one_space_in_the_first_style() {
+        assert_eq!(
+            styled_md("a\n*b* **c** d\n", 20),
+            vec!["[a |][b|ITALIC][ |][c|BOLD][ d|]"]
+        );
+        // A space ending a link and the one after it: the link keeps it.
+        assert_eq!(
+            styled_md("[a ](x)  b\n", 20),
+            vec!["[a |fg=Blue,UNDERLINED][b|]"]
+        );
+        assert_eq!(
+            spots("[a ](x)  b\n", 20),
+            vec![("x".to_string(), vec![(0, 0..2)])]
+        );
+    }
+
+    #[test]
+    fn code_spans_keep_their_spaces_in_links_too() {
+        assert_eq!(
+            spots("x [`a  b`](y) z\n", 20),
+            vec![("y".to_string(), vec![(0, 2..6)])]
+        );
+        assert_eq!(plain("x `a  b` z\n", 5), vec!["x", "a  b", "z"]);
     }
 
     #[test]

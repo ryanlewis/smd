@@ -71,13 +71,13 @@ A heading with a character none of the fonts has, or an emoji that needs shaping
 smd [--no-graphics] [FILE]
 ```
 
-With no file, smd opens the `home` note from the config. `smd --help` lists the options and keys.
+With no file, smd opens the `home` note from the config. `smd --help` lists the options and the main keys.
 
 ### Keys
 
 | Key | Action |
 | --- | --- |
-| `j`, `k`, arrow keys | Scroll a line |
+| `j`, `k`, Up, Down | Scroll a line |
 | Space, PgDn, PgUp, Ctrl-F, Ctrl-B | Scroll a page |
 | Ctrl-D, Ctrl-U | Scroll half a page |
 | `g`, `G`, Home, End | Go to the top or bottom |

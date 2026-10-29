@@ -393,6 +393,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn mmdc_that_cannot_start_or_fails_silently_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("cannot");
+        // Not executable, so it is found but cannot be run.
+        let plain = dir.join("plain-mmdc");
+        std::fs::write(&plain, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Fails with nothing on stderr.
+        let quiet = dir.join("quiet-mmdc");
+        std::fs::write(&quiet, "#!/bin/sh\ncat >/dev/null\nexit 3\n").unwrap();
+        std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let timeout = Duration::from_secs(10);
+        let cannot = run(plain.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
+        let failed = run(quiet.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
+        let _ = std::fs::remove_dir_all(&dir);
+        let cannot = cannot.unwrap_err();
+        assert!(
+            cannot.starts_with("mermaid: cannot run mmdc: ") && cannot.contains("ermission denied"),
+            "{cannot}"
+        );
+        assert_eq!(failed, Err("mermaid: mmdc failed (exit status: 3)".into()));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_timeout_stops_the_whole_process_group() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("timeout");

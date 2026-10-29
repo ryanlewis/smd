@@ -11,7 +11,18 @@ demo=$repo/docs/demo
 images=$repo/docs/images
 smd=$repo/target/release/smd
 work=$(mktemp -d)
-trap 'rm -rf $work' EXIT
+
+# On any exit, stop a capture still running and close the Ghostty this run
+# opened (found by its config path, which no other process uses). zsh skips
+# the EXIT trap when set -e stops the script inside a function, so a failed
+# command also cleans up through ZERR.
+cleanup() {
+  [[ -n $cap ]] && kill $cap 2>/dev/null
+  pkill -f "config-file=$work/ghostty.conf" 2>/dev/null || true
+  rm -rf $work
+}
+trap cleanup EXIT
+trap 'cleanup; exit 1' ZERR
 
 [[ -x $smd ]] || { echo "build smd first: cargo build --release" >&2; exit 1; }
 mkdir -p $images
@@ -81,7 +92,7 @@ video() {
   open_window
   local mov=$work/demo.mov
   screencapture -x -V 30 -R $x,$y,$w,$h $mov &
-  local cap=$!
+  cap=$!
   # screencapture takes a few seconds to start; the still lead-in is trimmed.
   sleep 9
   for burst in 1 2 3 4; do
@@ -98,11 +109,16 @@ video() {
   $work/click $((x + 45)) $((y + 51)) # the toolbar's Back button
   sleep 3
   wait $cap
+  cap=
   close_window
 
   # Start 2 seconds before the first scroll.
   local scroll=$(ffmpeg -hide_banner -i $mov -vf freezedetect=n=0.003:d=1 -map 0:v -f null - 2>&1 |
     grep -o 'freeze_end: [0-9.]*' | head -1 | cut -d' ' -f2)
+  if [[ -z $scroll ]]; then
+    echo "warning: found no still lead-in to trim; the GIF starts at the beginning of the capture" >&2
+    scroll=0
+  fi
   local start=$(( scroll > 2 ? scroll - 2 : 0 ))
   ffmpeg -loglevel error -y -ss $start -i $mov -filter_complex \
     "fps=12,$crop,scale=1000:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=256:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \

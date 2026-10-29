@@ -10,6 +10,8 @@ repository = "https://github.com/ryanlewis/smd"
 readme = "README.md"
 keywords = ["markdown", "terminal", "tui", "mermaid", "obsidian"]
 categories = ["command-line-utilities", "text-processing"]
+# The demo recordings and screenshots in docs/ stay out of the package.
+exclude = ["/docs", "/.github", "/renovate.json", "/.editorconfig"]
 
 [dependencies]
 ab_glyph = { version = "=0.2.32", default-features = false, features = ["std"] }

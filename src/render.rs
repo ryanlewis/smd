@@ -436,7 +436,7 @@ type Segment = (String, Style, Option<usize>);
 
 /// A unit of inline content for line breaking.
 enum Unit {
-    /// A run of non-space text, possibly in several styles.
+    /// A run of text with no space to break at, possibly in several styles.
     Word(Vec<Segment>),
     Space(Style, Option<usize>),
     Break,

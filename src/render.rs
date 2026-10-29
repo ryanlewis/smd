@@ -1118,6 +1118,11 @@ mod tests {
             vec![("y".to_string(), vec![(0, 2..3)])]
         );
         assert_eq!(spots("[ ](x) b\n", 20), vec![]);
+        // A no-break space is drawn, so its link stays.
+        assert_eq!(
+            spots("a [\u{a0}](x) b\n", 20),
+            vec![("x".to_string(), vec![(0, 2..3)])]
+        );
     }
 
     #[test]

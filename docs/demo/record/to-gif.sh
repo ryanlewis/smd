@@ -62,16 +62,19 @@ trim=()
 [[ -n $start ]] && trim+=(-ss $start)
 [[ -n $end ]] && trim+=(-to $end)
 
-# Smaller sizes and frame rates in turn until the GIF fits.
+# Lower frame rates, then fewer colours without dithering, then smaller sizes,
+# until the GIF fits: split panes need the width to stay readable.
 max=$(( max_mb * 1000000 ))
 tmp=$(mktemp -t smd-demo).gif
-for width fps in 1000 12  900 12  800 12  800 10  700 10  640 8; do
+for width fps colours in 1000 12 256  1000 10 256  1000 8 256  900 8 256  900 8 128  800 8 128  700 8 128  640 8 128; do
   (( width > cw )) && width=$cw
+  dither=bayer:bayer_scale=5
+  (( colours < 256 )) && dither=none
   ffmpeg -loglevel error -y $trim -i $video -filter_complex \
-    "fps=$fps,crop=$crop,scale=$width:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=256:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+    "fps=$fps,crop=$crop,scale=$width:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=${colours}:stats_mode=diff[p];[b][p]paletteuse=dither=${dither}:diff_mode=rectangle" \
     $tmp
   size=$(stat -f %z $tmp)
-  echo "${width}px wide at $fps fps: $size bytes"
+  echo "${width}px wide at $fps fps, $colours colours: $size bytes"
   (( size <= max )) && break
 done
 mv $tmp $out

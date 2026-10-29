@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::{Cell, CellDiffOption};
 use ratatui::crossterm::event::{
     self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -15,7 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::{DefaultTerminal, Frame, Terminal};
 
 use crate::config::{Action, Config, WebLinks};
 use crate::doc::{self, BlockKind, Document, Inline, Link};
@@ -498,6 +499,10 @@ pub struct Browser {
     ahead: Vec<Visited>,
     /// The notice on screen is about the last key, and goes at the next.
     passing: bool,
+    /// Where a copied link's OSC 52 sequence is written: the terminal.
+    clipboard: Box<dyn Write>,
+    /// What opens a link that is handed on.
+    opener: fn(&str) -> io::Result<()>,
 }
 
 impl Browser {
@@ -511,6 +516,8 @@ impl Browser {
             history: Vec::new(),
             ahead: Vec::new(),
             passing: false,
+            clipboard: Box::new(io::stdout()),
+            opener: open_with_system,
         }
     }
 
@@ -719,13 +726,13 @@ impl Browser {
     fn hand_on(&mut self, target: &str) {
         match self.config.web_links {
             WebLinks::Open => {
-                if let Err(err) = open_with_system(target) {
+                if let Err(err) = (self.opener)(target) {
                     self.say(format!("cannot open {target}: {err}"));
                 }
             }
             WebLinks::Copy => {
                 let osc = format!("\x1b]52;c;{}\x1b\\", kitty::base64(target.as_bytes()));
-                let mut out = io::stdout();
+                let out = &mut self.clipboard;
                 match out.write_all(osc.as_bytes()).and_then(|()| out.flush()) {
                     Ok(()) => self.say(format!("copied {target}")),
                     Err(err) => self.say(format!("cannot copy: {err}")),
@@ -780,13 +787,42 @@ pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 /// Run the browser until the reader quits, reloading the note when its file
 /// changes. Images are deleted from the terminal however it ends.
 pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<()> {
-    let result = run_browser(terminal, &mut browser);
+    let result = run_browser(terminal, &mut browser, &mut Live);
     let deleted = browser.view.images.delete_all(terminal.backend_mut());
     result.and(deleted)
 }
 
-fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Result<()> {
-    let mut last_check = Instant::now();
+/// Where the run loop gets the terminal's events and the time, so a test
+/// can stand in for both.
+trait Input {
+    fn now(&self) -> Instant;
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+/// The real terminal and clock.
+struct Live;
+
+impl Input for Live {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
+fn run_browser<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    browser: &mut Browser,
+    input: &mut impl Input,
+) -> io::Result<()> {
+    let mut last_check = input.now();
     let mut redraw = true;
     loop {
         if redraw {
@@ -794,10 +830,11 @@ fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Res
             browser.view.flush_images(terminal.backend_mut())?;
             redraw = false;
         }
-        if event::poll(CHECK_EVERY.saturating_sub(last_check.elapsed()))? {
+        let elapsed = input.now().saturating_duration_since(last_check);
+        if input.poll(CHECK_EVERY.saturating_sub(elapsed))? {
             // A resize needs no handling beyond the redraw.
             redraw = true;
-            match event::read()? {
+            match input.read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press && browser.key(key) => {
                     return Ok(());
                 }
@@ -805,8 +842,8 @@ fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Res
                 _ => {}
             }
         }
-        if last_check.elapsed() >= CHECK_EVERY {
-            last_check = Instant::now();
+        if input.now().saturating_duration_since(last_check) >= CHECK_EVERY {
+            last_check = input.now();
             if let Some(change) = browser.watcher.check() {
                 apply(&mut browser.view, &browser.path, &browser.vault, change);
                 redraw = true;

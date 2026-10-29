@@ -17,7 +17,9 @@ work=$(mktemp -d)
 # the EXIT trap when set -e stops the script inside a function, so a failed
 # command also cleans up through ZERR.
 cleanup() {
-  [[ -n $cap ]] && kill $cap 2>/dev/null
+  # Subshells inherit the ZERR trap; only the script itself cleans up.
+  if (( ZSH_SUBSHELL )); then return; fi
+  [[ -n $cap ]] && { kill $cap 2>/dev/null || true; }
   pkill -f "config-file=$work/ghostty.conf" 2>/dev/null || true
   rm -rf $work
 }
@@ -114,7 +116,7 @@ video() {
 
   # Start 2 seconds before the first scroll.
   local scroll=$(ffmpeg -hide_banner -i $mov -vf freezedetect=n=0.003:d=1 -map 0:v -f null - 2>&1 |
-    grep -o 'freeze_end: [0-9.]*' | head -1 | cut -d' ' -f2)
+    grep -o 'freeze_end: [0-9.]*' | head -1 | cut -d' ' -f2 || true)
   if [[ -z $scroll ]]; then
     echo "warning: found no still lead-in to trim; the GIF starts at the beginning of the capture" >&2
     scroll=0

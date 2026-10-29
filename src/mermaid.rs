@@ -296,6 +296,25 @@ mod tests {
         dir
     }
 
+    /// Write a script with file mode `mode` from a child process. Written
+    /// from this one, the write handle could be inherited by a process
+    /// another test is starting at that moment, and Linux refuses to run a
+    /// file while any process has it open for writing ("Text file busy").
+    #[cfg(unix)]
+    fn write_script(path: &Path, text: &str, mode: &str) {
+        let mut child = Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod \"$2\" \"$1\"", "sh"])
+            .arg(path)
+            .arg(mode)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(text.as_bytes()).unwrap();
+        drop(stdin);
+        assert!(child.wait().unwrap().success(), "{}", path.display());
+    }
+
     #[test]
     fn names_depend_on_source_and_theme_only() {
         let a = name("graph LR\n  A-->B\n", Theme::Dark);
@@ -365,7 +384,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_drawn_diagram_is_cached_and_a_failed_one_gives_its_error() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = scratch("run");
         // A stand-in for mmdc: fails like a parse error on "bad", echoes
         // "text", and otherwise prints a PNG.
@@ -375,8 +393,7 @@ mod tests {
             "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  bad) printf '\\nError: Parse error on line 2:\\nmore\\n' >&2; exit 1;;\n  text) printf text;;\n  *) cat '{}';;\nesac\n",
             dir.join("out.png").display()
         );
-        std::fs::write(&fake, script).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&fake, &script, "755");
         let program = fake.to_str().unwrap();
         let source = "graph LR\n  A-->B\n";
         let path = dir.join("cache").join("d.png");
@@ -394,16 +411,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mmdc_that_cannot_start_or_fails_silently_says_so() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = scratch("cannot");
         // Not executable, so it is found but cannot be run.
         let plain = dir.join("plain-mmdc");
-        std::fs::write(&plain, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_script(&plain, "#!/bin/sh\n", "644");
         // Fails with nothing on stderr.
         let quiet = dir.join("quiet-mmdc");
-        std::fs::write(&quiet, "#!/bin/sh\ncat >/dev/null\nexit 3\n").unwrap();
-        std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&quiet, "#!/bin/sh\ncat >/dev/null\nexit 3\n", "755");
         let timeout = Duration::from_secs(10);
         let cannot = run(plain.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
         let failed = run(quiet.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
@@ -419,7 +433,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_timeout_stops_the_whole_process_group() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = scratch("timeout");
         // A stand-in for mmdc that starts a child, as mmdc starts Chromium,
         // records its pid and sleeps.
@@ -428,8 +441,7 @@ mod tests {
             "#!/bin/sh\nsleep 300 &\necho $! > '{}'\nwait\n",
             dir.join("child.pid").display()
         );
-        std::fs::write(&fake, script).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&fake, &script, "755");
         let got = run(
             fake.to_str().unwrap(),
             "graph LR\n",

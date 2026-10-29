@@ -1318,8 +1318,8 @@ mod tests {
     #[test]
     fn file_urls_escape_what_a_url_cannot_hold() {
         assert_eq!(
-            file_url(Path::new("/n/betty (G3).md")),
-            "file:///n/betty%20%28G3%29.md"
+            file_url(Path::new("/n/my note (1).md")),
+            "file:///n/my%20note%20%281%29.md"
         );
     }
 

@@ -1,35 +1,111 @@
 # smd
 
-smd is a terminal markdown reader. It shows mermaid diagrams, maths and headings as images using the kitty graphics protocol, and keeps everything else as plain text you can select. It is at an early stage: for now it shows a markdown file as styled text, and diagrams and maths as their source.
+A terminal markdown reader that draws mermaid diagrams, maths and headings as images, and keeps the rest as text you can select.
 
-Tables are drawn as text. A table wider than the pane wraps its cells. A table with too many columns to wrap well is shown as one card per row, with a `Header: value` line for each cell.
+![smd showing a note with a mermaid diagram, maths and a table](docs/images/demo.gif)
 
-Code blocks are drawn on a panel a little lighter than the terminal's background (darker on a light one). If the terminal does not say what its background is, or with `--no-graphics`, they are drawn on `code_background` from the config, or indented if that is not set. Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours.
+## Features
 
-## Build
+- **Diagrams.** A ` ```mermaid ` code block is drawn as an image by [mermaid-cli](https://github.com/mermaid-js/mermaid-cli) (`mmdc`). Diagrams are cached on disk, so a file opens fast the second time.
+- **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image in pure Rust, with no TeX install. Inline maths stays as text.
+- **Headings.** Headings are drawn as images in a real font, larger for higher levels, including colour emoji.
+- **Images.** A paragraph that holds only a local PNG, GIF (first frame) or JPEG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder.
+- **Code blocks.** Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours, on a panel a little lighter than the background (darker on a light one).
+- **Tables.** A table wider than the pane wraps its cells. A table with too many columns to wrap well is shown as one card per row, with a `Header: value` line for each cell.
+- **Links and notes.** Follow links with the keyboard or the mouse, with a back and forward toolbar. Links to other notes open in smd, and Obsidian wiki links work.
+- **Live reload.** smd reloads the file when it changes on disk.
 
-You need a recent stable Rust toolchain.
+![A mermaid diagram drawn as an image](docs/images/diagram.png)
+
+![Maths drawn as an image](docs/images/maths.png)
+
+![A wide table wrapped to fit the pane](docs/images/table.png)
+
+## Terminal support
+
+Images, diagrams, maths and headings need a terminal that supports the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) with Unicode placeholders. smd has been tested in [Ghostty](https://ghostty.org) and Rex. Other terminals with Unicode-placeholder support should work but have not been tested.
+
+smd asks the terminal what it supports at start-up. In a terminal without kitty graphics, or with `--no-graphics`, images, diagrams and maths are shown as their markdown source, and headings as styled text. Everything else works the same.
+
+smd is developed on macOS, and its tests run on Linux.
+
+## Install
+
+You need Rust 1.99 or later.
 
 ```sh
-cargo build --release
+cargo install --git https://github.com/ryanlewis/smd --locked
+```
+
+Or build from source:
+
+```sh
+git clone https://github.com/ryanlewis/smd
+cd smd
+cargo build --release --locked
 ./target/release/smd notes.md
 ```
 
-Scroll with `j`/`k`, the arrow keys, PgUp/PgDn, Ctrl-D/Ctrl-U (half a page), Ctrl-F/Ctrl-B and `g`/`G`. Press `q` to quit. `smd --help` lists the options and keys.
+### Optional: mermaid-cli
 
-smd reloads the file when it changes on disk, including when an editor saves by renaming a new file over it. If the file is deleted, smd keeps showing the last version and says so on the bottom row.
+Diagrams need `mmdc` on your `PATH`:
 
-A paragraph that holds only a local PNG, GIF (first frame) or JPEG image, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder. This needs a terminal with kitty Unicode-placeholder support; it has been tested in Ghostty, directly and inside herdr. smd asks the terminal at start-up; in a terminal without kitty graphics, or with `--no-graphics`, images, diagrams and maths are shown as their markdown source.
+```sh
+npm install -g @mermaid-js/mermaid-cli
+```
 
-## Links and Obsidian notes
+Without it, each diagram is shown as its source, with a note saying `mmdc` was not found.
 
-Press Tab and Shift-Tab to move between links, Enter to follow one, Backspace (or `H`) to go back to where you were, and `L` to go forward again. The toolbar on the top row has Back and Forward buttons, dimmed when there is nowhere to go, and the name of the note. Following a link to another note opens it in smd. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
+### Fonts
 
-You can also click a link to follow it, and scroll with the mouse wheel. While smd has the mouse, dragging no longer selects text; most terminals let you select with Option (macOS) or Shift held. With `mouse = false` in the config, smd leaves the mouse to the terminal and marks links as terminal hyperlinks (OSC 8) instead, so the terminal opens them: a web link in the browser, and a note in whatever app opens `.md` files.
+smd does not bundle fonts. It draws headings with fonts from the system: a bold sans-serif font, a monospace font for inline code, and a colour emoji font.
+
+- macOS: Helvetica, Menlo and Apple Color Emoji, which come with the system.
+- Linux: DejaVu Sans or Liberation Sans, DejaVu Sans Mono or Liberation Mono, and Noto Color Emoji, from your distribution's packages.
+
+A heading with a character none of the fonts has, or an emoji that needs shaping (a flag, a skin tone, a joined family), is shown as text.
+
+## Usage
+
+```sh
+smd [--no-graphics] [FILE]
+```
+
+With no file, smd opens the `home` note from the config. `smd --help` lists the options and keys.
+
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `j`, `k`, arrow keys | Scroll a line |
+| Space, PgDn, PgUp, Ctrl-F, Ctrl-B | Scroll a page |
+| Ctrl-D, Ctrl-U | Scroll half a page |
+| `g`, `G`, Home, End | Go to the top or bottom |
+| Tab, Shift-Tab | Select the next or previous link |
+| Enter | Follow the selected link |
+| Backspace, `H`, Alt-Left | Go back |
+| `L`, Alt-Right | Go forward |
+| `q`, Esc, Ctrl-C | Quit |
+
+The keys can be changed in the [config](#config).
+
+### Mouse
+
+Click a link to follow it, click the toolbar's Back and Forward buttons, and scroll with the wheel. While smd has the mouse, dragging does not select text; most terminals let you select with Option (macOS) or Shift held.
+
+With `mouse = false` in the config, smd leaves the mouse to the terminal and marks links as terminal hyperlinks (OSC 8) instead, so the terminal opens them: a web link in the browser, and a note in whatever app opens `.md` files.
+
+### Links and Obsidian notes
+
+![Following a wiki link, with the back and forward toolbar](docs/images/links.png)
+
+The toolbar on the top row has Back and Forward buttons, dimmed when there is nowhere to go, and the name of the note. Following a link to another note opens it in smd. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
 
 Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]` and `[[#Heading]]`. smd finds the vault by looking up from the file for a folder with a `.obsidian` folder in it, and looks up a note by name anywhere in the vault, as Obsidian does. A note outside a vault looks in its own folder and the folders below it. An embedded image, `![[diagram.png]]`, is shown like any other image. An embedded note, `![[Note]]`, is shown as a link to it.
 
-Links inside tables and in headings drawn as images cannot be selected yet.
+### Reloading
+
+smd reloads the file when it changes on disk, including when an editor saves by renaming a new file over it. If the file is deleted, smd keeps showing the last version and says so on the bottom row.
 
 ## Config
 
@@ -57,6 +133,8 @@ next_link = ["tab", "n"]
 back = ["backspace", "h"]
 ```
 
+`code_background` is also used with `--no-graphics`.
+
 The actions and their default keys:
 
 | Action | Default keys |
@@ -71,3 +149,21 @@ The actions and their default keys:
 | `back`, `forward` | `backspace`, `H`, `alt-left`; `L`, `alt-right` |
 
 A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.
+
+## Limitations
+
+- Links inside tables and in headings drawn as images cannot be selected or clicked yet.
+- Only the first frame of a GIF is shown.
+- Only local images are shown; images from the web are not fetched.
+- Each mermaid diagram starts `mmdc`, which starts a browser, so the first open of a file with many diagrams is slow. Later opens use the cache.
+
+## Licence
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms.

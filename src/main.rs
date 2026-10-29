@@ -50,6 +50,39 @@ Keys:
 Click a link to follow it, and the toolbar's buttons to go back and forward.
 The keys can be changed in the config file; see the README.";
 
+/// The file to open: the one given, else the home note from the config.
+fn pick_file(given: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf, &'static str> {
+    given
+        .or(home)
+        .ok_or("no file given, and no `home` in ~/.config/smd/config.toml")
+}
+
+/// How the terminal and the config say things are drawn.
+#[derive(Debug, PartialEq)]
+struct Look {
+    /// Images are drawn for a dark background unless the terminal says
+    /// otherwise.
+    theme: theme::Theme,
+    /// Code blocks are shaded from it.
+    background: Option<theme::Rgb>,
+    /// Without a background, code blocks are drawn on the colour from the
+    /// config, or indented if it has none.
+    fallback_panel: Option<theme::Rgb>,
+    /// The size of a cell, if the terminal can show images.
+    cell: Option<(u16, u16)>,
+}
+
+impl Look {
+    fn new(probe: Option<kitty::Probe>, code_background: Option<theme::Rgb>) -> Look {
+        Look {
+            theme: probe.and_then(|p| p.theme).unwrap_or(theme::Theme::Dark),
+            background: probe.and_then(|p| p.background),
+            fallback_panel: code_background,
+            cell: probe.filter(|p| p.graphics).map(|p| p.cell),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let no_graphics = args.no_graphics;
@@ -60,14 +93,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // With no file, the home note from the config.
-    let Some(path) = args.file.or_else(|| config.home.clone()) else {
-        Args::command()
-            .error(
-                ErrorKind::MissingRequiredArgument,
-                "no file given, and no `home` in ~/.config/smd/config.toml",
-            )
-            .exit();
+    let path = match pick_file(args.file, config.home.clone()) {
+        Ok(path) => path,
+        Err(message) => Args::command()
+            .error(ErrorKind::MissingRequiredArgument, message)
+            .exit(),
     };
     let watcher = watch::Watcher::new(path.clone());
     let source = match std::fs::read_to_string(&path) {
@@ -80,22 +110,20 @@ fn main() -> ExitCode {
     let vault = vault::Vault::for_file(&path);
     // Asked before the terminal is set up, while nothing else reads its replies.
     let probe = (!no_graphics).then(kitty::probe);
-    // Images are drawn for a dark background unless the terminal says otherwise.
-    theme::set(probe.and_then(|p| p.theme).unwrap_or(theme::Theme::Dark));
-    // Code blocks are shaded from it. Without it they are drawn on the
-    // colour from the config, or indented if it has none.
-    if let Some(rgb) = probe.and_then(|p| p.background) {
+    let look = Look::new(probe, config.code_background);
+    theme::set(look.theme);
+    if let Some(rgb) = look.background {
         theme::set_background(rgb);
     }
-    if let Some(rgb) = config.code_background {
+    if let Some(rgb) = look.fallback_panel {
         theme::set_fallback_panel(rgb);
     }
-    let images = match probe {
-        Some(probe) if probe.graphics => {
-            heading::set_cell(probe.cell);
-            images::Images::new(probe.cell)
+    let images = match look.cell {
+        Some(cell) => {
+            heading::set_cell(cell);
+            images::Images::new(cell)
         }
-        _ => images::Images::text(),
+        None => images::Images::text(),
     };
 
     let mut terminal = match ratatui::try_init() {

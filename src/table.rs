@@ -2,12 +2,12 @@
 //! one with too many columns to wrap well is drawn as cards: a block of
 //! `Header: value` lines per row.
 
-use pulldown_cmark::{Alignment, Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{InlineStyle, Link, is_image};
+use crate::doc::{Embed, InlineStyle, Link, embed, is_wiki, link_dest};
 
 /// The longest word a column is widened to hold whole. A longer one, such as
 /// a URL, breaks.
@@ -445,9 +445,9 @@ impl Builder {
                 dest_url,
                 ..
             } => {
-                let wiki = matches!(link_type, LinkType::WikiLink { .. });
+                let wiki = is_wiki(link_type);
                 self.style.link = Some(Link {
-                    dest: link_dest(wiki, &dest_url).to_string(),
+                    dest: link_dest(&dest_url, wiki).to_string(),
                     wiki,
                 });
             }
@@ -458,17 +458,16 @@ impl Builder {
             } => {
                 // An embedded note is shown as a link to it, and an image as
                 // its alt text, as in a paragraph.
-                let wiki = matches!(link_type, LinkType::WikiLink { .. });
-                let dest = link_dest(wiki, &dest_url);
-                let note = wiki && !is_image(dest);
-                self.embeds.push(note);
-                if note {
-                    self.style.link = Some(Link {
-                        dest: dest.to_string(),
-                        wiki: true,
-                    });
-                } else {
-                    self.push(("[image: ".to_string(), self.style.clone()));
+                let wiki = is_wiki(link_type);
+                match embed(link_dest(&dest_url, wiki), wiki) {
+                    Embed::Note(link) => {
+                        self.embeds.push(true);
+                        self.style.link = Some(link);
+                    }
+                    Embed::Image(_) => {
+                        self.embeds.push(false);
+                        self.push(("[image: ".to_string(), self.style.clone()));
+                    }
                 }
             }
             _ => {}
@@ -545,16 +544,6 @@ impl Builder {
             aligns: self.aligns,
             rows: self.rows,
         }
-    }
-}
-
-/// Where a link or embed goes. In a table the pipe before a wiki link's
-/// alias is escaped, `\|`, and the backslash is left on the name.
-fn link_dest(wiki: bool, dest: &str) -> &str {
-    if wiki {
-        dest.strip_suffix('\\').unwrap_or(dest)
-    } else {
-        dest
     }
 }
 

@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
@@ -46,6 +46,9 @@ pub enum BlockKind {
     Image {
         src: String,
         alt: String,
+        /// An Obsidian embed, `![[name.png]]`, whose `src` is a name to look
+        /// up in the vault rather than a path.
+        wiki: bool,
     },
     /// A block the graphics layer will draw as an image. Until it does, the
     /// block is shown as its source text.
@@ -86,14 +89,42 @@ pub struct InlineStyle {
     pub strikethrough: bool,
     pub code: bool,
     pub math: bool,
-    pub link: Option<String>,
+    pub link: Option<Link>,
+}
+
+/// Where a link goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// The URL or path as written, or for a wiki link the note's name, which
+    /// may have a `#heading` after it.
+    pub dest: String,
+    /// An Obsidian wiki link, `[[name]]` or `[[name|text]]`.
+    pub wiki: bool,
+}
+
+impl From<&str> for Link {
+    fn from(dest: &str) -> Link {
+        Link {
+            dest: dest.to_string(),
+            wiki: false,
+        }
+    }
+}
+
+/// Whether `name` is an image file, by its extension.
+pub fn is_image(name: &str) -> bool {
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+    ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"]
+        .iter()
+        .any(|e| ext.eq_ignore_ascii_case(e))
 }
 
 pub fn parse(source: &str) -> Document {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_MATH;
+        | Options::ENABLE_MATH
+        | Options::ENABLE_WIKILINKS;
     let mut builder = Builder::new(source);
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
         builder.event(event, range);
@@ -107,11 +138,15 @@ struct Builder<'a> {
     emphasis: u32,
     strong: u32,
     strikethrough: u32,
-    links: Vec<String>,
+    links: Vec<Link>,
     in_table: bool,
-    /// The image being read and its alt text so far.
-    image: Option<(String, String)>,
+    /// The image being read: its source, alt text so far, and whether it is a
+    /// wiki embed.
+    image: Option<(String, String, bool)>,
     image_depth: u32,
+    /// For each image started and not yet ended, whether it was a wiki embed
+    /// of a note, read as a link instead.
+    embeds: Vec<bool>,
 }
 
 struct Frame {
@@ -125,7 +160,7 @@ struct Frame {
     /// Display maths and images (source, alt text) seen in `inlines`, and
     /// whether anything else was.
     display_math: Vec<String>,
-    images: Vec<(String, String)>,
+    images: Vec<(String, String, bool)>,
     other_inline: bool,
 }
 
@@ -182,9 +217,9 @@ fn paragraph_blocks(frame: &mut Frame, span: Range<usize>) -> Vec<Block> {
     let mut images = std::mem::take(&mut frame.images);
     let other = std::mem::replace(&mut frame.other_inline, false);
     if maths.is_empty() && images.len() == 1 && !other {
-        let (src, alt) = images.remove(0);
+        let (src, alt, wiki) = images.remove(0);
         return vec![Block {
-            kind: BlockKind::Image { src, alt },
+            kind: BlockKind::Image { src, alt, wiki },
             span,
         }];
     }
@@ -218,6 +253,7 @@ impl<'a> Builder<'a> {
             in_table: false,
             image: None,
             image_depth: 0,
+            embeds: Vec::new(),
         }
     }
 
@@ -360,11 +396,33 @@ impl<'a> Builder<'a> {
                 self.strikethrough += 1;
                 return;
             }
-            Tag::Link { dest_url, .. } => {
-                self.links.push(dest_url.to_string());
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                self.links.push(Link {
+                    dest: dest_url.to_string(),
+                    wiki: matches!(link_type, LinkType::WikiLink { .. }),
+                });
                 return;
             }
-            Tag::Image { dest_url, .. } => {
+            Tag::Image {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                let wiki = matches!(link_type, LinkType::WikiLink { .. });
+                // An embedded note is shown as a link to it.
+                let note = wiki && !is_image(&dest_url);
+                self.embeds.push(note);
+                if note {
+                    self.links.push(Link {
+                        dest: dest_url.to_string(),
+                        wiki,
+                    });
+                    return;
+                }
                 // A linked image stays inline so it keeps its link.
                 if !self.links.is_empty() {
                     self.top().other_inline = true;
@@ -372,7 +430,7 @@ impl<'a> Builder<'a> {
                 self.push_text("[image: ", self.style(), range);
                 self.image_depth += 1;
                 if self.image_depth == 1 {
-                    self.image = Some((dest_url.to_string(), String::new()));
+                    self.image = Some((dest_url.to_string(), String::new(), wiki));
                 }
                 return;
             }
@@ -399,6 +457,10 @@ impl<'a> Builder<'a> {
                 self.links.pop();
             }
             TagEnd::Image => {
+                if self.embeds.pop() == Some(true) {
+                    self.links.pop();
+                    return;
+                }
                 self.image_depth = self.image_depth.saturating_sub(1);
                 if self.image_depth == 0
                     && let Some(image) = self.image.take()
@@ -488,7 +550,7 @@ impl<'a> Builder<'a> {
 
     fn text(&mut self, text: &str, style: InlineStyle, range: Range<usize>) {
         // An image's alt text does not make its paragraph prose.
-        if let Some((_, alt)) = &mut self.image {
+        if let Some((_, alt, _)) = &mut self.image {
             alt.push_str(text);
         } else if !text.trim().is_empty() {
             self.top().other_inline = true;
@@ -818,7 +880,8 @@ mod tests {
             doc.blocks[0].kind,
             BlockKind::Image {
                 src: "cat.png".into(),
-                alt: "a big cat".into()
+                alt: "a big cat".into(),
+                wiki: false,
             }
         );
         assert_eq!(
@@ -832,7 +895,8 @@ mod tests {
             items[0].blocks[0].kind,
             BlockKind::Image {
                 src: "b.png".into(),
-                alt: "b".into()
+                alt: "b".into(),
+                wiki: false,
             }
         );
     }

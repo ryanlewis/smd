@@ -100,7 +100,7 @@ impl Table {
                     continue;
                 }
                 Event::Start(Tag::Link { dest_url, .. }) => {
-                    style.link = Some(dest_url.to_string());
+                    style.link = Some(dest_url.as_ref().into());
                     continue;
                 }
                 Event::End(TagEnd::Link) => {

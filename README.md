@@ -20,3 +20,44 @@ Scroll with `j`/`k`, the arrow keys, PgUp/PgDn, Ctrl-D/Ctrl-U (half a page), Ctr
 smd reloads the file when it changes on disk, including when an editor saves by renaming a new file over it. If the file is deleted, smd keeps showing the last version and says so on the bottom row.
 
 A paragraph that holds only a local PNG, GIF (first frame) or JPEG image, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder. This needs a terminal with kitty Unicode-placeholder support; it has been tested in Ghostty, directly and inside herdr. smd asks the terminal at start-up; in a terminal without kitty graphics, or with `--no-graphics`, images, diagrams and maths are shown as their markdown source.
+
+## Links and Obsidian notes
+
+Press Tab and Shift-Tab to move between links, Enter to follow one, and Backspace to go back to where you were. Following a link to another note opens it in smd. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
+
+Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]` and `[[#Heading]]`. smd finds the vault by looking up from the file for a folder with a `.obsidian` folder in it, and looks up a note by name anywhere in the vault, as Obsidian does. A note outside a vault looks in its own folder and the folders below it. An embedded image, `![[diagram.png]]`, is shown like any other image. An embedded note, `![[Note]]`, is shown as a link to it.
+
+Links inside tables and in headings drawn as images cannot be selected yet.
+
+## Config
+
+smd reads `~/.config/smd/config.toml` (or `$XDG_CONFIG_HOME/smd/config.toml`) if there is one. Every setting is optional:
+
+```toml
+# Opened when smd is run with no file, so `smd` alone opens your notes.
+home = "~/notes/HOME.md"
+
+# What following a web link does: "open" (the default), "copy" to copy it
+# to the clipboard through the terminal, or "ignore".
+web_links = "open"
+
+# Keys for each action. Naming an action replaces its default keys.
+[keys]
+next_link = ["tab", "n"]
+back = ["backspace", "h"]
+```
+
+The actions and their default keys:
+
+| Action | Default keys |
+| --- | --- |
+| `quit` | `q`, `esc`, `ctrl-c` |
+| `down`, `up` | `j`, `down`; `k`, `up` |
+| `half_down`, `half_up` | `ctrl-d`; `ctrl-u` |
+| `page_down`, `page_up` | `space`, `pagedown`, `ctrl-f`; `pageup`, `ctrl-b` |
+| `top`, `bottom` | `g`, `home`; `G`, `end` |
+| `next_link`, `prev_link` | `tab`; `shift-tab` |
+| `follow` | `enter` |
+| `back` | `backspace` |
+
+A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.

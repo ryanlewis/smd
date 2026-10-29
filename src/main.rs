@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod doc;
 mod heading;
 mod highlight;
@@ -10,12 +11,13 @@ mod raster;
 mod render;
 mod table;
 mod theme;
+mod vault;
 mod watch;
 
 use std::ffi::OsString;
 use std::io;
 use std::panic;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,23 +40,32 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let no_graphics = take_flag(&mut args, "--no-graphics");
-    let [path] = args.as_slice() else {
-        eprintln!("usage: smd [--no-graphics] <file.md>");
-        return ExitCode::from(2);
+    let config = match config::Config::load() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("smd: {err}");
+            return ExitCode::from(2);
+        }
     };
-    let watcher = watch::Watcher::new(path.into());
-    let source = match std::fs::read_to_string(path) {
+    // With no file, the home note from the config.
+    let path: PathBuf = match (args.as_slice(), &config.home) {
+        ([path], _) => path.into(),
+        ([], Some(home)) => home.clone(),
+        _ => {
+            eprintln!("usage: smd [--no-graphics] [<file.md>]");
+            eprintln!("With no file, smd opens `home` from ~/.config/smd/config.toml.");
+            return ExitCode::from(2);
+        }
+    };
+    let watcher = watch::Watcher::new(path.clone());
+    let source = match std::fs::read_to_string(&path) {
         Ok(source) => source,
         Err(err) => {
-            eprintln!("smd: {}: {err}", Path::new(path).display());
+            eprintln!("smd: {}: {err}", path.display());
             return ExitCode::FAILURE;
         }
     };
-    // Relative image paths are read from the markdown file's directory.
-    let base = match Path::new(path).parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-        _ => ".".into(),
-    };
+    let vault = vault::Vault::for_file(&path);
     // Asked before the terminal is set up, while nothing else reads its replies.
     let probe = (!no_graphics).then(kitty::probe);
     // Images are drawn for a dark background unless the terminal says otherwise.
@@ -93,8 +104,11 @@ fn main() -> ExitCode {
     // Started once the hook is set, like the jobs below.
     highlight::load_in_background();
     // Made once the hook is set, as this starts the jobs.
-    let view = app::View::new(doc::parse(&source), base, images);
-    let result = app::run(&mut terminal, view, Path::new(path), watcher);
+    // Relative image paths are read from the markdown file's directory.
+    let doc = app::parse(&vault, &source, &path);
+    let view = app::View::new(doc, app::folder(&path), images);
+    let browser = app::Browser::new(view, path, watcher, vault, config);
+    let result = app::run(&mut terminal, browser);
     ratatui::restore();
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -2,12 +2,12 @@
 //! one with too many columns to wrap well is drawn as cards: a block of
 //! `Header: value` lines per row. See `docs/spike-tables.md`.
 
-use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, LinkType, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::InlineStyle;
+use crate::doc::{InlineStyle, Link};
 
 /// The longest word a column is widened to hold whole. A longer one, such as
 /// a URL, breaks.
@@ -42,7 +42,10 @@ pub struct Table {
 
 impl Table {
     pub fn parse(source: &str) -> Table {
-        let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_MATH
+            | Options::ENABLE_WIKILINKS;
         let mut aligns = Vec::new();
         let mut rows: Vec<Vec<Cell>> = Vec::new();
         let mut style = InlineStyle::default();
@@ -76,8 +79,15 @@ impl Table {
                     style.strikethrough = nest(&mut depth[2], &event);
                     continue;
                 }
-                Event::Start(Tag::Link { dest_url, .. }) => {
-                    style.link = Some(dest_url.to_string());
+                Event::Start(Tag::Link {
+                    link_type,
+                    dest_url,
+                    ..
+                }) => {
+                    style.link = Some(Link {
+                        dest: dest_url.to_string(),
+                        wiki: matches!(link_type, LinkType::WikiLink { .. }),
+                    });
                     continue;
                 }
                 Event::End(TagEnd::Link) => {

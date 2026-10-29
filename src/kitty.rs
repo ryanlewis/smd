@@ -76,7 +76,7 @@ pub fn delete(out: &mut impl Write, id: u32) -> io::Result<()> {
     write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
 }
 
-fn base64(data: &[u8]) -> String {
+pub fn base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

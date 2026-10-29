@@ -1,20 +1,25 @@
-//! The full-screen view: a scrollable window onto the laid-out document.
+//! The full-screen view: a scrollable window onto the laid-out document, and
+//! the browser that moves it from note to note along links.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::doc::{self, Document};
+use crate::config::{Action, Config, WebLinks};
+use crate::doc::{self, BlockKind, Document, Inline, Link};
 use crate::highlight;
 use crate::images::{self, Images};
+use crate::kitty;
 use crate::render::{Layout, render};
+use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
 
 /// How often to look at the file on disk. A change shows after two checks.
@@ -34,6 +39,16 @@ pub struct View {
     scroll: usize,
     /// A message shown on the bottom row, such as the file being deleted.
     notice: Option<String>,
+    /// The selected link, as an index into the layout's links.
+    selected: Option<usize>,
+}
+
+/// What an action asks of the browser around the view.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Go {
+    Quit,
+    Follow(Link),
+    Back,
 }
 
 /// The block at the top of the view, found again after the document is laid
@@ -81,9 +96,32 @@ impl View {
             height: 0,
             scroll: 0,
             notice: None,
+            selected: None,
         };
         view.want_images();
         view
+    }
+
+    /// Show another document, from the top, with images read from `base`.
+    pub fn show(&mut self, doc: Document, base: PathBuf) {
+        self.doc = doc;
+        self.base = base;
+        self.scroll = 0;
+        self.selected = None;
+        self.want_images();
+        self.relayout(None);
+    }
+
+    /// Scroll to the first heading matching `wanted`. Returns false when
+    /// there is none.
+    pub fn jump_to_heading(&mut self, wanted: &str) -> bool {
+        let Some(start) = heading_start(&self.doc.blocks, wanted) else {
+            return false;
+        };
+        if let Some(b) = self.layout.blocks.iter().find(|b| b.span.start == start) {
+            self.scroll = b.rows.start.min(self.max_scroll());
+        }
+        true
     }
 
     /// Show a new version of the document, keeping the block at the top of the
@@ -93,6 +131,7 @@ impl View {
         let anchor = self.anchor();
         let old = std::mem::replace(&mut self.doc, doc);
         let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
+        self.selected = None;
         self.want_images();
         self.relayout(anchor);
     }
@@ -112,6 +151,7 @@ impl View {
             }
         }
         self.scroll = self.scroll.min(self.max_scroll());
+        self.selected = self.selected.filter(|&i| i < self.layout.links.len());
     }
 
     /// What to keep at the top of the view. A view at the very top stays there.
@@ -187,6 +227,7 @@ impl View {
             self.layout = render(&self.doc, width, &self.images);
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
+            self.selected = self.selected.filter(|&i| i < self.layout.links.len());
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
@@ -218,42 +259,109 @@ impl View {
         let end = (self.scroll + area.height as usize).min(lines.len());
         let visible = Text::from(lines[self.scroll..end].to_vec());
         frame.render_widget(Paragraph::new(visible), area);
+        // The selected link is shown in reverse.
+        if let Some(spot) = self.selected.and_then(|i| self.layout.links.get(i)) {
+            let buf = frame.buffer_mut();
+            for (row, cols) in &spot.cells {
+                if (self.scroll..end).contains(row) && cols.start < area.width {
+                    let y = area.y + (row - self.scroll) as u16;
+                    let width = cols.end.min(area.width) - cols.start;
+                    let cells = Rect::new(area.x + cols.start, y, width, 1);
+                    buf.set_style(cells, Style::new().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
     }
 
-    /// Handle a key press. Returns true when the reader should quit.
-    pub fn key(&mut self, key: KeyEvent) -> bool {
+    /// Do what an action says. Returns what the browser must do, if anything.
+    pub fn act(&mut self, action: Action) -> Option<Go> {
         let page = (self.height as isize).max(1);
         let half = (page / 2).max(1);
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => return true,
-                KeyCode::Char('d') => self.scroll_by(half),
-                KeyCode::Char('u') => self.scroll_by(-half),
-                KeyCode::Char('f') => self.scroll_by(page),
-                KeyCode::Char('b') => self.scroll_by(-page),
-                _ => {}
+        match action {
+            Action::Quit => return Some(Go::Quit),
+            Action::Down => self.scroll_by(1),
+            Action::Up => self.scroll_by(-1),
+            Action::HalfDown => self.scroll_by(half),
+            Action::HalfUp => self.scroll_by(-half),
+            Action::PageDown => self.scroll_by(page),
+            Action::PageUp => self.scroll_by(-page),
+            Action::Top => self.scroll = 0,
+            Action::Bottom => self.scroll = self.max_scroll(),
+            Action::NextLink => self.select_link(true),
+            Action::PrevLink => self.select_link(false),
+            Action::Follow => {
+                let spot = self.selected.and_then(|i| self.layout.links.get(i))?;
+                return Some(Go::Follow(spot.link.clone()));
             }
-            return false;
+            Action::Back => return Some(Go::Back),
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(page),
-            KeyCode::PageUp => self.scroll_by(-page),
-            KeyCode::Char('g') | KeyCode::Home => self.scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => self.scroll = self.max_scroll(),
-            _ => {}
+        None
+    }
+
+    /// The rows in view.
+    fn in_view(&self) -> std::ops::Range<usize> {
+        self.scroll..self.scroll + self.height as usize
+    }
+
+    /// Select the next or previous link, going round at the ends. With no
+    /// link selected in view, start from the first or last one in view.
+    fn select_link(&mut self, forward: bool) {
+        let links = &self.layout.links;
+        let row = |i: usize| links[i].cells.first().map_or(0, |c| c.0);
+        let view = self.in_view();
+        let selected = self.selected.filter(|&i| view.contains(&row(i)));
+        let next = match (selected, forward) {
+            (Some(i), true) => Some((i + 1) % links.len()),
+            (Some(i), false) => Some((i + links.len() - 1) % links.len()),
+            (None, true) => (0..links.len())
+                .find(|&i| row(i) >= view.start)
+                .or((!links.is_empty()).then_some(0)),
+            (None, false) => (0..links.len())
+                .rev()
+                .find(|&i| row(i) < view.end)
+                .or(links.len().checked_sub(1)),
+        };
+        let Some(next) = next else {
+            return;
+        };
+        self.selected = Some(next);
+        // Bring it into view, a little way down the page when that moves it.
+        let row = row(next);
+        if !self.in_view().contains(&row) {
+            self.scroll = row
+                .saturating_sub(self.height as usize / 3)
+                .min(self.max_scroll());
         }
-        false
     }
 }
 
+/// Where the first heading matching `wanted` starts in the source, looking
+/// inside quotes and lists too.
+fn heading_start(blocks: &[doc::Block], wanted: &str) -> Option<usize> {
+    blocks.iter().find_map(|b| match &b.kind {
+        BlockKind::Heading { content, .. } => {
+            let text: String = content
+                .iter()
+                .map(|i| match i {
+                    Inline::Text { text, .. } => text.as_str(),
+                    Inline::Break => " ",
+                })
+                .collect();
+            vault::heading_matches(&text, wanted).then_some(b.span.start)
+        }
+        BlockKind::Quote(inner) => heading_start(inner, wanted),
+        BlockKind::List { items, .. } => items
+            .iter()
+            .find_map(|item| heading_start(&item.blocks, wanted)),
+        _ => None,
+    })
+}
+
 /// Apply what the watcher saw to the view.
-fn apply(view: &mut View, path: &Path, change: Change) {
+fn apply(view: &mut View, path: &Path, vault: &Vault, change: Change) {
     match change {
         Change::Changed(source) => {
-            view.reload(doc::parse(&source));
+            view.reload(parse(vault, &source, path));
             view.set_notice(None);
         }
         // The path goes last so a narrow pane cuts it rather than the message.
@@ -267,32 +375,201 @@ fn apply(view: &mut View, path: &Path, change: Change) {
     }
 }
 
-/// Run the view until the reader quits, reloading it when the watched file at
-/// `path` changes. Mouse capture stays off so the terminal's own selection
-/// keeps working. Images are deleted from the terminal however the view ends.
-pub fn run(
-    terminal: &mut DefaultTerminal,
-    mut view: View,
-    path: &Path,
+/// `source`, the note at `path`, parsed with its embedded images found.
+pub fn parse(vault: &Vault, source: &str, path: &Path) -> Document {
+    let mut doc = doc::parse(source);
+    vault.resolve_embeds(&mut doc.blocks, path);
+    doc
+}
+
+/// The folder a note's relative image paths are read from.
+pub fn folder(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => ".".into(),
+    }
+}
+
+/// A note left by following a link, to come back to.
+struct Visited {
+    path: PathBuf,
+    scroll: usize,
+    selected: Option<usize>,
+}
+
+/// The view and the note it shows, the way back, and what is needed to
+/// follow links from it.
+pub struct Browser {
+    view: View,
+    path: PathBuf,
     watcher: Watcher,
-) -> io::Result<()> {
-    let result = run_view(terminal, &mut view, path, watcher);
-    let deleted = view.images.delete_all(terminal.backend_mut());
+    vault: Vault,
+    config: Config,
+    history: Vec<Visited>,
+    /// The notice on screen is about the last key, and goes at the next.
+    passing: bool,
+}
+
+impl Browser {
+    pub fn new(view: View, path: PathBuf, watcher: Watcher, vault: Vault, config: Config) -> Self {
+        Browser {
+            view,
+            path,
+            watcher,
+            vault,
+            config,
+            history: Vec::new(),
+            passing: false,
+        }
+    }
+
+    /// Show a short message until the next key.
+    fn say(&mut self, notice: String) {
+        self.view.set_notice(Some(notice));
+        self.passing = true;
+    }
+
+    /// Handle a key press. Returns true when the reader should quit.
+    fn key(&mut self, key: event::KeyEvent) -> bool {
+        if std::mem::take(&mut self.passing) {
+            self.view.set_notice(None);
+        }
+        let Some(action) = self.config.action(key) else {
+            return false;
+        };
+        match self.view.act(action) {
+            Some(Go::Quit) => return true,
+            Some(Go::Follow(link)) => self.follow(&link),
+            Some(Go::Back) => self.back(),
+            None => {}
+        }
+        false
+    }
+
+    fn follow(&mut self, link: &Link) {
+        match self.vault.follow(link, &self.path) {
+            Target::Note { path, heading } if path == self.path => {
+                if let Some(h) = heading {
+                    self.jump(&h);
+                }
+            }
+            Target::Note { path, heading } => {
+                let here = Visited {
+                    path: self.path.clone(),
+                    scroll: self.view.scroll,
+                    selected: self.view.selected,
+                };
+                if self.open(path) {
+                    self.history.push(here);
+                    if let Some(h) = heading {
+                        self.jump(&h);
+                    }
+                }
+            }
+            Target::Heading(h) => self.jump(&h),
+            Target::Web(url) => self.hand_on(&url),
+            Target::Other(path) => self.hand_on(&path.to_string_lossy()),
+            Target::Missing(name) => self.say(format!("no note found: {name}")),
+        }
+    }
+
+    fn jump(&mut self, heading: &str) {
+        if !self.view.jump_to_heading(heading) {
+            self.say(format!("no heading found: {heading}"));
+        }
+    }
+
+    /// Go back to the note the last link was followed from, where it was.
+    fn back(&mut self) {
+        let Some(visited) = self.history.pop() else {
+            return;
+        };
+        if self.open(visited.path) {
+            self.view.scroll = visited.scroll.min(self.view.max_scroll());
+            self.view.selected = visited.selected;
+            self.view.relayout(None);
+        }
+    }
+
+    /// Show the note at `path`, watching it from now on. Returns false, with
+    /// a notice, when it cannot be read.
+    fn open(&mut self, path: PathBuf) -> bool {
+        // Made before the read, so a save in between is seen.
+        let watcher = Watcher::new(path.clone());
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(err) => {
+                self.say(format!("cannot read file: {err}: {}", path.display()));
+                return false;
+            }
+        };
+        if !self.vault.holds(&path) {
+            self.vault = Vault::for_file(&path);
+        }
+        let doc = parse(&self.vault, &source, &path);
+        self.view.show(doc, folder(&path));
+        self.view.set_notice(None);
+        self.watcher = watcher;
+        self.path = path;
+        true
+    }
+
+    /// Hand a web link, or a file smd does not show, to whatever the config
+    /// says.
+    fn hand_on(&mut self, target: &str) {
+        match self.config.web_links {
+            WebLinks::Open => {
+                if let Err(err) = open_with_system(target) {
+                    self.say(format!("cannot open {target}: {err}"));
+                }
+            }
+            WebLinks::Copy => {
+                let osc = format!("\x1b]52;c;{}\x1b\\", kitty::base64(target.as_bytes()));
+                let mut out = io::stdout();
+                match out.write_all(osc.as_bytes()).and_then(|()| out.flush()) {
+                    Ok(()) => self.say(format!("copied {target}")),
+                    Err(err) => self.say(format!("cannot copy: {err}")),
+                }
+            }
+            WebLinks::Ignore => {}
+        }
+    }
+}
+
+/// Open `target` with the system's opener, without waiting for it.
+fn open_with_system(target: &str) -> io::Result<()> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = Command::new(opener)
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Reaped in the background so it leaves no zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// Run the browser until the reader quits, reloading the note when its file
+/// changes. Mouse capture stays off so the terminal's own selection keeps
+/// working. Images are deleted from the terminal however it ends.
+pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<()> {
+    let result = run_browser(terminal, &mut browser);
+    let deleted = browser.view.images.delete_all(terminal.backend_mut());
     result.and(deleted)
 }
 
-fn run_view(
-    terminal: &mut DefaultTerminal,
-    view: &mut View,
-    path: &Path,
-    mut watcher: Watcher,
-) -> io::Result<()> {
+fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Result<()> {
     let mut last_check = Instant::now();
     let mut redraw = true;
     loop {
         if redraw {
-            terminal.draw(|frame| view.draw(frame))?;
-            view.flush_images(terminal.backend_mut())?;
+            terminal.draw(|frame| browser.view.draw(frame))?;
+            browser.view.flush_images(terminal.backend_mut())?;
             redraw = false;
         }
         if event::poll(CHECK_EVERY.saturating_sub(last_check.elapsed()))? {
@@ -300,17 +577,18 @@ fn run_view(
             redraw = true;
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
-                && view.key(key)
+                && browser.key(key)
             {
                 return Ok(());
             }
         }
         if last_check.elapsed() >= CHECK_EVERY {
             last_check = Instant::now();
-            if let Some(change) = watcher.check() {
-                apply(view, path, change);
+            if let Some(change) = browser.watcher.check() {
+                apply(&mut browser.view, &browser.path, &browser.vault, change);
                 redraw = true;
             }
+            let view = &mut browser.view;
             // Images are made on other threads; this is where they show up.
             if view.receive_images() {
                 redraw = true;
@@ -329,6 +607,15 @@ mod tests {
     use crate::doc::parse;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    impl View {
+        /// Act on a key with the default keys. Returns true for quit.
+        fn key(&mut self, key: KeyEvent) -> bool {
+            let action = Config::default().action(key);
+            action.and_then(|a| self.act(a)) == Some(Go::Quit)
+        }
+    }
 
     fn new_view(md: &str) -> View {
         View::new(parse(md), PathBuf::new(), Images::new((8, 16)))
@@ -620,17 +907,140 @@ mod tests {
         let mut v = new_view("one\n\ntwo\n");
         let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
         let path = Path::new("a.md");
-        apply(&mut v, path, Change::Deleted);
+        let vault = Vault::for_file(path);
+        let apply = |v: &mut View, change| apply(v, path, &vault, change);
+        apply(&mut v, Change::Deleted);
         terminal.draw(|f| v.draw(f)).unwrap();
         assert_eq!(v.height, 2);
         let buf = terminal.backend().buffer();
         let row: String = (0..8).map(|x| buf[(x, 2)].symbol()).collect();
         assert_eq!(row, "file del");
         assert_eq!(buf[(0, 0)].symbol(), "o");
-        apply(&mut v, path, Change::Changed("back\n".into()));
+        apply(&mut v, Change::Changed("back\n".into()));
         terminal.draw(|f| v.draw(f)).unwrap();
         terminal
             .backend()
             .assert_buffer_lines(["back    ", "        ", "        "]);
+    }
+
+    #[test]
+    fn tab_selects_links_in_view_and_enter_follows() {
+        let md = format!("[[a]] and [b](b.md)\n\n{}[[c|see c]]\n", paragraphs(10));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        let tab = |v: &mut View| v.act(Action::NextLink);
+        assert_eq!(v.act(Action::Follow), None);
+        tab(&mut v);
+        assert_eq!(
+            v.act(Action::Follow),
+            Some(Go::Follow(Link {
+                dest: "a".into(),
+                wiki: true
+            }))
+        );
+        tab(&mut v);
+        assert_eq!(v.act(Action::Follow), Some(Go::Follow("b.md".into())));
+        // The next one is off the page, so the view moves to it.
+        tab(&mut v);
+        assert_eq!(v.selected, Some(2));
+        assert!(v.in_view().contains(&v.layout.links[2].cells[0].0));
+        // Round to the first, and back again.
+        tab(&mut v);
+        assert_eq!(v.selected, Some(0));
+        v.act(Action::PrevLink);
+        assert_eq!(v.selected, Some(2));
+        // Scrolled away from the selection, Tab starts from the view.
+        v.act(Action::Top);
+        v.act(Action::Down);
+        v.act(Action::Down);
+        tab(&mut v);
+        assert_eq!(v.selected, Some(2));
+    }
+
+    #[test]
+    fn the_selected_link_is_drawn_in_reverse() {
+        let mut v = new_view("go [[far away]] now\n");
+        let mut terminal = Terminal::new(TestBackend::new(30, 2)).unwrap();
+        v.resize(30, 2);
+        v.act(Action::NextLink);
+        terminal.draw(|f| v.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let reversed: String = (0..30)
+            .filter(|&x| buf[(x, 0)].modifier.contains(Modifier::REVERSED))
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert_eq!(reversed, "far away");
+    }
+
+    #[test]
+    fn a_link_wrapped_over_two_lines_covers_both() {
+        let mut v = new_view("one two [[three four five]]\n");
+        v.resize(14, 5);
+        assert_eq!(v.layout.links[0].cells, vec![(0, 8..13), (1, 0..9)]);
+    }
+
+    #[test]
+    fn jump_to_a_heading() {
+        let md = format!("# Top\n\n{0}## Next steps\n\n{0}", paragraphs(10));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        assert!(v.jump_to_heading("next-steps"));
+        assert_eq!(top(&v), "Next steps");
+        assert!(!v.jump_to_heading("nowhere"));
+    }
+
+    /// A browser on `files` in a fresh vault, showing the first.
+    fn browser(name: &str, files: &[(&str, &str)]) -> (Browser, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("smd-browse-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        for (file, text) in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let path = dir.join(files[0].0);
+        let vault = Vault::for_file(&path);
+        let doc = super::parse(&vault, files[0].1, &path);
+        let mut view = View::new(doc, folder(&path), Images::new((8, 16)));
+        view.resize(30, 6);
+        let watcher = Watcher::new(path.clone());
+        (
+            Browser::new(view, path, watcher, vault, Config::default()),
+            dir,
+        )
+    }
+
+    fn enter(b: &mut Browser, code: KeyCode) {
+        b.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn following_links_and_coming_back() {
+        let home = format!("{}[[Plan#Later]] [[gone]]\n", paragraphs(6));
+        let plan = format!("# Plan\n\n{0}## Later\n\n{0}", paragraphs(8));
+        let (mut b, dir) = browser("follow", &[("HOME.md", &home), ("work/Plan.md", &plan)]);
+        b.view.act(Action::Bottom);
+        let scroll = b.view.scroll;
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("work/Plan.md"));
+        assert_eq!(top(&b.view), "Later");
+        // Back to where the link was, with it still selected.
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        assert_eq!(b.view.scroll, scroll);
+        assert_eq!(b.view.selected, Some(0));
+        // A link to nothing says so until the next key.
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.view.notice.as_deref(), Some("no note found: gone"));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        enter(&mut b, KeyCode::Char('j'));
+        assert_eq!(b.view.notice, None);
+        // Nothing to go back to.
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

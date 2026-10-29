@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle};
+use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle, Link};
 use crate::highlight::{self, Segments};
 use crate::images::{self, Images, Placement};
 use crate::kitty;
@@ -24,6 +24,16 @@ pub struct Layout {
     /// Where each block landed, in document order. A block that holds others
     /// comes before them.
     pub blocks: Vec<BlockRows>,
+    /// Every link drawn as text, in document order.
+    pub links: Vec<LinkSpot>,
+}
+
+/// A link and the cells its text takes, which may be on several lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkSpot {
+    pub link: Link,
+    /// The line and the columns on it, for each line the link is on.
+    pub cells: Vec<(usize, Range<u16>)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,10 +206,12 @@ fn contents(
     let out = &mut ctx.layout.lines;
     match &block.kind {
         BlockKind::Paragraph(content) => {
-            wrap(content, Style::default(), width, first, rest, out);
+            let links = wrap(content, Style::default(), width, first, rest, out);
+            ctx.layout.links.extend(links);
         }
         BlockKind::Heading { level, content } => {
-            wrap(content, heading_style(*level), width, first, rest, out);
+            let links = wrap(content, heading_style(*level), width, first, rest, out);
+            ctx.layout.links.extend(links);
         }
         BlockKind::Code { lang, code } => {
             let colours = lang
@@ -237,7 +249,7 @@ fn contents(
         BlockKind::Figure { source, .. } if !ctx.images.graphics() => {
             preformatted(source, CODE, width, first, rest, out);
         }
-        BlockKind::Image { src, alt } if !ctx.images.graphics() => {
+        BlockKind::Image { src, alt, .. } if !ctx.images.graphics() => {
             // As written, unless it spans lines, which in a quote or list
             // would bring their markers along.
             let text = match ctx.source.get(block.span.clone()).map(str::trim) {
@@ -363,27 +375,47 @@ fn inline_style(base: Style, style: &InlineStyle) -> Style {
     s
 }
 
+/// Text in one style, and the link it is part of as an index into the
+/// links [`units`] found.
+type Segment = (String, Style, Option<usize>);
+
 /// A unit of inline content for line breaking.
 enum Unit {
     /// A run of non-space text, possibly in several styles.
-    Word(Vec<(String, Style)>),
-    Space(Style),
+    Word(Vec<Segment>),
+    Space(Style, Option<usize>),
     Break,
 }
 
-fn units(content: &[Inline], base: Style) -> Vec<Unit> {
+/// The content as units, and the links in it. Text next to text with the
+/// same link is one link, even when its style changes inside it.
+fn units(content: &[Inline], base: Style) -> (Vec<Unit>, Vec<Link>) {
     let mut units = Vec::new();
-    let mut word: Vec<(String, Style)> = Vec::new();
+    let mut links: Vec<Link> = Vec::new();
+    let mut word: Vec<Segment> = Vec::new();
+    // The link the last inline was part of.
+    let mut open: Option<usize> = None;
     for inline in content {
-        let (text, code, style) = match inline {
-            Inline::Text { text, style } => (text, style.code, inline_style(base, style)),
+        let (text, code, style, link) = match inline {
+            Inline::Text { text, style } => {
+                (text, style.code, inline_style(base, style), &style.link)
+            }
             Inline::Break => {
                 if !word.is_empty() {
                     units.push(Unit::Word(std::mem::take(&mut word)));
                 }
                 units.push(Unit::Break);
+                open = None;
                 continue;
             }
+        };
+        open = match link {
+            Some(link) if open.is_some_and(|i| links[i] == *link) => open,
+            Some(link) => {
+                links.push(link.clone());
+                Some(links.len() - 1)
+            }
+            None => None,
         };
         for c in text.chars() {
             // Code keeps its spaces and is not broken at them.
@@ -391,13 +423,13 @@ fn units(content: &[Inline], base: Style) -> Vec<Unit> {
                 if !word.is_empty() {
                     units.push(Unit::Word(std::mem::take(&mut word)));
                 }
-                if !matches!(units.last(), Some(Unit::Space(_))) {
-                    units.push(Unit::Space(style));
+                if !matches!(units.last(), Some(Unit::Space(..))) {
+                    units.push(Unit::Space(style, open));
                 }
             } else {
                 match word.last_mut() {
-                    Some((s, st)) if *st == style => s.push(c),
-                    _ => word.push((c.to_string(), style)),
+                    Some((s, st, l)) if *st == style && *l == open => s.push(c),
+                    _ => word.push((c.to_string(), style, open)),
                 }
             }
         }
@@ -405,10 +437,11 @@ fn units(content: &[Inline], base: Style) -> Vec<Unit> {
     if !word.is_empty() {
         units.push(Unit::Word(word));
     }
-    units
+    (units, links)
 }
 
-/// Fill lines greedily with inline content, breaking at spaces.
+/// Fill lines greedily with inline content, breaking at spaces. Returns
+/// where the links in it landed.
 fn wrap(
     content: &[Inline],
     base: Style,
@@ -416,43 +449,55 @@ fn wrap(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
-) {
+) -> Vec<LinkSpot> {
+    let (units, links) = units(content, base);
+    let mut spots: Vec<LinkSpot> = links
+        .into_iter()
+        .map(|link| LinkSpot {
+            link,
+            cells: Vec::new(),
+        })
+        .collect();
     let mut lines = Lines::new(width, first, rest, out);
-    let mut space: Option<Style> = None;
-    for unit in units(content, base) {
+    let mut space: Option<(Style, Option<usize>)> = None;
+    for unit in units {
         match unit {
             Unit::Break => {
                 lines.finish();
                 space = None;
             }
-            Unit::Space(style) => {
+            Unit::Space(style, link) => {
                 if lines.used > 0 {
-                    space = Some(style);
+                    space = Some((style, link));
                 }
             }
             Unit::Word(segments) => {
-                let word_width: usize = segments.iter().map(|(s, _)| s.width()).sum();
-                if let Some(style) = space.take() {
+                let word_width: usize = segments.iter().map(|(s, ..)| s.width()).sum();
+                if let Some((style, link)) = space.take() {
                     if lines.used + 1 + word_width > lines.avail() {
                         lines.finish();
                     } else {
-                        lines.push(" ", style);
+                        lines.push_link(" ", style, link, &mut spots);
                     }
                 }
-                if word_width <= lines.avail() {
-                    for (s, style) in &segments {
-                        lines.push(s, *style);
-                    }
-                } else {
-                    // Longer than a whole line: break it anywhere.
-                    for (s, style) in &segments {
-                        lines.push_breaking(s, *style);
+                let breaking = word_width > lines.avail();
+                for (s, style, link) in &segments {
+                    if breaking {
+                        // Longer than a whole line: break it anywhere.
+                        let mut buf = [0; 4];
+                        for c in s.chars() {
+                            lines.break_before(c.width().unwrap_or(0));
+                            lines.push_link(c.encode_utf8(&mut buf), *style, *link, &mut spots);
+                        }
+                    } else {
+                        lines.push_link(s, *style, *link, &mut spots);
                     }
                 }
             }
         }
     }
     lines.finish_last();
+    spots
 }
 
 /// Text shown as is, broken at the edge of the view rather than reflowed.
@@ -559,13 +604,33 @@ impl<'a> Lines<'a> {
         }
     }
 
+    /// Push `s`, and when it is part of link `link`, note its cells there.
+    fn push_link(&mut self, s: &str, style: Style, link: Option<usize>, spots: &mut [LinkSpot]) {
+        let start = spans_width(self.prefix()) + self.used;
+        self.push(s, style);
+        let Some(spot) = link.and_then(|i| spots.get_mut(i)) else {
+            return;
+        };
+        let row = self.out.len();
+        let end = spans_width(self.prefix()) + self.used;
+        let (start, end) = (start as u16, end as u16);
+        match spot.cells.last_mut() {
+            Some((r, cols)) if *r == row && cols.end == start => cols.end = end,
+            _ => spot.cells.push((row, start..end)),
+        }
+    }
+
+    /// Start a new line when one `w` columns wide would not fit.
+    fn break_before(&mut self, w: usize) {
+        if self.used > 0 && self.used + w > self.avail() {
+            self.finish();
+        }
+    }
+
     fn push_breaking(&mut self, s: &str, style: Style) {
         let mut buf = [0; 4];
         for c in s.chars() {
-            let w = c.width().unwrap_or(0);
-            if self.used > 0 && self.used + w > self.avail() {
-                self.finish();
-            }
+            self.break_before(c.width().unwrap_or(0));
             self.push(c.encode_utf8(&mut buf), style);
         }
     }

@@ -5,6 +5,17 @@ This folder holds the notes shown in the README's recording and screenshots, and
 - `Weather station.md`: the main note, with emoji headings, a mermaid diagram, maths, a Rust code block, a table, an image and wiki links.
 - `Sensors.md` and `Calibration.md`: small notes it links to.
 - `mandelbrot.png`: the image in the main note, made with `ffmpeg -f lavfi -i "mandelbrot=size=480x240:start_scale=2.5:maxiter=200" -frames:v 1 mandelbrot.png`.
+- `features/`: one small note per feature for the README's screenshots. The README shows each note as a snippet, so keep the two the same. `features/links/` has its own `.obsidian` folder and two notes that link to each other.
+
+## Taking the screenshots
+
+```sh
+cargo build --release
+docs/demo/record/features.sh                # all of them
+docs/demo/record/features.sh diff table     # only these
+```
+
+`features.sh` opens each note in a new Ghostty window with the clean config described below, sized in cells to fit the note, and writes `docs/images/<name>.png`: `diagram`, `maths`, `headings`, `code`, `diff`, `table`, `table-cards` (the same table in a narrow window) and `links` (after following the link, so Back is lit). Ghostty will not make a window shorter than about five rows, so a shot can keep fewer rows than its window has. Each function at the end of the script sets one shot's note, window size and rows. It needs the same tools and permissions as `record.sh` below, and takes about a minute.
 
 ## Recording the GIF by hand
 
@@ -29,15 +40,15 @@ Asciinema and vhs cannot show kitty graphics, so `record.sh` records a real Ghos
 
 ```sh
 cargo build --release
-docs/demo/record/record.sh          # the stills; record.sh video or all also replaces demo.gif
+docs/demo/record/record.sh          # the stills, by features.sh; record.sh video or all also replaces demo.gif
 ```
 
 The script:
 
 1. Opens smd on `Weather station.md` in a new Ghostty window with a clean config (`record/ghostty.conf`): 100x32 cells, no user Ghostty or smd settings, and smd as the only process, so no prompt or path shows.
-2. Takes stills with `screencapture -l <window id>`: `diagram.png`, `maths.png`, `table.png` and `links.png`.
+2. For the stills, runs `features.sh`, which takes them with `screencapture -l <window id>`.
 3. Records the window's area with `screencapture -V 30 -R ...` while it scrolls through the note, presses Tab and Enter to follow the last link, and clicks the toolbar's Back button.
-4. Trims the start to 2 seconds before the first scroll, crops off the title bar, and writes `docs/images/demo.gif` (1000 px wide, 12 fps) and the PNGs (256 colours) with ffmpeg.
+4. Trims the start to 2 seconds before the first scroll, crops off the title bar, and writes `docs/images/demo.gif` (1000 px wide, 12 fps) with ffmpeg. The PNGs are cropped the same way, in 256 colours.
 
 It drives keys with `osascript` and clicks with a small Swift helper, so the terminal you run it from needs Accessibility and Screen Recording permission (System Settings > Privacy & Security). Leave the mouse and keyboard alone while it runs, about a minute. The Ghostty window moves to the front and closes when it is done.
 

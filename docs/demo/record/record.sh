@@ -1,6 +1,7 @@
 #!/bin/zsh -f
 # Records the README media from a real Ghostty window on macOS.
 # Usage: docs/demo/record/record.sh [stills|video|all]   (default: stills)
+# stills runs features.sh, which takes the README's screenshots.
 # video and all overwrite docs/images/demo.gif, which is now recorded by hand
 # (open.sh and to-gif.sh).
 # See docs/demo/README.md.
@@ -129,30 +130,10 @@ video() {
     $images/demo.gif
 }
 
-stills() {
-  open_window
-  shot() {
-    sleep 1.2
-    screencapture -x -o -l $id $work/$1.png
-    ffmpeg -loglevel error -y -i $work/$1.png -vf \
-      "$crop,split[a][b];[a]palettegen=max_colors=256[p];[b][p]paletteuse=dither=none" \
-      $images/$1.png
-  }
-  shot diagram
-  down 16; shot maths
-  down 24; shot table
-  keys 'keystroke "G"'; sleep 0.3     # bottom
-  keys 'key code 48'; sleep 0.3       # tab: first link in view, the reference station
-  keys 'key code 36'; sleep 1.5       # enter: Calibration
-  keys 'key code 48'                  # tab: select a link there
-  shot links
-  close_window
-}
-
 case ${1:-stills} in
   video) video ;;
-  stills) stills ;;
-  all) stills; video ;;
+  stills) $here/features.sh ;;
+  all) $here/features.sh; video ;;
   *) echo "usage: $0 [video|stills|all]" >&2; exit 2 ;;
 esac
 ls -l $images

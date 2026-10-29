@@ -931,6 +931,13 @@ mod tests {
     }
 
     #[test]
+    fn an_image_embed_with_a_fragment_in_a_cell_is_still_an_image() {
+        let table = Table::parse("| ![[pic.png#frag]] |\n|-|");
+        let image = vec![("[image: pic.png#frag]".into(), InlineStyle::default())];
+        assert_eq!(table.rows, vec![vec![image]]);
+    }
+
+    #[test]
     fn a_table_with_only_a_header_shows_it_as_one_card() {
         let table = Table::parse("| aaaaaaaa | bbbbbbbb | cccccccc |\n|---|---|---|");
         assert_eq!(

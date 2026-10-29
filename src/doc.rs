@@ -111,12 +111,19 @@ impl From<&str> for Link {
     }
 }
 
-/// Whether `name` is an image file, by its extension.
+/// Whether `name` is an image file, by its extension. A `#` fragment after
+/// it is ignored.
 pub fn is_image(name: &str) -> bool {
+    let name = without_fragment(name);
     let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
     ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"]
         .iter()
         .any(|e| ext.eq_ignore_ascii_case(e))
+}
+
+/// `name` without a `#heading` or `#^block` after it.
+fn without_fragment(name: &str) -> &str {
+    name.split_once('#').map_or(name, |(name, _)| name)
 }
 
 pub fn parse(source: &str) -> Document {
@@ -419,7 +426,9 @@ impl<'a> Builder<'a> {
         self.push_text("[image: ", self.style(), range);
         self.image_depth += 1;
         if self.image_depth == 1 {
-            self.image = Some((dest.to_string(), String::new(), wiki));
+            // An embed is looked up by its name alone.
+            let src = if wiki { without_fragment(dest) } else { dest };
+            self.image = Some((src.to_string(), String::new(), wiki));
         }
     }
 
@@ -1202,6 +1211,20 @@ paragraph @21..62
   "text "
   "alias" link="Note" wiki=true
   " more"
+"#,
+        );
+    }
+
+    #[test]
+    fn an_image_embed_with_a_fragment_is_still_an_image() {
+        assert_outline(
+            "![[pic.png#frag]]\n",
+            "image \"pic.png\" alt=\"pic.png#frag\" wiki=true @0..18\n",
+        );
+        assert_outline(
+            "text ![[pic.png#x|200]] more\n",
+            r#"paragraph @0..29
+  "text [image: 200] more"
 "#,
         );
     }

@@ -123,8 +123,11 @@ fn needs_shaping(c: char) -> bool {
 }
 
 /// The runs split by face: text in `sans`, code in `mono` where it has the
-/// glyph and in `sans` where only that does, and emoji in `emoji`. Variation
-/// selectors are dropped. `None` when a character is in none of them.
+/// glyph and in `sans` where only that does, and emoji in `emoji`. A
+/// character with U+FE0F after it asks to be an emoji, so it is drawn in
+/// `emoji` when that has it, even if the text font has it too, as many have
+/// ❤. Variation selectors are dropped. `None` when a character is in none of
+/// them.
 fn pieces<'a>(
     runs: &[Run],
     sans: &'a FontVec,
@@ -136,14 +139,18 @@ fn pieces<'a>(
     let mut out: Vec<Piece> = Vec::new();
     for (s, is_code) in runs {
         let colour = if *is_code { code } else { text };
-        for c in s.chars() {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
             if matches!(c, '\u{FE0E}' | '\u{FE0F}') {
                 continue;
             }
             if needs_shaping(c) {
                 return None;
             }
-            let face = if *is_code && has(mono, c) {
+            let as_emoji = chars.peek() == Some(&'\u{FE0F}');
+            let face = if let Some(e) = emoji.filter(|e| as_emoji && e.has(c)) {
+                Face::Emoji(e)
+            } else if *is_code && has(mono, c) {
                 Face::Outline(mono)
             } else if has(sans, c) {
                 Face::Outline(sans)
@@ -516,5 +523,48 @@ mod tests {
         let light = drawn("# Theme\n", (10, 20), Theme::Light);
         assert_eq!(dark.size(), light.size());
         assert_ne!(dark.png().unwrap(), light.png().unwrap());
+    }
+
+    #[test]
+    fn each_level_has_its_colour_in_both_themes() {
+        let dark = |t: [u8; 3]| [t[0], t[1], t[2], 0xff];
+        let want_dark = [
+            (1, dark([0xd7, 0x8b, 0xf0])),
+            (2, dark([0x6f, 0xd3, 0xe8])),
+            (3, dark([0x8f, 0xd8, 0x8f])),
+            (4, dark([0xe8, 0xe8, 0xe8])),
+            (5, dark([0xe8, 0xe8, 0xe8])),
+            (6, dark([0xa8, 0xa8, 0xa8])),
+        ];
+        let want_light = [
+            (1, dark([0x8b, 0x3f, 0xa8])),
+            (2, dark([0x1f, 0x6f, 0x80])),
+            (3, dark([0x2e, 0x7d, 0x32])),
+            (4, dark([0x22, 0x22, 0x22])),
+            (5, dark([0x22, 0x22, 0x22])),
+            (6, dark([0x66, 0x66, 0x66])),
+        ];
+        for (level, text) in want_dark {
+            assert_eq!(
+                colours(level, Theme::Dark),
+                (text, [0xe5, 0xc0, 0x7b, 0xff]),
+                "dark level {level}"
+            );
+        }
+        for (level, text) in want_light {
+            assert_eq!(
+                colours(level, Theme::Light),
+                (text, [0x95, 0x5f, 0x00, 0xff]),
+                "light level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn levels_outside_one_to_six_get_the_body_colour() {
+        for theme in [Theme::Dark, Theme::Light] {
+            assert_eq!(colours(0, theme).0, colours(4, theme).0);
+            assert_eq!(colours(7, theme).0, colours(4, theme).0);
+        }
     }
 }

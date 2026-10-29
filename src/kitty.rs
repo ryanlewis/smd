@@ -100,6 +100,10 @@ pub fn base64(data: &[u8]) -> String {
 /// How long to wait for the terminal to answer the start-up queries.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// How much longer to wait for a terminal that has started to answer but has
+/// not sent the DA1 reply by the timeout.
+const LATE_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Cell size used when the terminal reports none.
 const FALLBACK_CELL: (u16, u16) = (8, 16);
 
@@ -125,7 +129,8 @@ pub struct Probe {
 /// The queries end with `CSI c` (DA1). Terminals answer in order, and nearly
 /// all answer DA1, so the DA1 reply ends the wait: a terminal that sends it
 /// without a graphics reply has no graphics. One that answers nothing is given
-/// up on after a short timeout. The cell size falls back to the pixel size the
+/// up on after a short timeout, and one that has started to answer by then is
+/// given a little longer to send DA1. The cell size falls back to the pixel size the
 /// tty reports. The queries are sent on the alternate screen, which is left
 /// again before this returns. Call it before the key reader starts: it reads
 /// the replies from the terminal itself.
@@ -142,7 +147,11 @@ pub fn probe() -> Probe {
 }
 
 fn window_cell_size() -> Option<(u16, u16)> {
-    let size = ratatui::crossterm::terminal::window_size().ok()?;
+    cell_size(ratatui::crossterm::terminal::window_size().ok()?)
+}
+
+/// The size of one cell in the window `size` reports, if it reports pixels.
+fn cell_size(size: ratatui::crossterm::terminal::WindowSize) -> Option<(u16, u16)> {
     if size.columns == 0 || size.rows == 0 {
         return None;
     }
@@ -168,43 +177,96 @@ fn query() -> Option<Vec<u8>> {
     if !was_raw {
         terminal::enable_raw_mode().ok()?;
     }
+    let reply = exchange(&mut io::stdout(), libc::STDIN_FILENO, REPLY_TIMEOUT);
+    if !was_raw {
+        let _ = terminal::disable_raw_mode();
+    }
+    Some(reply)
+}
+
+/// Send the queries to `out` and read the replies from `fd` until the DA1
+/// reply or until `timeout` has passed since they were sent.
+#[cfg(unix)]
+fn exchange(out: &mut impl Write, fd: libc::c_int, timeout: Duration) -> Vec<u8> {
     // On the alternate screen, so a terminal that prints the graphics query
     // as text (Terminal.app does) leaves nothing behind once it is left.
-    let mut out = io::stdout();
     let sent = write!(out, "\x1b[?1049h{}", queries())
         .and_then(|()| out.flush())
         .is_ok();
-    let mut buf = Vec::new();
-    let deadline = Instant::now() + REPLY_TIMEOUT;
-    let fd = libc::STDIN_FILENO;
-    while sent && !has_da1_reply(&buf) {
+    let read = move |left| read_chunk(fd, left);
+    let mut reply = Vec::new();
+    if sent {
+        reply = read_replies(reply, Instant::now() + timeout, read);
+    }
+    // A slow terminal, over ssh say, is given a little longer once it has
+    // started to answer, so its last replies are read here and do not reach
+    // the key reader as key presses.
+    if !reply.is_empty() && !has_da1_reply(&reply) {
+        reply = read_replies(reply, Instant::now() + LATE_REPLY_TIMEOUT, read);
+    }
+    let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
+    reply
+}
+
+/// Add chunks from `next` to `buf` until it holds the DA1 reply or `deadline`
+/// passes. `next` is given the time left and returns `None` when nothing came
+/// in that time or the input ended.
+fn read_replies(
+    mut buf: Vec<u8>,
+    deadline: Instant,
+    mut next: impl FnMut(Duration) -> Option<Vec<u8>>,
+) -> Vec<u8> {
+    while !has_da1_reply(&buf) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
+        let Some(chunk) = next(left) else {
+            break;
+        };
+        buf.extend_from_slice(&chunk);
+    }
+    buf
+}
+
+/// The bytes waiting on `fd`, waiting up to `left` for some to arrive. A
+/// signal, such as a window resize, does not end the wait.
+#[cfg(unix)]
+fn read_chunk(fd: libc::c_int, left: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + left;
+    loop {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
+        let left = deadline.saturating_duration_since(Instant::now());
         let ms = left.as_millis().clamp(1, 1000) as libc::c_int;
         // SAFETY: one valid pollfd for the duration of the call.
-        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
-            break;
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready < 0 && interrupted() && !left.is_zero() {
+            continue;
+        }
+        if ready <= 0 {
+            return None;
         }
         let mut chunk = [0u8; 256];
         // SAFETY: reads at most chunk.len() bytes into chunk.
         let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n <= 0 {
-            break;
+        if n < 0 && interrupted() {
+            continue;
         }
-        buf.extend_from_slice(&chunk[..n as usize]);
+        if n <= 0 {
+            return None;
+        }
+        return Some(chunk[..n as usize].to_vec());
     }
-    let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
-    if !was_raw {
-        let _ = terminal::disable_raw_mode();
-    }
-    Some(buf)
+}
+
+/// Whether the last system call failed because a signal interrupted it.
+#[cfg(unix)]
+fn interrupted() -> bool {
+    io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
 }
 
 #[cfg(not(unix))]
@@ -352,6 +414,293 @@ mod tests {
         assert_eq!(
             queries(),
             "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c"
+        );
+    }
+
+    #[test]
+    fn cell_size_divides_the_window_by_its_cells() {
+        use ratatui::crossterm::terminal::WindowSize;
+        let size = |columns, rows, width, height| WindowSize {
+            rows,
+            columns,
+            width,
+            height,
+        };
+        assert_eq!(cell_size(size(80, 24, 640, 384)), Some((8, 16)));
+        assert_eq!(cell_size(size(100, 30, 1705, 1023)), Some((17, 34)));
+        // No cells, no pixels, or fewer pixels than cells: no size.
+        assert_eq!(cell_size(size(0, 24, 640, 384)), None);
+        assert_eq!(cell_size(size(80, 0, 640, 384)), None);
+        assert_eq!(cell_size(size(80, 24, 0, 0)), None);
+        assert_eq!(cell_size(size(80, 24, 79, 384)), None);
+        assert_eq!(cell_size(size(80, 24, 640, 23)), None);
+    }
+
+    /// Feed `chunks` to `read_replies` one per call, then nothing, and say
+    /// how many chunks it asked for.
+    fn replies(chunks: &[&[u8]]) -> (Vec<u8>, usize) {
+        let mut calls = 0;
+        let buf = read_replies(Vec::new(), Instant::now() + REPLY_TIMEOUT, |left| {
+            assert!(!left.is_zero() && left <= REPLY_TIMEOUT);
+            calls += 1;
+            chunks.get(calls - 1).map(|c| c.to_vec())
+        });
+        (buf, calls)
+    }
+
+    #[test]
+    fn replies_are_read_until_da1() {
+        let kitty: &[u8] =
+            b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[6;34;17t\x1b_Gi=31;OK\x1b\\\x1b[?62;22c";
+        let (buf, calls) = replies(&[kitty, b"after"]);
+        assert_eq!((buf.as_slice(), calls), (kitty, 1));
+    }
+
+    #[test]
+    fn replies_split_across_reads_are_joined() {
+        let (buf, calls) = replies(&[
+            b"\x1b[6;3",
+            b"4;17t\x1b_Gi=3",
+            b"1;OK\x1b\\\x1b[?6",
+            b"2;22c",
+            b"after",
+        ]);
+        assert_eq!(calls, 4);
+        assert_eq!(parse_cell_reply(&buf), Some((17, 34)));
+        assert!(parse_graphics_reply(&buf));
+        assert!(has_da1_reply(&buf));
+    }
+
+    #[test]
+    fn da1_alone_ends_the_wait() {
+        let (buf, calls) = replies(&[b"\x1b[?1;2c", b"after"]);
+        assert_eq!((buf.as_slice(), calls), (&b"\x1b[?1;2c"[..], 1));
+        assert!(!parse_graphics_reply(&buf));
+        assert_eq!(parse_cell_reply(&buf), None);
+    }
+
+    #[test]
+    fn garbage_before_the_replies_is_kept_and_skipped() {
+        let (buf, calls) = replies(&[b"jk\x1b[A\x1b[?1;2", b"t", b"\x1b[6;16;8t\x1b[?6c"]);
+        assert_eq!(calls, 3);
+        assert_eq!(parse_cell_reply(&buf), Some((8, 16)));
+        assert!(!parse_graphics_reply(&buf));
+    }
+
+    #[test]
+    fn replies_after_da1_are_not_waited_for() {
+        // A terminal that answers DA1 first: the graphics reply that follows
+        // in a later read is not waited for, one in the same read is kept.
+        let (buf, calls) = replies(&[b"\x1b[?62c", b"\x1b_Gi=31;OK\x1b\\"]);
+        assert_eq!(calls, 1);
+        assert!(!parse_graphics_reply(&buf));
+        let (buf, _) = replies(&[b"\x1b[?62c\x1b_Gi=31;OK\x1b\\\x1b[6;16;8t"]);
+        assert!(parse_graphics_reply(&buf));
+        assert_eq!(parse_cell_reply(&buf), Some((8, 16)));
+    }
+
+    #[test]
+    fn no_reply_gives_up() {
+        // Nothing within the time left, or the input ended.
+        let (buf, calls) = replies(&[]);
+        assert_eq!((buf, calls), (Vec::new(), 1));
+        let (buf, calls) = replies(&[b"\x1b[6;16;8t"]);
+        assert_eq!((buf.as_slice(), calls), (&b"\x1b[6;16;8t"[..], 2));
+    }
+
+    #[test]
+    fn a_passed_deadline_reads_nothing() {
+        let buf = read_replies(Vec::new(), Instant::now(), |_| {
+            panic!("read after the deadline")
+        });
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn replies_stop_at_the_deadline() {
+        // Input that never ends and never holds DA1 is cut off by the clock.
+        let start = Instant::now();
+        let buf = read_replies(Vec::new(), start + Duration::from_millis(20), |_| {
+            std::thread::sleep(Duration::from_millis(2));
+            Some(b"x".to_vec())
+        });
+        assert!(!buf.is_empty());
+        assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    /// A pipe holding `input`, its write end closed when `close` is set.
+    #[cfg(unix)]
+    struct Pipe {
+        read: libc::c_int,
+        write: Option<libc::c_int>,
+    }
+
+    #[cfg(unix)]
+    impl Pipe {
+        fn new(input: &[u8], close: bool) -> Pipe {
+            let mut fds = [0; 2];
+            // SAFETY: pipe writes two descriptors into fds.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: writes input.len() bytes from input; a pipe buffer
+            // holds far more than these tests send.
+            let n = unsafe { libc::write(fds[1], input.as_ptr().cast(), input.len()) };
+            assert_eq!(n, input.len() as isize);
+            let mut pipe = Pipe {
+                read: fds[0],
+                write: Some(fds[1]),
+            };
+            if close {
+                pipe.close_write();
+            }
+            pipe
+        }
+
+        fn close_write(&mut self) {
+            if let Some(fd) = self.write.take() {
+                // SAFETY: fd is open and owned by this pipe.
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            self.close_write();
+            // SAFETY: the read end is open and owned by this pipe.
+            unsafe { libc::close(self.read) };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_chunk_reads_what_is_waiting_in_pieces() {
+        let input: Vec<u8> = (0..300).map(|i| i as u8).collect();
+        let pipe = Pipe::new(&input, true);
+        let first = read_chunk(pipe.read, REPLY_TIMEOUT).unwrap();
+        assert_eq!(first, input[..256]);
+        let second = read_chunk(pipe.read, REPLY_TIMEOUT).unwrap();
+        assert_eq!(second, input[256..]);
+        // The write end is closed: the input has ended.
+        assert_eq!(read_chunk(pipe.read, REPLY_TIMEOUT), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_chunk_gives_up_when_nothing_comes() {
+        let pipe = Pipe::new(b"", false);
+        assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exchange_sends_the_queries_on_the_alternate_screen() {
+        let reply = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[6;34;17t\x1b_Gi=31;OK\x1b\\\x1b[?62;22c";
+        // Left open, so only the DA1 reply can end the wait in time.
+        let pipe = Pipe::new(reply, false);
+        let mut out = Vec::new();
+        let timeout = Duration::from_secs(10);
+        let start = Instant::now();
+        assert_eq!(exchange(&mut out, pipe.read, timeout), reply);
+        assert!(start.elapsed() < timeout);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\x1b[?1049h{}\x1b[?1049l", queries())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_terminals_late_replies_are_read() {
+        // The cell size comes in time, DA1 only after the timeout: DA1 is
+        // still read here, and nothing is left for the key reader.
+        let pipe = Pipe::new(b"\x1b[6;16;8t", false);
+        let write = pipe.write.unwrap();
+        let timeout = Duration::from_millis(100);
+        let terminal = std::thread::spawn(move || {
+            std::thread::sleep(timeout * 2);
+            // SAFETY: writes the reply from a live buffer to an open pipe.
+            unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
+        });
+        let reply = exchange(&mut Vec::new(), pipe.read, timeout);
+        terminal.join().unwrap();
+        assert_eq!(reply, b"\x1b[6;16;8t\x1b[?62c");
+        assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exchange_gives_up_on_a_silent_terminal() {
+        // Waits in whole milliseconds, so it can give up a fraction of one
+        // before the timeout: only the outcome is checked, not the time.
+        let pipe = Pipe::new(b"", false);
+        let mut out = Vec::new();
+        assert!(exchange(&mut out, pipe.read, Duration::from_millis(20)).is_empty());
+        assert!(out.ends_with(b"\x1b[?1049l"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_does_not_end_the_wait() {
+        // A window resize (SIGWINCH) while the probe waits interrupts poll.
+        // SIGUSR1 stands in for it, with a handler that does nothing and
+        // without SA_RESTART, as with any handler.
+        extern "C" fn ignore(_: libc::c_int) {}
+        // SAFETY: a zeroed sigaction is valid; the handler is async-signal
+        // safe as it does nothing. The old handler is put back below.
+        let old = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            let mut old: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, &mut old), 0);
+            old
+        };
+        let pipe = Pipe::new(b"", false);
+        let write = pipe.write.unwrap();
+        // SAFETY: pthread_self has no preconditions.
+        let waiting = unsafe { libc::pthread_self() } as usize;
+        let terminal = std::thread::spawn(move || {
+            // Several signals, so some land while the probe is in poll.
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(10));
+                // SAFETY: the waiting thread is alive until this thread is
+                // joined.
+                unsafe { libc::pthread_kill(waiting as libc::pthread_t, libc::SIGUSR1) };
+            }
+            // SAFETY: writes the reply from a live buffer to an open pipe.
+            unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
+        });
+        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10));
+        terminal.join().unwrap();
+        // SAFETY: puts back the handler saved above.
+        unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) };
+        assert_eq!(reply, b"\x1b[?62c");
+    }
+
+    /// A writer that fails every write.
+    #[cfg(unix)]
+    struct Broken;
+
+    #[cfg(unix)]
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exchange_reads_nothing_when_the_queries_cannot_be_sent() {
+        // The replies would be there, but no query went out to ask for them.
+        let pipe = Pipe::new(b"\x1b[?62c", true);
+        assert!(exchange(&mut Broken, pipe.read, REPLY_TIMEOUT).is_empty());
+        assert_eq!(
+            read_chunk(pipe.read, REPLY_TIMEOUT).as_deref(),
+            Some(&b"\x1b[?62c"[..])
         );
     }
 }

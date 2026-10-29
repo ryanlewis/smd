@@ -283,6 +283,15 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// The current style with `code` or `math` added.
+    fn style_with(&self, code: bool, math: bool) -> InlineStyle {
+        InlineStyle {
+            code,
+            math,
+            ..self.style()
+        }
+    }
+
     fn event(&mut self, event: Event, range: Range<usize>) {
         // A table is kept whole as source text, so skip its contents.
         if self.in_table {
@@ -303,48 +312,62 @@ impl<'a> Builder<'a> {
                 _ => self.text(&html, self.style(), range),
             },
             Event::InlineHtml(html) => self.text(&html, self.style(), range),
-            Event::Code(code) => {
-                let style = InlineStyle {
-                    code: true,
-                    ..self.style()
-                };
-                self.text(&code, style, range);
-            }
+            Event::Code(code) => self.text(&code, self.style_with(true, false), range),
             Event::InlineMath(math) => {
-                let style = InlineStyle {
-                    math: true,
-                    ..self.style()
-                };
-                self.text(&format!("${math}$"), style, range);
+                self.text(&format!("${math}$"), self.style_with(false, true), range);
             }
-            Event::DisplayMath(math) => {
-                let style = InlineStyle {
-                    math: true,
-                    ..self.style()
-                };
-                // Display maths alone does not make a paragraph prose.
-                let other = self.top().other_inline;
-                self.text(&format!("$${math}$$"), style, range);
-                let top = self.top();
-                top.other_inline = other;
-                top.display_math.push(math.trim().to_string());
-            }
+            Event::DisplayMath(math) => self.display_math(&math, range),
             Event::FootnoteReference(label) => {
                 self.text(&format!("[^{label}]"), self.style(), range);
             }
             Event::SoftBreak => self.text(" ", self.style(), range),
             Event::HardBreak => self.inline(Inline::Break, range),
             Event::Rule => self.push_block(BlockKind::Rule, range),
-            Event::TaskListMarker(done) => {
-                if let FrameKind::Item { task } = &mut self.top().kind {
-                    *task = Some(done);
+            Event::TaskListMarker(done) => self.mark_task(done),
+        }
+    }
+
+    fn display_math(&mut self, math: &str, range: Range<usize>) {
+        // Display maths alone does not make a paragraph prose.
+        let other = self.top().other_inline;
+        self.text(&format!("$${math}$$"), self.style_with(false, true), range);
+        let top = self.top();
+        top.other_inline = other;
+        top.display_math.push(math.trim().to_string());
+    }
+
+    fn start(&mut self, tag: Tag, range: Range<usize>) {
+        match tag {
+            Tag::Table(_) => self.start_table(range),
+            Tag::Emphasis => self.emphasis += 1,
+            Tag::Strong => self.strong += 1,
+            Tag::Strikethrough => self.strikethrough += 1,
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            } => self.links.push(Link {
+                dest: dest_url.to_string(),
+                wiki: is_wiki(link_type),
+            }),
+            Tag::Image {
+                link_type,
+                dest_url,
+                ..
+            } => self.start_image(is_wiki(link_type), &dest_url, range),
+            tag => {
+                if let Some(kind) = self.block_frame(tag) {
+                    self.top().flush_inlines();
+                    self.stack.push(Frame::new(kind, range));
                 }
             }
         }
     }
 
-    fn start(&mut self, tag: Tag, range: Range<usize>) {
-        let kind = match tag {
+    /// The frame a block-level tag opens, or `None` for a tag that is not
+    /// enabled or is kept as plain inline text.
+    fn block_frame(&mut self, tag: Tag) -> Option<FrameKind> {
+        Some(match tag {
             Tag::Paragraph => {
                 if let FrameKind::Item { .. } = self.top().kind {
                     self.mark_list_loose();
@@ -353,18 +376,10 @@ impl<'a> Builder<'a> {
             }
             Tag::Heading { level, .. } => FrameKind::Heading(level as u8),
             Tag::BlockQuote(_) => FrameKind::Quote,
-            Tag::CodeBlock(kind) => {
-                let lang = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        info.split_whitespace().next().map(str::to_string)
-                    }
-                    CodeBlockKind::Indented => None,
-                };
-                FrameKind::Code {
-                    lang,
-                    code: String::new(),
-                }
-            }
+            Tag::CodeBlock(kind) => FrameKind::Code {
+                lang: code_lang(kind),
+                code: String::new(),
+            },
             Tag::HtmlBlock => FrameKind::Html(String::new()),
             Tag::List(start) => FrameKind::List {
                 start,
@@ -372,73 +387,40 @@ impl<'a> Builder<'a> {
                 items: Vec::new(),
             },
             Tag::Item => FrameKind::Item { task: None },
-            Tag::Table(_) => {
-                let source = table_source(self.source, range.clone());
-                self.push_block(
-                    BlockKind::Figure {
-                        kind: FigureKind::Table,
-                        source,
-                    },
-                    range,
-                );
-                self.in_table = true;
-                return;
-            }
-            Tag::Emphasis => {
-                self.emphasis += 1;
-                return;
-            }
-            Tag::Strong => {
-                self.strong += 1;
-                return;
-            }
-            Tag::Strikethrough => {
-                self.strikethrough += 1;
-                return;
-            }
-            Tag::Link {
-                link_type,
-                dest_url,
-                ..
-            } => {
-                self.links.push(Link {
-                    dest: dest_url.to_string(),
-                    wiki: matches!(link_type, LinkType::WikiLink { .. }),
-                });
-                return;
-            }
-            Tag::Image {
-                link_type,
-                dest_url,
-                ..
-            } => {
-                let wiki = matches!(link_type, LinkType::WikiLink { .. });
-                // An embedded note is shown as a link to it.
-                let note = wiki && !is_image(&dest_url);
-                self.embeds.push(note);
-                if note {
-                    self.links.push(Link {
-                        dest: dest_url.to_string(),
-                        wiki,
-                    });
-                    return;
-                }
-                // A linked image stays inline so it keeps its link.
-                if !self.links.is_empty() {
-                    self.top().other_inline = true;
-                }
-                self.push_text("[image: ", self.style(), range);
-                self.image_depth += 1;
-                if self.image_depth == 1 {
-                    self.image = Some((dest_url.to_string(), String::new(), wiki));
-                }
-                return;
-            }
-            // Not enabled, or kept as plain inline text.
-            _ => return,
+            _ => return None,
+        })
+    }
+
+    fn start_table(&mut self, range: Range<usize>) {
+        let source = table_source(self.source, range.clone());
+        let kind = BlockKind::Figure {
+            kind: FigureKind::Table,
+            source,
         };
-        self.top().flush_inlines();
-        self.stack.push(Frame::new(kind, range));
+        self.push_block(kind, range);
+        self.in_table = true;
+    }
+
+    fn start_image(&mut self, wiki: bool, dest: &str, range: Range<usize>) {
+        // An embedded note is shown as a link to it.
+        let note = wiki && !is_image(dest);
+        self.embeds.push(note);
+        if note {
+            self.links.push(Link {
+                dest: dest.to_string(),
+                wiki,
+            });
+            return;
+        }
+        // A linked image stays inline so it keeps its link.
+        if !self.links.is_empty() {
+            self.top().other_inline = true;
+        }
+        self.push_text("[image: ", self.style(), range);
+        self.image_depth += 1;
+        if self.image_depth == 1 {
+            self.image = Some((dest.to_string(), String::new(), wiki));
+        }
     }
 
     fn end(&mut self, tag: TagEnd) {
@@ -456,71 +438,37 @@ impl<'a> Builder<'a> {
             TagEnd::Link => {
                 self.links.pop();
             }
-            TagEnd::Image => {
-                if self.embeds.pop() == Some(true) {
-                    self.links.pop();
-                    return;
-                }
-                self.image_depth = self.image_depth.saturating_sub(1);
-                if self.image_depth == 0
-                    && let Some(image) = self.image.take()
-                {
-                    self.top().images.push(image);
-                }
-                let end = self.top().inline_span.as_ref().map_or(0, |s| s.end);
-                self.push_text("]", self.style(), end..end);
-            }
+            TagEnd::Image => self.end_image(),
             _ => {}
         }
+    }
+
+    fn end_image(&mut self) {
+        if self.embeds.pop() == Some(true) {
+            self.links.pop();
+            return;
+        }
+        self.image_depth = self.image_depth.saturating_sub(1);
+        if self.image_depth == 0
+            && let Some(image) = self.image.take()
+        {
+            self.top().images.push(image);
+        }
+        let end = self.top().inline_span.as_ref().map_or(0, |s| s.end);
+        self.push_text("]", self.style(), end..end);
     }
 
     /// Pop the top frame and add what it built to its parent.
     fn close(&mut self) {
         let mut frame = self.stack.pop().expect("frame to close");
         let span = frame.span.clone();
-        let kind = std::mem::replace(&mut frame.kind, FrameKind::Root);
-        match kind {
+        let kind = match std::mem::replace(&mut frame.kind, FrameKind::Root) {
             FrameKind::Root => unreachable!("root frame is never closed"),
             FrameKind::Paragraph => {
-                for block in paragraph_blocks(&mut frame, span) {
-                    self.top().blocks.push(block);
-                }
+                let blocks = paragraph_blocks(&mut frame, span);
+                self.top().blocks.extend(blocks);
+                return;
             }
-            FrameKind::Heading(level) => {
-                let content = std::mem::take(&mut frame.inlines);
-                self.push_block(BlockKind::Heading { level, content }, span);
-            }
-            FrameKind::Quote => {
-                frame.flush_inlines();
-                self.push_block(BlockKind::Quote(frame.blocks), span);
-            }
-            FrameKind::Code { lang, code } => {
-                let kind = match lang.as_deref() {
-                    Some("mermaid") => BlockKind::Figure {
-                        kind: FigureKind::Mermaid,
-                        source: code,
-                    },
-                    Some("math") => BlockKind::Figure {
-                        kind: FigureKind::Math,
-                        source: code,
-                    },
-                    _ => BlockKind::Code { lang, code },
-                };
-                self.push_block(kind, span);
-            }
-            FrameKind::Html(html) => self.push_block(BlockKind::Html(html), span),
-            FrameKind::List {
-                start,
-                tight,
-                items,
-            } => self.push_block(
-                BlockKind::List {
-                    start,
-                    tight,
-                    items,
-                },
-                span,
-            ),
             FrameKind::Item { task } => {
                 frame.flush_inlines();
                 if let FrameKind::List { items, .. } = &mut self.top().kind {
@@ -529,8 +477,29 @@ impl<'a> Builder<'a> {
                         blocks: frame.blocks,
                     });
                 }
+                return;
             }
-        }
+            FrameKind::Heading(level) => BlockKind::Heading {
+                level,
+                content: frame.inlines,
+            },
+            FrameKind::Quote => {
+                frame.flush_inlines();
+                BlockKind::Quote(frame.blocks)
+            }
+            FrameKind::Code { lang, code } => code_block(lang, code),
+            FrameKind::Html(html) => BlockKind::Html(html),
+            FrameKind::List {
+                start,
+                tight,
+                items,
+            } => BlockKind::List {
+                start,
+                tight,
+                items,
+            },
+        };
+        self.push_block(kind, span);
     }
 
     fn push_block(&mut self, kind: BlockKind, span: Range<usize>) {
@@ -539,13 +508,38 @@ impl<'a> Builder<'a> {
         top.blocks.push(Block { kind, span });
     }
 
+    /// Mark the open list item as a task. In a loose list the marker comes
+    /// inside the item's paragraph, so the item is the frame below it.
+    fn mark_task(&mut self, done: bool) {
+        let item = match self.top().kind {
+            FrameKind::Item { .. } => self.stack.last_mut(),
+            _ => self.under_top(),
+        };
+        if let Some(Frame {
+            kind: FrameKind::Item { task },
+            ..
+        }) = item
+        {
+            *task = Some(done);
+        }
+    }
+
+    /// Mark the list holding the item on top of the stack as loose.
     fn mark_list_loose(&mut self) {
-        let len = self.stack.len();
-        if len >= 2
-            && let FrameKind::List { tight, .. } = &mut self.stack[len - 2].kind
+        if let Some(Frame {
+            kind: FrameKind::List { tight, .. },
+            ..
+        }) = self.under_top()
         {
             *tight = false;
         }
+    }
+
+    /// The frame below the top one: the item holding a paragraph, or the
+    /// list holding an item.
+    fn under_top(&mut self) -> Option<&mut Frame> {
+        let len = self.stack.len();
+        len.checked_sub(2).map(|i| &mut self.stack[i])
     }
 
     fn text(&mut self, text: &str, style: InlineStyle, range: Range<usize>) {
@@ -584,6 +578,37 @@ impl<'a> Builder<'a> {
         let top = self.top();
         top.inlines.push(inline);
         extend_span(&mut top.inline_span, range);
+    }
+}
+
+fn is_wiki(link_type: LinkType) -> bool {
+    matches!(link_type, LinkType::WikiLink { .. })
+}
+
+/// The language of a code block: the first word of a fence's info string,
+/// without attributes after a comma such as `rust,no_run`.
+fn code_lang(kind: CodeBlockKind) -> Option<String> {
+    match kind {
+        CodeBlockKind::Fenced(info) => info
+            .split_whitespace()
+            .next()
+            .and_then(|word| word.split(',').next())
+            .map(str::to_string),
+        CodeBlockKind::Indented => None,
+    }
+}
+
+/// A fenced block in `mermaid` or `math`, in any case, is a figure; any
+/// other is code.
+fn code_block(lang: Option<String>, code: String) -> BlockKind {
+    let figure = match lang.as_deref() {
+        Some(n) if n.eq_ignore_ascii_case("mermaid") => FigureKind::Mermaid,
+        Some(n) if n.eq_ignore_ascii_case("math") => FigureKind::Math,
+        _ => return BlockKind::Code { lang, code },
+    };
+    BlockKind::Figure {
+        kind: figure,
+        source: code,
     }
 }
 
@@ -741,6 +766,54 @@ mod tests {
     }
 
     #[test]
+    fn a_loose_list_keeps_its_task_markers() {
+        let blocks = kinds("- loose\n\n- [x] done\n");
+        let BlockKind::List {
+            tight: false,
+            items,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected a loose list, got {blocks:?}");
+        };
+        assert_eq!(items[0].task, None);
+        assert_eq!(items[1].task, Some(true));
+        assert_eq!(
+            items[1].blocks[0].kind,
+            BlockKind::Paragraph(vec![text("done")])
+        );
+    }
+
+    #[test]
+    fn loose_task_markers_unchecked_first_and_nested() {
+        let tasks = |items: &[ListItem]| items.iter().map(|i| i.task).collect::<Vec<_>>();
+        let blocks = kinds("- [ ] a\n\n- b\n");
+        let BlockKind::List {
+            tight: false,
+            items,
+            ..
+        } = &blocks[0]
+        else {
+            panic!("expected a loose list, got {blocks:?}");
+        };
+        assert_eq!(tasks(items), [Some(false), None]);
+        let blocks = kinds("- x\n  - [ ] a\n\n  - [x] b\n");
+        let BlockKind::List { items, .. } = &blocks[0] else {
+            panic!("expected a list, got {blocks:?}");
+        };
+        assert_eq!(tasks(items), [None]);
+        let BlockKind::List {
+            tight: false,
+            items,
+            ..
+        } = &items[0].blocks[1].kind
+        else {
+            panic!("expected a nested loose list, got {:?}", items[0].blocks);
+        };
+        assert_eq!(tasks(items), [Some(false), Some(true)]);
+    }
+
+    #[test]
     fn loose_ordered_list() {
         let blocks = kinds("3. one\n\n4. two\n");
         assert!(matches!(
@@ -776,6 +849,39 @@ mod tests {
                 code: "fn main() {}\n".into()
             }]
         );
+    }
+
+    #[test]
+    fn figure_fences_ignore_case_and_attributes() {
+        for (md, kind) in [
+            ("```Mermaid\ngraph TD\n```\n", FigureKind::Mermaid),
+            ("```mermaid,foo\ngraph TD\n```\n", FigureKind::Mermaid),
+            ("```MATH\ngraph TD\n```\n", FigureKind::Math),
+        ] {
+            assert_eq!(
+                kinds(md),
+                vec![BlockKind::Figure {
+                    kind,
+                    source: "graph TD\n".into()
+                }],
+                "{md:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn math_fence_with_attributes_is_a_figure_and_near_misses_stay_code() {
+        assert_eq!(
+            kinds("```math,display\nx^2\n```\n"),
+            vec![BlockKind::Figure {
+                kind: FigureKind::Math,
+                source: "x^2\n".into()
+            }]
+        );
+        for lang in ["mermaidx", "mermaid-js"] {
+            let blocks = kinds(&format!("```{lang}\ngraph TD\n```\n"));
+            assert!(matches!(&blocks[0], BlockKind::Code { .. }), "{blocks:?}");
+        }
     }
 
     #[test]
@@ -943,6 +1049,285 @@ mod tests {
         assert_eq!(
             kinds("---\n\n<div>hi</div>\n"),
             vec![BlockKind::Rule, BlockKind::Html("<div>hi</div>\n".into())]
+        );
+    }
+
+    /// Every field of the parsed blocks as indented lines, one block or
+    /// inline per line, so a test can pin the whole of the builder's output.
+    fn outline(md: &str) -> String {
+        let mut out = String::new();
+        outline_blocks(&parse(md).blocks, 0, &mut out);
+        out
+    }
+
+    fn outline_blocks(blocks: &[Block], depth: usize, out: &mut String) {
+        for Block { kind, span } in blocks {
+            let pad = "  ".repeat(depth);
+            let head = match kind {
+                BlockKind::Heading { level, .. } => format!("heading {level}"),
+                BlockKind::Paragraph(_) => "paragraph".to_string(),
+                BlockKind::Code { lang, code } => format!("code {lang:?} {code:?}"),
+                BlockKind::Quote(_) => "quote".to_string(),
+                BlockKind::List { start, tight, .. } => format!("list {start:?} tight={tight}"),
+                BlockKind::Rule => "rule".to_string(),
+                BlockKind::Html(html) => format!("html {html:?}"),
+                BlockKind::Image { src, alt, wiki } => {
+                    format!("image {src:?} alt={alt:?} wiki={wiki}")
+                }
+                BlockKind::Figure { kind, source } => format!("figure {kind:?} {source:?}"),
+            };
+            out.push_str(&format!("{pad}{head} @{span:?}\n"));
+            match kind {
+                BlockKind::Heading { content, .. } | BlockKind::Paragraph(content) => {
+                    outline_inlines(content, depth + 1, out);
+                }
+                BlockKind::Quote(blocks) => outline_blocks(blocks, depth + 1, out),
+                BlockKind::List { items, .. } => {
+                    for ListItem { task, blocks } in items {
+                        out.push_str(&format!("{pad}  item task={task:?}\n"));
+                        outline_blocks(blocks, depth + 2, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn outline_inlines(inlines: &[Inline], depth: usize, out: &mut String) {
+        let pad = "  ".repeat(depth);
+        for inline in inlines {
+            let line = match inline {
+                Inline::Break => "break".to_string(),
+                Inline::Text { text, style } => {
+                    let InlineStyle {
+                        emphasis,
+                        strong,
+                        strikethrough,
+                        code,
+                        math,
+                        link,
+                    } = style;
+                    let mut line = format!("{text:?}");
+                    for (on, name) in [
+                        (emphasis, "em"),
+                        (strong, "strong"),
+                        (strikethrough, "strike"),
+                        (code, "code"),
+                        (math, "math"),
+                    ] {
+                        if *on {
+                            line.push_str(&format!(" {name}"));
+                        }
+                    }
+                    if let Some(Link { dest, wiki }) = link {
+                        line.push_str(&format!(" link={dest:?} wiki={wiki}"));
+                    }
+                    line
+                }
+            };
+            out.push_str(&format!("{pad}{line}\n"));
+        }
+    }
+
+    #[track_caller]
+    fn assert_outline(md: &str, expected: &str) {
+        assert_eq!(outline(md), expected, "markdown: {md:?}");
+    }
+
+    #[test]
+    fn pin_headings_atx_setext_and_inline_code() {
+        assert_outline(
+            "## Heading `code`\nSetext\n===\n",
+            r#"heading 2 @0..18
+  "Heading "
+  "code" code
+heading 1 @18..29
+  "Setext"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_nested_inline_styles() {
+        assert_outline(
+            "***strong em*** ~~*x*~~ [a **b** `c`](u)  \nend\n",
+            r#"paragraph @0..47
+  "strong em" em strong
+  " "
+  "x" em strike
+  " "
+  "a " link="u" wiki=false
+  "b" strong link="u" wiki=false
+  " " link="u" wiki=false
+  "c" code link="u" wiki=false
+  break
+  "end"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_wiki_links() {
+        assert_outline(
+            "# Wiki *a* [[Note]]\n\nsee [[Note#Part|the part]] and [[Other]]\n",
+            r#"heading 1 @0..20
+  "Wiki "
+  "a" em
+  " "
+  "Note" link="Note" wiki=true
+paragraph @21..62
+  "see "
+  "the part" link="Note#Part" wiki=true
+  " and "
+  "Other" link="Other" wiki=true
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_wiki_embeds_of_images_and_notes() {
+        assert_outline(
+            "![[pic.png]]\n",
+            "image \"pic.png\" alt=\"pic.png\" wiki=true @0..13\n",
+        );
+        assert_outline(
+            "![[Note]]\n",
+            r#"paragraph @0..10
+  "Note" link="Note" wiki=true
+"#,
+        );
+        assert_outline(
+            "text ![[Note|alias]] more\n",
+            r#"paragraph @0..26
+  "text "
+  "alias" link="Note" wiki=true
+  " more"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_images() {
+        assert_outline(
+            "![outer ![inner](i.png) alt](o.png)\n",
+            "image \"o.png\" alt=\"outer inner alt\" wiki=false @0..36\n",
+        );
+        assert_outline(
+            "- item\n\n  ![x](x.png)\n",
+            r#"list None tight=false @0..22
+  item task=None
+    paragraph @2..7
+      "item"
+    image "x.png" alt="x" wiki=false @10..22
+"#,
+        );
+        assert_outline(
+            "![a](a.png) ![b](b.png)\n",
+            r#"paragraph @0..24
+  "[image: a] [image: b]"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_nested_quotes_and_lists() {
+        assert_outline(
+            "> outer\n> > inner\n> > - item\n",
+            r#"quote @0..29
+  paragraph @2..8
+    "outer"
+  quote @10..29
+    paragraph @12..18
+      "inner"
+    list None tight=true @22..29
+      item task=None
+        paragraph @24..28
+          "item"
+"#,
+        );
+        assert_outline(
+            "1. a\n   - [ ] b\n     > c\n2. d\n",
+            r#"list Some(1) tight=true @0..30
+  item task=None
+    paragraph @3..4
+      "a"
+    list None tight=true @8..25
+      item task=Some(false)
+        paragraph @14..15
+          "b"
+        quote @21..25
+          paragraph @23..25
+            "c"
+  item task=None
+    paragraph @28..29
+      "d"
+"#,
+        );
+        assert_outline(
+            "- one\n\n  two\n- three\n",
+            r#"list None tight=false @0..21
+  item task=None
+    paragraph @2..6
+      "one"
+    paragraph @9..13
+      "two"
+  item task=None
+    paragraph @15..21
+      "three"
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_code_fences() {
+        assert_outline(
+            "```\nplain\n```\n\n    indented\n\n``` rust  extra\nlet x;\n```\n",
+            r#"code None "plain\n" @0..13
+code None "indented\n" @19..28
+code Some("rust") "let x;\n" @29..55
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_maths_and_mermaid_figures() {
+        assert_outline(
+            "```math\nx^2\n```\n\n```mermaid\ngraph TD\n```\n\n$$a$$\n$$b$$\n",
+            r#"figure Math "x^2\n" @0..15
+figure Mermaid "graph TD\n" @17..40
+figure Math "a" @42..54
+figure Math "b" @42..54
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_tables() {
+        assert_outline(
+            "> | a |\n> |---|\n\nafter *x*\n",
+            r#"quote @0..16
+  figure Table "| a |\n|---|" @2..16
+paragraph @17..27
+  "after "
+  "x" em
+"#,
+        );
+    }
+
+    #[test]
+    fn pin_footnotes_html_and_rules() {
+        assert_outline(
+            "Text[^1].\n\n[^1]: The note.\n\n<!-- c -->\n\na <b>bold</b> c\n\n***\n___\n",
+            r#"paragraph @0..10
+  "Text[^1]."
+paragraph @11..27
+  "[^1]: The note."
+html "<!-- c -->\n" @28..39
+paragraph @40..56
+  "a <b>bold</b> c"
+rule @57..61
+rule @61..65
+"#,
         );
     }
 }

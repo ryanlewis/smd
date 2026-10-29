@@ -20,6 +20,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -66,6 +67,15 @@ impl Action {
             Action::Back => &["backspace", "H", "alt-left"],
             Action::Forward => &["L", "alt-right"],
         }
+    }
+
+    /// Every default key name, for checking the help lists them.
+    #[cfg(test)]
+    pub fn all_default_keys() -> Vec<&'static str> {
+        Action::ALL
+            .into_iter()
+            .flat_map(|a| a.defaults().iter().copied())
+            .collect()
     }
 
     const ALL: [Action; 14] = [
@@ -205,10 +215,18 @@ impl Config {
     /// Read the config file. A missing file gives the defaults; one that
     /// cannot be read or has a mistake in it is an error that names it.
     pub fn load() -> Result<Config, String> {
-        let Some(path) = path() else {
+        Config::load_from(path(), |p| std::fs::read_to_string(p))
+    }
+
+    /// `load` for a given path and a way to read it.
+    fn load_from(
+        path: Option<PathBuf>,
+        read: impl FnOnce(&Path) -> std::io::Result<String>,
+    ) -> Result<Config, String> {
+        let Some(path) = path else {
             return Ok(Config::default());
         };
-        match std::fs::read_to_string(&path) {
+        match read(&path) {
             Ok(text) => Config::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
@@ -257,9 +275,17 @@ impl Config {
 
 /// Where the config file is.
 fn path() -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+    path_in(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// `path` for given values of `$XDG_CONFIG_HOME` and `$HOME`.
+fn path_in(xdg_config_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let base = match xdg_config_home {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+        _ => PathBuf::from(home?).join(".config"),
     };
     Some(base.join("smd").join("config.toml"))
 }
@@ -354,5 +380,60 @@ mod tests {
             let err = Config::from_str(text).unwrap_err();
             assert!(err.contains(wanted), "{text}: {err}");
         }
+    }
+
+    fn os(s: &str) -> Option<OsString> {
+        Some(OsString::from(s))
+    }
+
+    #[test]
+    fn the_path_is_under_xdg_config_home_else_home() {
+        let want = |p: &str| Some(PathBuf::from(p));
+        assert_eq!(path_in(os("/x"), os("/h")), want("/x/smd/config.toml"));
+        assert_eq!(path_in(None, os("/h")), want("/h/.config/smd/config.toml"));
+        assert_eq!(
+            path_in(os(""), os("/h")),
+            want("/h/.config/smd/config.toml")
+        );
+        assert_eq!(path_in(os("/x"), None), want("/x/smd/config.toml"));
+        assert_eq!(path_in(None, None), None);
+        assert_eq!(path_in(os(""), None), None);
+    }
+
+    #[test]
+    fn no_path_gives_the_defaults() {
+        let c = Config::load_from(None, |_| panic!("nothing to read")).unwrap();
+        assert!(c.mouse);
+    }
+
+    #[test]
+    fn a_missing_file_gives_the_defaults() {
+        let c = Config::load_from(Some("/c".into()), |_| {
+            Err(std::io::ErrorKind::NotFound.into())
+        })
+        .unwrap();
+        assert_eq!(c.home, None);
+    }
+
+    #[test]
+    fn a_file_is_read_from_its_path() {
+        let c = Config::load_from(Some("/c/config.toml".into()), |p| {
+            assert_eq!(p, Path::new("/c/config.toml"));
+            Ok("mouse = false\n".into())
+        })
+        .unwrap();
+        assert!(!c.mouse);
+    }
+
+    #[test]
+    fn a_mistake_or_an_unreadable_file_names_the_path() {
+        let err = Config::load_from(Some("/c/config.toml".into()), |_| Ok("mouse = 1\n".into()))
+            .unwrap_err();
+        assert!(err.starts_with("/c/config.toml: "), "{err}");
+        let err = Config::load_from(Some("/c/config.toml".into()), |_| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        })
+        .unwrap_err();
+        assert!(err.starts_with("/c/config.toml: "), "{err}");
     }
 }

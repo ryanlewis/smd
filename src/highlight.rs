@@ -34,8 +34,6 @@ pub type Segments = Vec<(String, Style)>;
 /// Diffs need no syntaxes.
 pub fn highlight(set: Option<&SyntaxSet>, lang: &str, code: &str) -> Option<Vec<Segments>> {
     let code = code.trim_end_matches('\n');
-    // Attributes such as `rust,no_run` follow the language after a comma.
-    let lang = lang.split(',').next().unwrap_or(lang);
     if lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch") {
         return Some(diff(code));
     }
@@ -204,11 +202,25 @@ mod tests {
     }
 
     #[test]
-    fn attributes_after_a_comma_are_not_part_of_the_language() {
-        let lines = highlight(Some(syntax_set()), "rust,no_run", "fn main() {}").unwrap();
-        assert_eq!(
-            lines[0][0],
-            ("fn".to_string(), Style::new().fg(Color::Magenta))
-        );
+    fn fences_with_attributes_are_coloured_as_their_language() {
+        for md in [
+            "```rust,no_run\nfn main() {}\n```\n",
+            "```rust,ignore\nfn main() {}\n```\n",
+        ] {
+            let doc = crate::doc::parse(md);
+            let crate::doc::BlockKind::Code {
+                lang: Some(lang),
+                code,
+            } = &doc.blocks[0].kind
+            else {
+                panic!("expected code, got {:?}", doc.blocks);
+            };
+            let lines = highlight(Some(syntax_set()), lang, code).unwrap();
+            assert_eq!(
+                lines[0][0],
+                ("fn".to_string(), Style::new().fg(Color::Magenta)),
+                "{md:?}"
+            );
+        }
     }
 }

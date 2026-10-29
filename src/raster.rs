@@ -488,4 +488,219 @@ mod tests {
         assert_eq!(data[16..24], crate::images::tests::png(30, 7)[16..24]);
         assert!(canvas.png().is_ok());
     }
+
+    /// A PNG of `width` by `height` with the given colour type and depth.
+    fn png_of(
+        (width, height): (u32, u32),
+        color: png::ColorType,
+        depth: png::BitDepth,
+        palette: Option<(&[u8], Option<&[u8]>)>,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(color);
+        encoder.set_depth(depth);
+        if let Some((colours, alpha)) = palette {
+            encoder.set_palette(colours.to_vec());
+            if let Some(alpha) = alpha {
+                encoder.set_trns(alpha.to_vec());
+            }
+        }
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(data).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    fn pixels_of(bitmap: &Bitmap) -> &[Rgba] {
+        &bitmap.pixels
+    }
+
+    #[test]
+    fn decode_keeps_rgba_and_adds_opaque_alpha_to_rgb() {
+        let rgba = png_of(
+            (2, 1),
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            None,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        );
+        let bitmap = Bitmap::decode(&rgba).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[1, 2, 3, 4], [5, 6, 7, 8]]);
+        let rgb = png_of(
+            (2, 1),
+            png::ColorType::Rgb,
+            png::BitDepth::Eight,
+            None,
+            &[1, 2, 3, 4, 5, 6],
+        );
+        let bitmap = Bitmap::decode(&rgb).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[1, 2, 3, 255], [4, 5, 6, 255]]);
+    }
+
+    #[test]
+    fn decode_spreads_grey_over_the_colour_channels() {
+        let grey = png_of(
+            (2, 1),
+            png::ColorType::Grayscale,
+            png::BitDepth::Eight,
+            None,
+            &[10, 200],
+        );
+        let bitmap = Bitmap::decode(&grey).unwrap();
+        assert_eq!(
+            pixels_of(&bitmap),
+            [[10, 10, 10, 255], [200, 200, 200, 255]]
+        );
+        let with_alpha = png_of(
+            (2, 1),
+            png::ColorType::GrayscaleAlpha,
+            png::BitDepth::Eight,
+            None,
+            &[10, 20, 200, 255],
+        );
+        let bitmap = Bitmap::decode(&with_alpha).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[10, 10, 10, 20], [200, 200, 200, 255]]);
+    }
+
+    #[test]
+    fn decode_scales_low_bit_depth_grey_to_eight_bits() {
+        // One bit per pixel, packed from the high bit: black, white.
+        let one = png_of(
+            (2, 1),
+            png::ColorType::Grayscale,
+            png::BitDepth::One,
+            None,
+            &[0b0100_0000],
+        );
+        let bitmap = Bitmap::decode(&one).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[0, 0, 0, 255], [255, 255, 255, 255]]);
+        // Four bits per pixel: 0x0 and 0xF.
+        let four = png_of(
+            (2, 1),
+            png::ColorType::Grayscale,
+            png::BitDepth::Four,
+            None,
+            &[0x0F],
+        );
+        let bitmap = Bitmap::decode(&four).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[0, 0, 0, 255], [255, 255, 255, 255]]);
+    }
+
+    #[test]
+    fn decode_keeps_the_high_byte_of_sixteen_bit_samples() {
+        let rgba = png_of(
+            (1, 1),
+            png::ColorType::Rgba,
+            png::BitDepth::Sixteen,
+            None,
+            &[0x12, 0xFF, 0x56, 0xFF, 0x9A, 0xFF, 0xDE, 0xFF],
+        );
+        let bitmap = Bitmap::decode(&rgba).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[0x12, 0x56, 0x9A, 0xDE]]);
+        let grey = png_of(
+            (1, 1),
+            png::ColorType::Grayscale,
+            png::BitDepth::Sixteen,
+            None,
+            &[0x80, 0xFF],
+        );
+        let bitmap = Bitmap::decode(&grey).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[0x80, 0x80, 0x80, 255]]);
+    }
+
+    #[test]
+    fn decode_looks_up_palette_colours_and_their_transparency() {
+        let colours = [255, 0, 0, 0, 255, 0];
+        let opaque = png_of(
+            (2, 1),
+            png::ColorType::Indexed,
+            png::BitDepth::Eight,
+            Some((&colours, None)),
+            &[1, 0],
+        );
+        let bitmap = Bitmap::decode(&opaque).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[0, 255, 0, 255], [255, 0, 0, 255]]);
+        // A tRNS chunk gives the first entry half cover and leaves the rest
+        // opaque.
+        let clear = png_of(
+            (2, 1),
+            png::ColorType::Indexed,
+            png::BitDepth::Eight,
+            Some((&colours, Some(&[128]))),
+            &[0, 1],
+        );
+        let bitmap = Bitmap::decode(&clear).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[255, 0, 0, 128], [0, 255, 0, 255]]);
+        // Packed two bits per pixel.
+        let packed = png_of(
+            (2, 1),
+            png::ColorType::Indexed,
+            png::BitDepth::Two,
+            Some((&colours, None)),
+            &[0b0100_0000],
+        );
+        let bitmap = Bitmap::decode(&packed).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[0, 255, 0, 255], [255, 0, 0, 255]]);
+    }
+
+    #[test]
+    fn decode_refuses_data_that_is_not_a_whole_png() {
+        assert!(Bitmap::decode(&[]).is_none());
+        assert!(Bitmap::decode(b"not a png at all").is_none());
+        let good = png_of(
+            (4, 4),
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            None,
+            &[9; 64],
+        );
+        assert!(Bitmap::decode(&good).is_some());
+        // Cut off in the header, and in the middle of the image data.
+        assert!(Bitmap::decode(&good[..20]).is_none());
+        assert!(Bitmap::decode(&good[..good.len() - 20]).is_none());
+        // A flipped byte in the compressed data fails the checksum.
+        let mut bad = good.clone();
+        let at = bad.len() - 20;
+        bad[at] ^= 0xFF;
+        assert!(Bitmap::decode(&bad).is_none());
+    }
+
+    #[test]
+    fn encode_reports_pixels_that_do_not_fit_the_size() {
+        assert!(encode(2, 2, png::ColorType::Rgba, &[0; 3]).is_err());
+        let data = encode(2, 1, png::ColorType::Grayscale, &[7, 9]).unwrap();
+        let bitmap = Bitmap::decode(&data).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[7, 7, 7, 255], [9, 9, 9, 255]]);
+    }
+
+    #[test]
+    fn decode_starts_each_packed_row_on_a_byte() {
+        // 3 by 2 at one bit per pixel: each row takes one byte.
+        let data = png_of(
+            (3, 2),
+            png::ColorType::Grayscale,
+            png::BitDepth::One,
+            None,
+            &[0b1010_0000, 0b0100_0000],
+        );
+        let bitmap = Bitmap::decode(&data).unwrap();
+        let (b, w) = ([0, 0, 0, 255], [255, 255, 255, 255]);
+        assert_eq!(pixels_of(&bitmap), [w, b, w, b, w, b]);
+    }
+
+    #[test]
+    fn decode_turns_a_colour_key_into_transparency() {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, 2, 1);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_trns(vec![0, 50]);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[50, 60]).unwrap();
+        writer.finish().unwrap();
+        let bitmap = Bitmap::decode(&out).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[50, 50, 50, 0], [60, 60, 60, 255]]);
+    }
 }

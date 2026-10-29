@@ -5,8 +5,10 @@ use std::io::{self, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::{Cell, CellDiffOption};
 use ratatui::crossterm::event::{
     self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -15,7 +17,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::{DefaultTerminal, Frame, Terminal};
 
 use crate::config::{Action, Config, WebLinks};
 use crate::doc::{self, BlockKind, Document, Inline, Link};
@@ -48,6 +50,9 @@ pub struct View {
     notice: Option<String>,
     /// The selected link, as an index into the layout's links.
     selected: Option<usize>,
+    /// Other notes, with their image directories, whose images are kept so
+    /// they show at once when the reader goes back to them.
+    kept: Vec<(Rc<Document>, PathBuf)>,
 }
 
 /// What an action asks of the browser around the view.
@@ -105,6 +110,7 @@ impl View {
             scroll: 0,
             notice: None,
             selected: None,
+            kept: Vec::new(),
         };
         view.want_images();
         view
@@ -147,6 +153,9 @@ impl View {
     fn want_images(&mut self) {
         let mut wanted = Vec::new();
         images::wanted_in(&self.doc.blocks, &self.base, &mut wanted);
+        for (doc, base) in &self.kept {
+            images::wanted_in(&doc.blocks, base, &mut wanted);
+        }
         self.images.want(wanted);
     }
 
@@ -480,6 +489,7 @@ pub fn folder(path: &Path) -> PathBuf {
 /// A note left by following a link, to come back to.
 struct Visited {
     path: PathBuf,
+    doc: Rc<Document>,
     scroll: usize,
     selected: Option<usize>,
 }
@@ -498,6 +508,10 @@ pub struct Browser {
     ahead: Vec<Visited>,
     /// The notice on screen is about the last key, and goes at the next.
     passing: bool,
+    /// Where a copied link's OSC 52 sequence is written: the terminal.
+    clipboard: Box<dyn Write>,
+    /// What opens a link that is handed on.
+    opener: fn(&str) -> io::Result<()>,
 }
 
 impl Browser {
@@ -511,6 +525,8 @@ impl Browser {
             history: Vec::new(),
             ahead: Vec::new(),
             passing: false,
+            clipboard: Box::new(io::stdout()),
+            opener: open_with_system,
         }
     }
 
@@ -623,6 +639,7 @@ impl Browser {
     fn here(&self) -> Visited {
         Visited {
             path: self.path.clone(),
+            doc: Rc::new(self.view.doc.clone()),
             scroll: self.view.scroll,
             selected: self.view.selected,
         }
@@ -707,6 +724,13 @@ impl Browser {
             self.vault = Vault::for_file(&path);
         }
         let doc = parse(&self.vault, &source, &path);
+        // Keep the images of the nearest notes Back and Forward lead to, and
+        // of the one being left, which is about to join them.
+        let back = self.history.iter().rev().take(KEEP_IMAGES_OF);
+        let notes = back.chain(self.ahead.iter().rev().take(KEEP_IMAGES_OF));
+        let mut kept: Vec<_> = notes.map(|v| (v.doc.clone(), folder(&v.path))).collect();
+        kept.push((Rc::new(self.view.doc.clone()), folder(&self.path)));
+        self.view.kept = kept;
         self.view.show(doc, folder(&path));
         self.view.set_notice(None);
         self.watcher = watcher;
@@ -719,13 +743,13 @@ impl Browser {
     fn hand_on(&mut self, target: &str) {
         match self.config.web_links {
             WebLinks::Open => {
-                if let Err(err) = open_with_system(target) {
+                if let Err(err) = (self.opener)(target) {
                     self.say(format!("cannot open {target}: {err}"));
                 }
             }
             WebLinks::Copy => {
                 let osc = format!("\x1b]52;c;{}\x1b\\", kitty::base64(target.as_bytes()));
-                let mut out = io::stdout();
+                let out = &mut self.clipboard;
                 match out.write_all(osc.as_bytes()).and_then(|()| out.flush()) {
                     Ok(()) => self.say(format!("copied {target}")),
                     Err(err) => self.say(format!("cannot copy: {err}")),
@@ -769,6 +793,9 @@ fn open_with_system(target: &str) -> io::Result<()> {
 const BACK_BUTTON: &str = " ← Back ";
 const FORWARD_BUTTON: &str = " Forward → ";
 
+/// How many notes each way along Back and Forward keep their images.
+const KEEP_IMAGES_OF: usize = 8;
+
 /// How far one step of the mouse wheel scrolls.
 const WHEEL_LINES: isize = 3;
 
@@ -780,13 +807,42 @@ pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 /// Run the browser until the reader quits, reloading the note when its file
 /// changes. Images are deleted from the terminal however it ends.
 pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<()> {
-    let result = run_browser(terminal, &mut browser);
+    let result = run_browser(terminal, &mut browser, &mut Live);
     let deleted = browser.view.images.delete_all(terminal.backend_mut());
     result.and(deleted)
 }
 
-fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Result<()> {
-    let mut last_check = Instant::now();
+/// Where the run loop gets the terminal's events and the time, so a test
+/// can stand in for both.
+trait Input {
+    fn now(&self) -> Instant;
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+/// The real terminal and clock.
+struct Live;
+
+impl Input for Live {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
+fn run_browser<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    browser: &mut Browser,
+    input: &mut impl Input,
+) -> io::Result<()> {
+    let mut last_check = input.now();
     let mut redraw = true;
     loop {
         if redraw {
@@ -794,10 +850,11 @@ fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Res
             browser.view.flush_images(terminal.backend_mut())?;
             redraw = false;
         }
-        if event::poll(CHECK_EVERY.saturating_sub(last_check.elapsed()))? {
+        let elapsed = input.now().saturating_duration_since(last_check);
+        if input.poll(CHECK_EVERY.saturating_sub(elapsed))? {
             // A resize needs no handling beyond the redraw.
             redraw = true;
-            match event::read()? {
+            match input.read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press && browser.key(key) => {
                     return Ok(());
                 }
@@ -805,8 +862,8 @@ fn run_browser(terminal: &mut DefaultTerminal, browser: &mut Browser) -> io::Res
                 _ => {}
             }
         }
-        if last_check.elapsed() >= CHECK_EVERY {
-            last_check = Instant::now();
+        if input.now().saturating_duration_since(last_check) >= CHECK_EVERY {
+            last_check = input.now();
             if let Some(change) = browser.watcher.check() {
                 apply(&mut browser.view, &browser.path, &browser.vault, change);
                 redraw = true;
@@ -1318,8 +1375,8 @@ mod tests {
     #[test]
     fn file_urls_escape_what_a_url_cannot_hold() {
         assert_eq!(
-            file_url(Path::new("/n/betty (G3).md")),
-            "file:///n/betty%20%28G3%29.md"
+            file_url(Path::new("/n/my note (1).md")),
+            "file:///n/my%20note%20%281%29.md"
         );
     }
 
@@ -1418,6 +1475,377 @@ mod tests {
         // Nothing to go back to.
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(b.path, dir.join("HOME.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A browser as `browser` makes, with the syntaxes loaded first, so
+    /// they cannot arrive part way through a test and cause a redraw.
+    fn loaded(name: &str, files: &[(&str, &str)]) -> (Browser, PathBuf) {
+        highlight::syntax_set();
+        browser(name, files)
+    }
+
+    /// One step of a scripted run: an event that arrives a while into a
+    /// poll, a poll that times out with nothing, or polls that time out
+    /// until something new is drawn, for work on other threads.
+    enum Step {
+        After(Duration, Event),
+        Wait,
+        Drawn,
+    }
+
+    /// Input from a script, with a clock that moves only when it says.
+    struct Script {
+        now: Instant,
+        steps: std::collections::VecDeque<Step>,
+        /// How long each poll was asked to wait.
+        timeouts: Vec<Duration>,
+        /// What the terminal was sent.
+        out: Shared,
+        /// How much had been sent when the `Drawn` in front was reached, and
+        /// when.
+        sent: Option<(usize, Instant)>,
+    }
+
+    impl Input for Script {
+        fn now(&self) -> Instant {
+            self.now
+        }
+
+        fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+            self.timeouts.push(timeout);
+            match self.steps.front() {
+                Some(Step::After(after, _)) => {
+                    assert!(*after <= timeout, "{after:?} is past the {timeout:?} poll");
+                    self.now += *after;
+                    Ok(true)
+                }
+                Some(Step::Wait) => {
+                    self.steps.pop_front();
+                    self.now += timeout;
+                    Ok(false)
+                }
+                Some(Step::Drawn) => {
+                    let len = self.out.0.borrow().len();
+                    match self.sent {
+                        Some((sent, _)) if len > sent => {
+                            self.steps.pop_front();
+                            self.sent = None;
+                        }
+                        Some((_, since)) => {
+                            assert!(
+                                since.elapsed() < Duration::from_secs(5),
+                                "nothing new was drawn"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        None => self.sent = Some((len, Instant::now())),
+                    }
+                    self.now += timeout;
+                    Ok(false)
+                }
+                None => Err(io::Error::other("the script ran out")),
+            }
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            match self.steps.pop_front() {
+                Some(Step::After(_, event)) => Ok(event),
+                _ => panic!("read with no event polled"),
+            }
+        }
+    }
+
+    fn pressed(code: KeyCode) -> Step {
+        Step::After(
+            Duration::ZERO,
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+        )
+    }
+
+    fn quit() -> Step {
+        pressed(KeyCode::Char('q'))
+    }
+
+    /// The result of running `b` on `steps` in a 30x7 terminal, how many
+    /// frames were drawn, and how long each poll waited.
+    fn run_script(b: &mut Browser, steps: Vec<Step>) -> (io::Result<()>, usize, Vec<Duration>) {
+        let out = Shared::default();
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 30, 7)),
+        };
+        let mut terminal =
+            Terminal::with_options(CrosstermBackend::new(out.clone()), options).unwrap();
+        let mut script = Script {
+            now: Instant::now(),
+            steps: steps.into(),
+            timeouts: Vec::new(),
+            out,
+            sent: None,
+        };
+        let result = run_browser(&mut terminal, b, &mut script);
+        (result, terminal.get_frame().count(), script.timeouts)
+    }
+
+    #[test]
+    fn the_loop_draws_once_and_quits_on_a_quit_key() {
+        let (mut b, dir) = loaded("loop-quit", &[("a.md", "one\n")]);
+        let (result, frames, timeouts) = run_script(&mut b, vec![quit()]);
+        assert!(result.is_ok());
+        assert_eq!(frames, 1);
+        assert_eq!(timeouts, [CHECK_EVERY]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_redraws_after_events_but_not_while_nothing_changes() {
+        let (mut b, dir) = loaded("loop-idle", &[("a.md", "one\n")]);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        let steps = vec![
+            Step::Wait,
+            Step::Wait,
+            // Only a press quits; a release is one more event to draw after.
+            Step::After(Duration::ZERO, Event::Key(release)),
+            // A key with no action, part way into the wait for a check.
+            Step::After(
+                Duration::from_millis(100),
+                Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            ),
+            Step::Wait,
+            Step::After(Duration::ZERO, Event::Resize(30, 7)),
+            quit(),
+        ];
+        let (result, frames, timeouts) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 4);
+        let ms = Duration::from_millis;
+        // The poll after the key waits only for the rest of the check's time.
+        assert_eq!(
+            timeouts,
+            [
+                CHECK_EVERY,
+                CHECK_EVERY,
+                CHECK_EVERY,
+                CHECK_EVERY,
+                ms(50),
+                CHECK_EVERY,
+                CHECK_EVERY
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_ends_with_an_error_from_the_input() {
+        let (mut b, dir) = loaded("loop-error", &[("a.md", "one\n")]);
+        let (result, frames, _) = run_script(&mut b, vec![Step::Wait]);
+        assert_eq!(result.unwrap_err().to_string(), "the script ran out");
+        assert_eq!(frames, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_scrolls_with_the_wheel() {
+        let (mut b, dir) = loaded("loop-mouse", &[("a.md", &paragraphs(10))]);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let steps = vec![Step::After(Duration::ZERO, Event::Mouse(wheel)), quit()];
+        let (result, frames, _) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert_eq!(b.view.scroll, WHEEL_LINES as usize);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_reloads_the_note_when_its_file_changes() {
+        let (mut b, dir) = loaded("loop-change", &[("a.md", "one\n")]);
+        std::fs::write(dir.join("a.md"), "something else\n").unwrap();
+        // The change shows once two checks agree on it.
+        let steps = vec![Step::Wait, Step::Wait, Step::Wait, quit()];
+        let (result, frames, _) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert_eq!(top(&b.view), "something else");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_redraws_when_an_image_arrives() {
+        use crate::images::tests::png;
+        let (mut b, dir) = loaded("loop-image", &[("a.md", "one\n")]);
+        std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
+        b.view.show(parse("![a](a.png)\n"), dir.clone());
+        let lines = b.view.layout.lines.len();
+        let (result, frames, _) = run_script(&mut b, vec![Step::Drawn, quit()]);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert!(b.view.layout.lines.len() > lines, "the image took no rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_redraws_when_the_syntaxes_arrive() {
+        let (mut b, dir) = loaded("loop-syntaxes", &[("a.md", "```rust\nfn main() {}\n```\n")]);
+        highlight::syntax_set();
+        // As if the note were laid out before the syntaxes had loaded.
+        b.view.highlighted = false;
+        let (result, frames, _) = run_script(&mut b, vec![Step::Wait, quit()]);
+        assert!(result.is_ok());
+        assert_eq!(frames, 2);
+        assert!(b.view.highlighted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn syntaxes_lay_out_again_only_once_and_only_after_a_layout() {
+        highlight::syntax_set();
+        let mut v = View::new(parse("one\n"), ".".into(), Images::text());
+        // Not laid out yet: there is nothing to redo.
+        v.highlighted = false;
+        assert!(!v.receive_syntaxes());
+        v.resize(20, 5);
+        assert!(v.highlighted);
+        assert!(!v.receive_syntaxes());
+        v.highlighted = false;
+        assert!(v.receive_syntaxes());
+        assert!(v.highlighted);
+    }
+
+    /// A writer whose bytes the test can read after handing it over.
+    #[derive(Clone, Default)]
+    struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that always fails.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("no terminal"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn handing_on(name: &str, web_links: WebLinks) -> (Browser, PathBuf) {
+        let (mut b, dir) = browser(name, &[("a.md", "one\n")]);
+        b.config.web_links = web_links;
+        b.opener = |target| panic!("opened {target}");
+        b.clipboard = Box::new(Broken);
+        (b, dir)
+    }
+
+    #[test]
+    fn handing_on_opens_with_the_opener() {
+        let (mut b, dir) = handing_on("hand-open", WebLinks::Open);
+        b.opener = |target| {
+            assert_eq!(target, "https://example.com/");
+            Ok(())
+        };
+        b.hand_on("https://example.com/");
+        assert_eq!(b.view.notice, None);
+        b.opener = |target| Err(io::Error::other(format!("nothing opens {target}")));
+        b.hand_on("https://example.com/");
+        assert_eq!(
+            b.view.notice.as_deref(),
+            Some("cannot open https://example.com/: nothing opens https://example.com/")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handing_on_copies_through_the_terminal() {
+        let (mut b, dir) = handing_on("hand-copy", WebLinks::Copy);
+        let out = Shared::default();
+        b.clipboard = Box::new(out.clone());
+        b.hand_on("https://example.com/");
+        assert_eq!(
+            String::from_utf8(out.0.borrow().clone()).unwrap(),
+            "\x1b]52;c;aHR0cHM6Ly9leGFtcGxlLmNvbS8=\x1b\\"
+        );
+        assert_eq!(
+            b.view.notice.as_deref(),
+            Some("copied https://example.com/")
+        );
+        b.clipboard = Box::new(Broken);
+        b.hand_on("https://example.com/");
+        assert_eq!(b.view.notice.as_deref(), Some("cannot copy: no terminal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handing_on_can_do_nothing() {
+        let (mut b, dir) = handing_on("hand-ignore", WebLinks::Ignore);
+        b.hand_on("https://example.com/");
+        assert_eq!(b.view.notice, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A browser that read `HOME.md`, with an image above a link to
+    /// `Other.md`, waited for the image, scrolled below it and followed the
+    /// link. Also the scroll it left `HOME.md` at.
+    fn gone_past_an_image(name: &str) -> (Browser, PathBuf, usize) {
+        use crate::images::tests::png;
+        let home = format!("![a](a.png)\n\n{0}[[Other]]\n\n{0}", paragraphs(6));
+        let (mut b, dir) = loaded(name, &[("HOME.md", "one\n"), ("Other.md", "other\n")]);
+        std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
+        std::fs::write(dir.join("HOME.md"), &home).unwrap();
+        assert!(b.open(dir.join("HOME.md")));
+        let (result, _, _) = run_script(&mut b, vec![Step::Drawn, quit()]);
+        assert!(result.is_ok());
+        // Below the image, with the link in view.
+        b.view.scroll_by(16);
+        let scroll = b.view.scroll;
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("Other.md"));
+        (b, dir, scroll)
+    }
+
+    #[test]
+    fn back_lands_where_the_reader_was_below_an_image() {
+        let (mut b, dir, scroll) = gone_past_an_image("back-scroll");
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        // Waits for the image, in case it has to be made again: the scroll
+        // must not move when it arrives.
+        let key = images::key(&b.view.doc.blocks[0]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while b.view.images.ready(&key).is_none() {
+            assert!(Instant::now() < deadline, "image not ready");
+            std::thread::sleep(Duration::from_millis(1));
+            b.view.receive_images();
+        }
+        assert_eq!(b.view.scroll, scroll);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_shows_the_images_at_once() {
+        let (mut b, dir, _) = gone_past_an_image("back-images");
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        assert_eq!(b.view.layout.placements().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

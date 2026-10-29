@@ -1,13 +1,13 @@
 //! Tables, drawn as text. A table wider than the view wraps its cells, and
 //! one with too many columns to wrap well is drawn as cards: a block of
-//! `Header: value` lines per row. See `docs/spike-tables.md`.
+//! `Header: value` lines per row.
 
 use pulldown_cmark::{Alignment, Event, LinkType, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{InlineStyle, Link};
+use crate::doc::{InlineStyle, Link, is_image};
 
 /// The longest word a column is widened to hold whole. A longer one, such as
 /// a URL, breaks.
@@ -46,91 +46,11 @@ impl Table {
             | Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_MATH
             | Options::ENABLE_WIKILINKS;
-        let mut aligns = Vec::new();
-        let mut rows: Vec<Vec<Cell>> = Vec::new();
-        let mut style = InlineStyle::default();
-        // How deep in emphasis, strong and strikethrough spans, which nest.
-        let mut depth = [0u32; 3];
+        let mut builder = Builder::default();
         for event in Parser::new_ext(source, options) {
-            let (text, style) = match event {
-                Event::Start(Tag::Table(a)) => {
-                    aligns = a;
-                    continue;
-                }
-                Event::Start(Tag::TableHead | Tag::TableRow) => {
-                    rows.push(Vec::new());
-                    continue;
-                }
-                Event::Start(Tag::TableCell) => {
-                    if let Some(row) = rows.last_mut() {
-                        row.push(Vec::new());
-                    }
-                    continue;
-                }
-                Event::Start(Tag::Emphasis) | Event::End(TagEnd::Emphasis) => {
-                    style.emphasis = nest(&mut depth[0], &event);
-                    continue;
-                }
-                Event::Start(Tag::Strong) | Event::End(TagEnd::Strong) => {
-                    style.strong = nest(&mut depth[1], &event);
-                    continue;
-                }
-                Event::Start(Tag::Strikethrough) | Event::End(TagEnd::Strikethrough) => {
-                    style.strikethrough = nest(&mut depth[2], &event);
-                    continue;
-                }
-                Event::Start(Tag::Link {
-                    link_type,
-                    dest_url,
-                    ..
-                }) => {
-                    style.link = Some(Link {
-                        dest: dest_url.to_string(),
-                        wiki: matches!(link_type, LinkType::WikiLink { .. }),
-                    });
-                    continue;
-                }
-                Event::End(TagEnd::Link) => {
-                    style.link = None;
-                    continue;
-                }
-                Event::Text(t) | Event::InlineHtml(t) | Event::Html(t) => {
-                    (t.to_string(), style.clone())
-                }
-                Event::Code(t) => (
-                    t.to_string(),
-                    InlineStyle {
-                        code: true,
-                        ..style.clone()
-                    },
-                ),
-                Event::InlineMath(t) | Event::DisplayMath(t) => (
-                    t.to_string(),
-                    InlineStyle {
-                        math: true,
-                        ..style.clone()
-                    },
-                ),
-                Event::SoftBreak | Event::HardBreak => (" ".to_string(), style.clone()),
-                _ => continue,
-            };
-            let Some(cell) = rows.last_mut().and_then(|row| row.last_mut()) else {
-                continue;
-            };
-            match cell.last_mut() {
-                Some((s, last)) if *last == style => s.push_str(&text),
-                _ => cell.push((text, style)),
-            }
+            builder.event(event);
         }
-        let columns = aligns
-            .len()
-            .max(rows.iter().map(Vec::len).max().unwrap_or(0))
-            .max(1);
-        aligns.resize(columns, Alignment::None);
-        for row in &mut rows {
-            row.resize_with(columns, Vec::new);
-        }
-        Table { aligns, rows }
+        builder.finish()
     }
 
     /// The table drawn in `avail` columns: as it is when it fits, with its
@@ -482,9 +402,160 @@ fn chars_width(chars: &[(char, usize)]) -> usize {
     chars.iter().map(|(c, _)| c.width().unwrap_or(0)).sum()
 }
 
+/// A table read from parser events, one at a time.
+#[derive(Default)]
+struct Builder {
+    aligns: Vec<Alignment>,
+    rows: Vec<Vec<Cell>>,
+    /// The style of the text read next.
+    style: InlineStyle,
+    /// How deep in emphasis, strong and strikethrough spans, which nest.
+    depth: [u32; 3],
+    /// For each image started and not yet ended, whether it embeds a note.
+    embeds: Vec<bool>,
+}
+
+impl Builder {
+    fn event(&mut self, event: Event) {
+        match event {
+            Event::Start(tag) => self.start(tag),
+            Event::End(tag) => self.end(tag),
+            event => {
+                if let Some(run) = self.run(event) {
+                    self.push(run);
+                }
+            }
+        }
+    }
+
+    fn start(&mut self, tag: Tag) {
+        match tag {
+            Tag::Table(aligns) => self.aligns = aligns,
+            Tag::TableHead | Tag::TableRow => self.rows.push(Vec::new()),
+            Tag::TableCell => {
+                if let Some(row) = self.rows.last_mut() {
+                    row.push(Vec::new());
+                }
+            }
+            Tag::Emphasis => self.style.emphasis = nest(&mut self.depth[0], true),
+            Tag::Strong => self.style.strong = nest(&mut self.depth[1], true),
+            Tag::Strikethrough => self.style.strikethrough = nest(&mut self.depth[2], true),
+            Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                self.style.link = Some(Link {
+                    dest: dest_url.to_string(),
+                    wiki: matches!(link_type, LinkType::WikiLink { .. }),
+                });
+            }
+            Tag::Image {
+                link_type,
+                dest_url,
+                ..
+            } => {
+                // An embedded note is shown as a link to it, and an image as
+                // its alt text, as in a paragraph.
+                let wiki = matches!(link_type, LinkType::WikiLink { .. });
+                // In a table the pipe before an alias is escaped, `\|`, and
+                // the backslash is left on the name.
+                let dest = if wiki {
+                    dest_url.strip_suffix('\\').unwrap_or(&dest_url)
+                } else {
+                    &dest_url
+                };
+                let note = wiki && !is_image(dest);
+                self.embeds.push(note);
+                if note {
+                    self.style.link = Some(Link {
+                        dest: dest.to_string(),
+                        wiki: true,
+                    });
+                } else {
+                    self.push(("[image: ".to_string(), self.style.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Emphasis => self.style.emphasis = nest(&mut self.depth[0], false),
+            TagEnd::Strong => self.style.strong = nest(&mut self.depth[1], false),
+            TagEnd::Strikethrough => self.style.strikethrough = nest(&mut self.depth[2], false),
+            TagEnd::Link => self.style.link = None,
+            TagEnd::Image => {
+                if self.embeds.pop() == Some(true) {
+                    self.style.link = None;
+                } else {
+                    self.push(("]".to_string(), self.style.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The text an event adds to a cell, and its style.
+    fn run(&self, event: Event) -> Option<(String, InlineStyle)> {
+        let run = match event {
+            Event::Text(t) | Event::InlineHtml(t) | Event::Html(t) => {
+                (t.to_string(), self.style.clone())
+            }
+            Event::Code(t) => (
+                t.to_string(),
+                InlineStyle {
+                    code: true,
+                    ..self.style.clone()
+                },
+            ),
+            Event::InlineMath(t) | Event::DisplayMath(t) => (
+                t.to_string(),
+                InlineStyle {
+                    math: true,
+                    ..self.style.clone()
+                },
+            ),
+            Event::SoftBreak | Event::HardBreak => (" ".to_string(), self.style.clone()),
+            _ => return None,
+        };
+        Some(run)
+    }
+
+    /// Add a run to the last cell, joined to its last run when their styles
+    /// match. Text outside a cell is dropped.
+    fn push(&mut self, (text, style): (String, InlineStyle)) {
+        let Some(cell) = self.rows.last_mut().and_then(|row| row.last_mut()) else {
+            return;
+        };
+        match cell.last_mut() {
+            Some((s, last)) if *last == style => s.push_str(&text),
+            _ => cell.push((text, style)),
+        }
+    }
+
+    /// The table, with an alignment and a cell in every row for each column.
+    fn finish(mut self) -> Table {
+        let columns = self
+            .aligns
+            .len()
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0))
+            .max(1);
+        self.aligns.resize(columns, Alignment::None);
+        for row in &mut self.rows {
+            row.resize_with(columns, Vec::new);
+        }
+        Table {
+            aligns: self.aligns,
+            rows: self.rows,
+        }
+    }
+}
+
 /// Go in or out of a span that nests. Returns whether still inside one.
-fn nest(depth: &mut u32, event: &Event) -> bool {
-    if matches!(event, Event::Start(_)) {
+fn nest(depth: &mut u32, start: bool) -> bool {
+    if start {
         *depth += 1;
     } else {
         *depth = depth.saturating_sub(1);
@@ -598,6 +669,48 @@ mod tests {
             ..InlineStyle::default()
         };
         assert_eq!(table.rows[0][0], vec![("a b c".to_string(), emphasis)]);
+    }
+
+    #[test]
+    fn cells_keep_strikethrough_math_html_and_wiki_links() {
+        let table = Table::parse("| ~~a ~b~ c~~ d | $x$ <br> [[n]] |\n|---|---|");
+        let plain = InlineStyle::default();
+        let struck = InlineStyle {
+            strikethrough: true,
+            ..InlineStyle::default()
+        };
+        let math = InlineStyle {
+            math: true,
+            ..InlineStyle::default()
+        };
+        let wiki = InlineStyle {
+            link: Some(Link {
+                dest: "n".into(),
+                wiki: true,
+            }),
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            table.rows,
+            vec![vec![
+                vec![("a b c".into(), struck), (" d".into(), plain.clone())],
+                vec![
+                    ("x".into(), math),
+                    (" <br> ".into(), plain),
+                    ("n".into(), wiki),
+                ],
+            ]]
+        );
+    }
+
+    #[test]
+    fn text_before_a_table_is_dropped() {
+        let table = Table::parse("<div>x</div>\n\n***\n\nsome\ntext $$y$$\n\n| a |\n|---|");
+        assert_eq!(table.aligns, vec![Alignment::None]);
+        assert_eq!(table.rows, vec![vec![cell("a")]]);
+        let empty = Table::parse("just\ntext");
+        assert_eq!(empty.aligns, vec![Alignment::None]);
+        assert!(empty.rows.is_empty());
     }
 
     #[test]
@@ -741,6 +854,61 @@ mod tests {
                 "            full VM",
                 "──────────────────────────────",
             ]
+        );
+    }
+
+    #[test]
+    fn images_and_note_embeds_in_a_cell_read_as_in_a_paragraph() {
+        let table = Table::parse(
+            "| ![a *b*](a.png) | ![[d.png]] | ![[Note]] | [![a](a.png)](u) |\n|-|-|-|-|",
+        );
+        let plain = InlineStyle::default();
+        let emphasis = InlineStyle {
+            emphasis: true,
+            ..InlineStyle::default()
+        };
+        let note = InlineStyle {
+            link: Some(Link {
+                dest: "Note".into(),
+                wiki: true,
+            }),
+            ..InlineStyle::default()
+        };
+        let outer = InlineStyle {
+            link: Some("u".into()),
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            table.rows,
+            vec![vec![
+                vec![
+                    ("[image: a ".into(), plain.clone()),
+                    ("b".into(), emphasis),
+                    ("]".into(), plain.clone()),
+                ],
+                vec![("[image: d.png]".into(), plain)],
+                vec![("Note".into(), note)],
+                vec![("[image: a]".into(), outer)],
+            ]]
+        );
+    }
+
+    #[test]
+    fn an_embed_in_a_cell_drops_the_escape_before_its_alias() {
+        let table = Table::parse("| ![[pic.png\\|200]] | ![[Note\\|alias]] |\n|-|-|");
+        let note = InlineStyle {
+            link: Some(Link {
+                dest: "Note".into(),
+                wiki: true,
+            }),
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            table.rows,
+            vec![vec![
+                vec![("[image: 200]".into(), InlineStyle::default())],
+                vec![("alias".into(), note)],
+            ]]
         );
     }
 

@@ -35,7 +35,8 @@ use unicode_width::UnicodeWidthStr;
 const CHECK_EVERY: Duration = Duration::from_millis(150);
 
 pub struct View {
-    doc: Document,
+    /// Shared with the place Back or Forward keeps when the reader leaves.
+    doc: Rc<Document>,
     /// The directory relative image paths are read from.
     base: PathBuf,
     images: Images,
@@ -100,7 +101,7 @@ impl Anchor {
 impl View {
     pub fn new(doc: Document, base: PathBuf, images: Images) -> Self {
         let mut view = View {
-            doc,
+            doc: Rc::new(doc),
             base,
             images,
             layout: Layout::default(),
@@ -118,7 +119,7 @@ impl View {
 
     /// Show another document, from the top, with images read from `base`.
     pub fn show(&mut self, doc: Document, base: PathBuf) {
-        self.doc = doc;
+        self.doc = Rc::new(doc);
         self.base = base;
         self.scroll = 0;
         self.selected = None;
@@ -143,7 +144,7 @@ impl View {
     /// it no longer has are deleted on the next flush.
     pub fn reload(&mut self, doc: Document) {
         let anchor = self.anchor();
-        let old = std::mem::replace(&mut self.doc, doc);
+        let old = std::mem::replace(&mut self.doc, Rc::new(doc));
         let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
         self.selected = None;
         self.want_images();
@@ -595,12 +596,16 @@ impl Browser {
             }
             Target::Note { path, heading } => {
                 let here = self.here();
+                // Forward goes nowhere after a new link, so its notes keep
+                // no images.
+                let ahead = std::mem::take(&mut self.ahead);
                 if self.open(path) {
                     self.history.push(here);
-                    self.ahead.clear();
                     if let Some(h) = heading {
                         self.jump(&h);
                     }
+                } else {
+                    self.ahead = ahead;
                 }
             }
             Target::Heading(h) => self.jump(&h),
@@ -640,7 +645,7 @@ impl Browser {
     fn here(&self) -> Visited {
         Visited {
             path: self.path.clone(),
-            doc: Rc::new(self.view.doc.clone()),
+            doc: Rc::clone(&self.view.doc),
             scroll: self.view.scroll,
             selected: self.view.selected,
         }
@@ -730,7 +735,7 @@ impl Browser {
         let back = self.history.iter().rev().take(KEEP_IMAGES_OF);
         let notes = back.chain(self.ahead.iter().rev().take(KEEP_IMAGES_OF));
         let mut kept: Vec<_> = notes.map(|v| (v.doc.clone(), folder(&v.path))).collect();
-        kept.push((Rc::new(self.view.doc.clone()), folder(&self.path)));
+        kept.push((Rc::clone(&self.view.doc), folder(&self.path)));
         self.view.kept = kept;
         self.view.show(doc, folder(&path));
         self.view.set_notice(None);

@@ -215,26 +215,44 @@ fn read_replies(deadline: Instant, mut next: impl FnMut(Duration) -> Option<Vec<
     buf
 }
 
-/// The bytes waiting on `fd`, waiting up to `left` for some to arrive.
+/// The bytes waiting on `fd`, waiting up to `left` for some to arrive. A
+/// signal, such as a window resize, does not end the wait.
 #[cfg(unix)]
 fn read_chunk(fd: libc::c_int, left: Duration) -> Option<Vec<u8>> {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ms = left.as_millis().clamp(1, 1000) as libc::c_int;
-    // SAFETY: one valid pollfd for the duration of the call.
-    if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
-        return None;
+    let deadline = Instant::now() + left;
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let ms = left.as_millis().clamp(1, 1000) as libc::c_int;
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready < 0 && interrupted() && !left.is_zero() {
+            continue;
+        }
+        if ready <= 0 {
+            return None;
+        }
+        let mut chunk = [0u8; 256];
+        // SAFETY: reads at most chunk.len() bytes into chunk.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n < 0 && interrupted() {
+            continue;
+        }
+        if n <= 0 {
+            return None;
+        }
+        return Some(chunk[..n as usize].to_vec());
     }
-    let mut chunk = [0u8; 256];
-    // SAFETY: reads at most chunk.len() bytes into chunk.
-    let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-    if n <= 0 {
-        return None;
-    }
-    Some(chunk[..n as usize].to_vec())
+}
+
+/// Whether the last system call failed because a signal interrupted it.
+#[cfg(unix)]
+fn interrupted() -> bool {
+    io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
 }
 
 #[cfg(not(unix))]
@@ -584,6 +602,40 @@ mod tests {
         let mut out = Vec::new();
         assert!(exchange(&mut out, pipe.read, Duration::from_millis(20)).is_empty());
         assert!(out.ends_with(b"\x1b[?1049l"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_does_not_end_the_wait() {
+        // A window resize (SIGWINCH) while the probe waits interrupts poll.
+        // SIGUSR1 stands in for it, with a handler that does nothing and
+        // without SA_RESTART, as with any handler.
+        extern "C" fn ignore(_: libc::c_int) {}
+        // SAFETY: a zeroed sigaction is valid; the handler is async-signal
+        // safe as it does nothing.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let pipe = Pipe::new(b"", false);
+        let write = pipe.write.unwrap();
+        // SAFETY: pthread_self has no preconditions.
+        let waiting = unsafe { libc::pthread_self() } as usize;
+        let terminal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: the waiting thread is alive until this thread is joined.
+            unsafe { libc::pthread_kill(waiting as libc::pthread_t, libc::SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: writes the reply from a live buffer to an open pipe.
+            unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
+        });
+        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10));
+        terminal.join().unwrap();
+        assert_eq!(reply, b"\x1b[?62c");
     }
 
     /// A writer that fails every write.

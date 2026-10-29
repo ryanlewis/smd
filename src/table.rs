@@ -1,6 +1,6 @@
 //! Tables, drawn as text. A table wider than the view wraps its cells, and
 //! one with too many columns to wrap well is drawn as cards: a block of
-//! `Header: value` lines per row. See `docs/spike-tables.md`.
+//! `Header: value` lines per row.
 
 use pulldown_cmark::{Alignment, Event, LinkType, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};

@@ -135,8 +135,10 @@ pub enum Embed {
 /// alone, without a fragment.
 pub fn embed(dest: &str, wiki: bool) -> Embed {
     if !wiki {
-        Embed::Image(dest.to_string())
-    } else if is_image(dest) {
+        return Embed::Image(dest.to_string());
+    }
+    let dest = link_dest(dest, true);
+    if is_image(dest) {
         Embed::Image(without_fragment(dest).to_string())
     } else {
         Embed::Note(Link {
@@ -146,19 +148,23 @@ pub fn embed(dest: &str, wiki: bool) -> Embed {
     }
 }
 
-/// Where a link or embed goes. In a table the pipe before a wiki link's
-/// alias is escaped, `\|`, and the backslash is left on the name.
+/// Where a link or embed goes. A wiki link's name is read without spaces
+/// around it, `[[pic.png |300]]`, or a backslash at its end, which is left
+/// there when the pipe before an alias is escaped, `\|`, as it must be in a
+/// table.
 pub fn link_dest(dest: &str, wiki: bool) -> &str {
     if wiki {
-        dest.strip_suffix('\\').unwrap_or(dest)
+        dest.strip_suffix('\\').unwrap_or(dest).trim()
     } else {
         dest
     }
 }
 
-/// `name` without a `#heading` or `#^block` after it.
+/// `name` without a `#heading` or `#^block` after it, or the space before
+/// one.
 fn without_fragment(name: &str) -> &str {
-    name.split_once('#').map_or(name, |(name, _)| name)
+    name.split_once('#')
+        .map_or(name, |(name, _)| name.trim_end())
 }
 
 pub fn parse(source: &str) -> Document {
@@ -388,10 +394,13 @@ impl<'a> Builder<'a> {
                 link_type,
                 dest_url,
                 ..
-            } => self.links.push(Link {
-                dest: dest_url.to_string(),
-                wiki: is_wiki(link_type),
-            }),
+            } => {
+                let wiki = is_wiki(link_type);
+                self.links.push(Link {
+                    dest: link_dest(&dest_url, wiki).to_string(),
+                    wiki,
+                });
+            }
             Tag::Image {
                 link_type,
                 dest_url,
@@ -1257,6 +1266,29 @@ paragraph @21..62
             "text ![[pic.png#x|200]] more\n",
             r#"paragraph @0..29
   "text [image: 200] more"
+"#,
+        );
+    }
+
+    #[test]
+    fn a_wiki_name_drops_spaces_and_the_escape_before_its_alias() {
+        assert_outline(
+            "![[pic.png |300]]\n",
+            "image \"pic.png\" alt=\"300\" wiki=true @0..18\n",
+        );
+        assert_outline(
+            "![[pic.png #small]]\n",
+            "image \"pic.png\" alt=\"pic.png #small\" wiki=true @0..20\n",
+        );
+        assert_outline(
+            "a [[Note\\|x]] ![[Note#H\\|y]] [[ Note |z]]\n",
+            r#"paragraph @0..42
+  "a "
+  "x" link="Note" wiki=true
+  " "
+  "y" link="Note#H" wiki=true
+  " "
+  "z" link="Note" wiki=true
 "#,
         );
     }

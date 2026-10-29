@@ -459,7 +459,7 @@ impl Builder {
                 // An embedded note is shown as a link to it, and an image as
                 // its alt text, as in a paragraph.
                 let wiki = is_wiki(link_type);
-                match embed(link_dest(&dest_url, wiki), wiki) {
+                match embed(&dest_url, wiki) {
                     Embed::Note(link) => {
                         self.embeds.push(true);
                         self.style.link = Some(link);
@@ -923,6 +923,13 @@ mod tests {
     fn an_image_embed_with_a_fragment_in_a_cell_is_still_an_image() {
         let table = Table::parse("| ![[pic.png#frag]] |\n|-|");
         let image = vec![("[image: pic.png#frag]".into(), InlineStyle::default())];
+        assert_eq!(table.rows, vec![vec![image]]);
+    }
+
+    #[test]
+    fn an_embed_in_a_cell_drops_spaces_around_its_name() {
+        let table = Table::parse("| ![[pic.png \\|300]] |\n|-|");
+        let image = vec![("[image: 300]".into(), InlineStyle::default())];
         assert_eq!(table.rows, vec![vec![image]]);
     }
 

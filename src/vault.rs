@@ -434,4 +434,403 @@ mod tests {
         assert_eq!(Path::new(src), v.path("attachments/pic.png"));
         assert!(!wiki);
     }
+
+    fn md(dest: &str) -> Link {
+        dest.into()
+    }
+
+    #[test]
+    fn a_wiki_link_with_a_heading_and_a_block_reference() {
+        let v = TempVault::new("wikihb", &["HOME.md", "Plan.md"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let home = v.path("HOME.md");
+        // The block reference after a heading is dropped with the heading kept.
+        assert_eq!(
+            vault.follow(&wiki("Plan#Goals#^abc"), &home),
+            note(v.path("Plan.md"), Some("Goals#^abc"))
+        );
+        // An empty heading is no heading.
+        assert_eq!(
+            vault.follow(&wiki("Plan#"), &home),
+            note(v.path("Plan.md"), None)
+        );
+        // A block reference alone in the open note goes to the note itself.
+        assert_eq!(
+            vault.follow(&wiki("#^abc"), &home),
+            note(home.clone(), None)
+        );
+        assert_eq!(vault.follow(&wiki("#"), &home), note(home.clone(), None));
+        // Wiki headings are not percent-decoded.
+        assert_eq!(
+            vault.follow(&wiki("#100%25"), &home),
+            Target::Heading("100%25".into())
+        );
+    }
+
+    #[test]
+    fn a_markdown_link_to_a_heading_in_the_open_note() {
+        let v = TempVault::new("mdheading", &["HOME.md"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let home = v.path("HOME.md");
+        assert_eq!(
+            vault.follow(&md("#Part%20two"), &home),
+            Target::Heading("Part two".into())
+        );
+        assert_eq!(vault.follow(&md("#^blk"), &home), note(home.clone(), None));
+        assert_eq!(vault.follow(&md("  "), &home), note(home, None));
+    }
+
+    #[test]
+    fn web_and_mail_links_are_not_looked_up() {
+        let v = TempVault::new("web", &["HOME.md"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let home = v.path("HOME.md");
+        for dest in [
+            "http://example.com",
+            "https://example.com/a%20b#frag",
+            "obsidian://open?vault=x",
+            "mailto:me@example.com",
+            "MAILTO:me@example.com",
+            "HTTPS://Example.com",
+        ] {
+            assert_eq!(vault.follow(&md(dest), &home), Target::Web(dest.into()));
+        }
+        // Surrounding space is trimmed.
+        assert_eq!(
+            vault.follow(&md("  https://x.org  "), &home),
+            Target::Web("https://x.org".into())
+        );
+        // A wiki link is always a note name, even one that looks like an address.
+        assert_eq!(
+            vault.follow(&wiki("https://x.org"), &home),
+            Target::Missing("https://x.org".into())
+        );
+        // A scheme must be letters only, so this is a path.
+        assert_eq!(
+            vault.follow(&md("a1b://x"), &home),
+            Target::Missing("a1b://x".into())
+        );
+        assert_eq!(
+            vault.follow(&md("://x"), &home),
+            Target::Missing("://x".into())
+        );
+    }
+
+    #[test]
+    fn links_to_files_that_are_not_notes() {
+        let v = TempVault::new(
+            "other",
+            &[
+                "HOME.md",
+                "docs/spec.pdf",
+                "img/pic.png",
+                "Old.markdown",
+                "data.csv",
+            ],
+        );
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let home = v.path("HOME.md");
+        assert_eq!(
+            vault.follow(&wiki("spec.pdf"), &home),
+            Target::Other(v.path("docs/spec.pdf"))
+        );
+        assert_eq!(
+            vault.follow(&wiki("pic.png"), &home),
+            Target::Other(v.path("img/pic.png"))
+        );
+        assert_eq!(
+            vault.follow(&wiki("data.csv#x"), &home),
+            Target::Other(v.path("data.csv"))
+        );
+        assert_eq!(
+            vault.follow(&md("docs/spec.pdf"), &home),
+            Target::Other(v.path("docs/spec.pdf"))
+        );
+        assert_eq!(
+            vault.follow(&md("img/pic.png"), &home),
+            Target::Other(v.path("img/pic.png"))
+        );
+        // `.markdown` is a note too.
+        assert_eq!(
+            vault.follow(&md("Old.markdown"), &home),
+            note(v.path("Old.markdown"), None)
+        );
+        assert_eq!(
+            vault.follow(&wiki("Old.markdown"), &home),
+            note(v.path("Old.markdown"), None)
+        );
+    }
+
+    #[test]
+    fn missing_notes_report_what_was_looked_for() {
+        let v = TempVault::new("missing", &["HOME.md", "docs/a.md"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let home = v.path("HOME.md");
+        assert_eq!(
+            vault.follow(&md("nope.md#Head"), &home),
+            Target::Missing("nope.md".into())
+        );
+        // The name is shown as written, not decoded.
+        assert_eq!(
+            vault.follow(&md("no%20pe"), &home),
+            Target::Missing("no%20pe".into())
+        );
+        assert_eq!(
+            vault.follow(&wiki("docs/zzz"), &home),
+            Target::Missing("docs/zzz".into())
+        );
+        // A path that exists only by its end in another folder is not a match.
+        assert_eq!(
+            vault.follow(&wiki("other/a"), &home),
+            Target::Missing("other/a".into())
+        );
+        // A markdown link is relative to the note, not looked up by name.
+        assert_eq!(
+            vault.follow(&md("a.md"), &home),
+            Target::Missing("a.md".into())
+        );
+        // A dotted name with no known extension gets `.md` added.
+        assert_eq!(
+            vault.follow(&wiki("v1.2 notes"), &home),
+            Target::Missing("v1.2 notes".into())
+        );
+        // A directory is not a note.
+        assert_eq!(
+            vault.follow(&md("docs"), &home),
+            Target::Missing("docs".into())
+        );
+    }
+
+    #[test]
+    fn markdown_links_go_up_folders_and_decode_escapes() {
+        let v = TempVault::new(
+            "up",
+            &["a/b/HOME.md", "a/Top.md", "a/b/caf\u{e9}.md", "a/b/100%.md"],
+        );
+        let vault = Vault::for_file(&v.path("a/b/HOME.md"));
+        let home = v.path("a/b/HOME.md");
+        assert_eq!(
+            vault.follow(&md("../Top"), &home),
+            note(v.path("a/b/../Top.md"), None)
+        );
+        assert_eq!(
+            vault.follow(&md("caf%C3%A9.md"), &home),
+            note(v.path("a/b/caf\u{e9}.md"), None)
+        );
+        // Bad escapes are kept as written.
+        assert_eq!(
+            vault.follow(&md("100%.md"), &home),
+            note(v.path("a/b/100%.md"), None)
+        );
+        assert_eq!(
+            vault.follow(&md("100%zz.md"), &home),
+            Target::Missing("100%zz.md".into())
+        );
+        // Escapes that are not UTF-8 are kept as written.
+        assert_eq!(percent_decode("%ff%fe"), "%ff%fe");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%"), "%");
+    }
+
+    #[test]
+    fn a_name_shared_by_notes_goes_to_the_nearest_folder() {
+        let v = TempVault::new(
+            "clash",
+            &[
+                "Idea.md",
+                "work/Idea.md",
+                "work/team/Idea.md",
+                "work/team/sub/Note.md",
+                "work/Other.md",
+                "play/Idea.md",
+            ],
+        );
+        let vault = Vault::for_file(&v.path("Idea.md"));
+        // Sharing the most folders wins.
+        assert_eq!(
+            vault.follow(&wiki("Idea"), &v.path("work/team/sub/Note.md")),
+            note(v.path("work/team/Idea.md"), None)
+        );
+        assert_eq!(
+            vault.follow(&wiki("Idea"), &v.path("work/Other.md")),
+            note(v.path("work/Idea.md"), None)
+        );
+        assert_eq!(
+            vault.follow(&wiki("idea"), &v.path("play/x.md")),
+            note(v.path("play/Idea.md"), None)
+        );
+        // From the top, the shortest path wins.
+        assert_eq!(
+            vault.follow(&wiki("Idea"), &v.path("Elsewhere.md")),
+            note(v.path("Idea.md"), None)
+        );
+        // A path that is only the end of others picks by the same rule.
+        assert_eq!(
+            vault.follow(&wiki("team/Idea"), &v.path("play/x.md")),
+            note(v.path("work/team/Idea.md"), None)
+        );
+        assert_eq!(
+            vault.follow(&wiki("/work/Idea"), &v.path("play/x.md")),
+            note(v.path("work/Idea.md"), None)
+        );
+    }
+
+    #[test]
+    fn a_path_is_tried_from_the_vault_top_then_the_linking_folder() {
+        let v = TempVault::new(
+            "paths",
+            &["HOME.md", "sub/HOME2.md", "sub/x/Page.md", "x/Page.md"],
+        );
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        // From the top first.
+        assert_eq!(
+            vault.follow(&wiki("x/Page"), &v.path("sub/HOME2.md")),
+            note(v.path("x/Page.md"), None)
+        );
+        // Then relative to the linking note.
+        assert_eq!(
+            vault.follow(&wiki("x/Page.md"), &v.path("sub/HOME2.md")),
+            note(v.path("x/Page.md"), None)
+        );
+        // Names are trimmed.
+        assert_eq!(
+            vault.follow(&wiki(" x/Page "), &v.path("sub/HOME2.md")),
+            note(v.path("x/Page.md"), None)
+        );
+    }
+
+    #[test]
+    fn a_path_relative_to_the_linking_folder_is_found_when_not_at_the_top() {
+        let v = TempVault::new("rel", &["HOME.md", "sub/x/Page.md"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        assert_eq!(
+            vault.follow(&wiki("x/Page"), &v.path("sub/y.md")),
+            note(v.path("sub/x/Page.md"), None)
+        );
+    }
+
+    #[test]
+    fn skipped_folders_are_not_indexed() {
+        let v = TempVault::new(
+            "skip",
+            &[
+                "HOME.md",
+                ".trash/Gone.md",
+                ".git/Hidden.md",
+                "node_modules/Dep.md",
+                "target/Out.md",
+                "kept/Kept.md",
+            ],
+        );
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let home = v.path("HOME.md");
+        for name in ["Gone", "Hidden", "Dep", "Out"] {
+            assert_eq!(
+                vault.follow(&wiki(name), &home),
+                Target::Missing(name.into())
+            );
+        }
+        assert_eq!(
+            vault.follow(&wiki("Kept"), &home),
+            note(v.path("kept/Kept.md"), None)
+        );
+    }
+
+    #[test]
+    fn a_note_outside_a_vault_looks_in_its_own_folder_and_below() {
+        let root = std::env::temp_dir().join(format!("smd-vault-novault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("notes/deep")).unwrap();
+        std::fs::write(root.join("notes/a.md"), "").unwrap();
+        std::fs::write(root.join("notes/deep/b.md"), "").unwrap();
+        std::fs::write(root.join("above.md"), "").unwrap();
+        let from = root.join("notes/a.md");
+        let vault = Vault::for_file(&from);
+        assert!(!root.join("notes/.obsidian").exists());
+        assert!(vault.root.starts_with(&root));
+        assert_eq!(vault.root, root.join("notes"));
+        assert!(vault.holds(&root.join("notes/deep/b.md")));
+        assert!(!vault.holds(&root.join("above.md")));
+        assert_eq!(
+            vault.follow(&wiki("b"), &from),
+            note(root.join("notes/deep/b.md"), None)
+        );
+        assert_eq!(
+            vault.follow(&wiki("above"), &from),
+            Target::Missing("above".into())
+        );
+        // A markdown link can still reach above, relative to the note.
+        assert_eq!(
+            vault.follow(&md("../above.md"), &from),
+            note(root.join("notes/../above.md"), None)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bare_file_name_uses_the_current_folder() {
+        let vault = Vault::for_file(Path::new("x.md"));
+        assert!(vault.holds(Path::new("y.md")));
+        assert_eq!(folder(Path::new("x.md")), PathBuf::from("."));
+        assert_eq!(folder(Path::new("/")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn extensions_that_count_as_files() {
+        assert!(has_extension("a.md"));
+        assert!(has_extension("dir.v2/a.PDF"));
+        assert!(has_extension("pic.JPG"));
+        assert!(!has_extension("v1.2 notes"));
+        assert!(!has_extension("dir.pdf/note"));
+        assert!(!has_extension("plain"));
+        assert!(is_markdown(Path::new("a.MD")));
+        assert!(is_markdown(Path::new("a.Markdown")));
+        assert!(!is_markdown(Path::new("a.txt")));
+        assert!(!is_markdown(Path::new("md")));
+    }
+
+    #[test]
+    fn heading_matches_ignores_case_spaces_and_punctuation() {
+        assert!(heading_matches("My Heading", "my-heading"));
+        assert!(heading_matches("Café au lait", "CAFÉ AU LAIT"));
+        assert!(heading_matches("1. Intro", "1 intro"));
+        assert!(!heading_matches("Anything", ""));
+        assert!(!heading_matches("Anything", "---"));
+        assert!(!heading_matches("", ""));
+        assert!(!heading_matches("Intro two", "intro"));
+    }
+
+    #[test]
+    fn embeds_inside_quotes_and_lists_are_resolved() {
+        let v = TempVault::new("nested", &["HOME.md", "pics/a.png", "pics/b.png"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let mut doc = crate::doc::parse("> ![[a.png]]\n\n- ![[b.png]]\n\n![](web.png)\n");
+        vault.resolve_embeds(&mut doc.blocks, &v.path("HOME.md"));
+        let srcs = srcs(&doc.blocks);
+        assert_eq!(
+            srcs,
+            [
+                (v.path("pics/a.png").to_string_lossy().to_string(), false),
+                (v.path("pics/b.png").to_string_lossy().to_string(), false),
+                ("web.png".to_string(), false),
+            ]
+        );
+    }
+
+    fn srcs(blocks: &[Block]) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        for block in blocks {
+            match &block.kind {
+                BlockKind::Image { src, wiki, .. } => out.push((src.clone(), *wiki)),
+                BlockKind::Quote(inner) => out.extend(srcs(inner)),
+                BlockKind::List { items, .. } => {
+                    for item in items {
+                        out.extend(srcs(&item.blocks));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
 }

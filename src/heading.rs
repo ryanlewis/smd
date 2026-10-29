@@ -524,4 +524,47 @@ mod tests {
         assert_eq!(dark.size(), light.size());
         assert_ne!(dark.png().unwrap(), light.png().unwrap());
     }
+
+    #[test]
+    fn each_level_has_its_colour_in_both_themes() {
+        let dark = |t: [u8; 3]| [t[0], t[1], t[2], 0xff];
+        let want_dark = [
+            (1, dark([0xd7, 0x8b, 0xf0])),
+            (2, dark([0x6f, 0xd3, 0xe8])),
+            (3, dark([0x8f, 0xd8, 0x8f])),
+            (4, dark([0xe8, 0xe8, 0xe8])),
+            (5, dark([0xe8, 0xe8, 0xe8])),
+            (6, dark([0xa8, 0xa8, 0xa8])),
+        ];
+        let want_light = [
+            (1, dark([0x8b, 0x3f, 0xa8])),
+            (2, dark([0x1f, 0x6f, 0x80])),
+            (3, dark([0x2e, 0x7d, 0x32])),
+            (4, dark([0x22, 0x22, 0x22])),
+            (5, dark([0x22, 0x22, 0x22])),
+            (6, dark([0x66, 0x66, 0x66])),
+        ];
+        for (level, text) in want_dark {
+            assert_eq!(
+                colours(level, Theme::Dark),
+                (text, [0xe5, 0xc0, 0x7b, 0xff]),
+                "dark level {level}"
+            );
+        }
+        for (level, text) in want_light {
+            assert_eq!(
+                colours(level, Theme::Light),
+                (text, [0x95, 0x5f, 0x00, 0xff]),
+                "light level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn levels_outside_one_to_six_get_the_body_colour() {
+        for theme in [Theme::Dark, Theme::Light] {
+            assert_eq!(colours(0, theme).0, colours(4, theme).0);
+            assert_eq!(colours(7, theme).0, colours(4, theme).0);
+        }
+    }
 }

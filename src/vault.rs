@@ -444,7 +444,7 @@ mod tests {
         let v = TempVault::new("wikihb", &["HOME.md", "Plan.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
-        // The block reference after a heading is dropped with the heading kept.
+        // A block reference after a heading is kept in the heading text (not stripped).
         assert_eq!(
             vault.follow(&wiki("Plan#Goals#^abc"), &home),
             note(v.path("Plan.md"), Some("Goals#^abc"))
@@ -687,7 +687,7 @@ mod tests {
             vault.follow(&wiki("x/Page"), &v.path("sub/HOME2.md")),
             note(v.path("x/Page.md"), None)
         );
-        // Then relative to the linking note.
+        // With `.md` written out it is found the same way.
         assert_eq!(
             vault.follow(&wiki("x/Page.md"), &v.path("sub/HOME2.md")),
             note(v.path("x/Page.md"), None)
@@ -740,6 +740,8 @@ mod tests {
     fn a_note_outside_a_vault_looks_in_its_own_folder_and_below() {
         let root = std::env::temp_dir().join(format!("smd-vault-novault-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        // Removes the folder on drop, even when an assertion fails.
+        let _guard = TempVault(root.clone());
         std::fs::create_dir_all(root.join("notes/deep")).unwrap();
         std::fs::write(root.join("notes/a.md"), "").unwrap();
         std::fs::write(root.join("notes/deep/b.md"), "").unwrap();
@@ -764,7 +766,6 @@ mod tests {
             vault.follow(&md("../above.md"), &from),
             note(root.join("notes/../above.md"), None)
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

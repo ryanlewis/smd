@@ -34,6 +34,12 @@ pub fn current() -> Theme {
     THEME.get().copied().unwrap_or(Theme::Dark)
 }
 
+/// Whether the terminal reported its background, so the theme is known
+/// rather than the dark one assumed when it did not.
+pub fn reported() -> bool {
+    BACKGROUND.get().is_some()
+}
+
 /// Keep the background colour the terminal reported. Only the first call counts.
 pub fn set_background(rgb: Rgb) {
     let _ = BACKGROUND.set(rgb);

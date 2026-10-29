@@ -295,4 +295,85 @@ mod tests {
         assert_eq!(look.theme, Theme::Dark);
         assert_eq!(look.cell, None);
     }
+
+    fn io_err(text: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::NotFound, text)
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_exits_with_two() {
+        let failure = loaded(Err("bad config".to_string())).unwrap_err();
+        assert_eq!(
+            failure,
+            Failure {
+                message: "bad config".to_string(),
+                code: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_named() {
+        let path = Path::new("notes/a.md");
+        assert_eq!(source(path, Ok("# a".to_string())), Ok("# a".to_string()));
+        let failure = source(path, Err(io_err("gone"))).unwrap_err();
+        assert_eq!(failure, Failure::new("notes/a.md: gone"));
+        assert_eq!(failure.code, 1);
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_opened_says_so() {
+        assert_eq!(opened(Ok(3)), Ok(3));
+        assert_eq!(
+            opened::<()>(Err(io_err("no tty"))),
+            Err(Failure::new("cannot open the terminal: no tty"))
+        );
+    }
+
+    #[test]
+    fn a_run_that_fails_is_a_failure() {
+        assert_eq!(finished(Ok(())), Ok(()));
+        assert_eq!(finished(Err(io_err("broken"))), Err(Failure::new("broken")));
+    }
+
+    #[test]
+    fn the_exit_code_comes_with_the_message() {
+        let mut err = Vec::new();
+        assert_eq!(exit_code(Ok(()), &mut err), ExitCode::SUCCESS);
+        assert!(err.is_empty());
+        let failure = Failure {
+            message: "bad config".to_string(),
+            code: 2,
+        };
+        assert_eq!(exit_code(Err(failure), &mut err), ExitCode::from(2));
+        assert_eq!(String::from_utf8(err).unwrap(), "smd: bad config\n");
+        let mut err = Vec::new();
+        assert_eq!(
+            exit_code(Err(Failure::new("gone")), &mut err),
+            ExitCode::FAILURE
+        );
+        assert_eq!(String::from_utf8(err).unwrap(), "smd: gone\n");
+    }
+
+    #[test]
+    fn images_are_graphics_only_with_a_cell() {
+        let images = images_for(Some((9, 18)));
+        assert!(images.graphics());
+        assert_eq!(images.cell(), (9, 18));
+        assert!(!images_for(None).graphics());
+    }
+
+    #[test]
+    fn the_mouse_is_set_only_when_the_config_lets_smd_take_it() {
+        let mut out = Vec::new();
+        set_mouse(&mut out, true, true);
+        assert_eq!(out, app::MOUSE_ON.as_bytes());
+        let mut out = Vec::new();
+        set_mouse(&mut out, true, false);
+        assert_eq!(out, app::MOUSE_OFF.as_bytes());
+        let mut out = Vec::new();
+        set_mouse(&mut out, false, true);
+        set_mouse(&mut out, false, false);
+        assert!(out.is_empty());
+    }
 }

@@ -595,7 +595,7 @@ mod tests {
             png::ColorType::Rgba,
             png::BitDepth::Sixteen,
             None,
-            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
+            &[0x12, 0xFF, 0x56, 0xFF, 0x9A, 0xFF, 0xDE, 0xFF],
         );
         let bitmap = Bitmap::decode(&rgba).unwrap();
         assert_eq!(pixels_of(&bitmap), [[0x12, 0x56, 0x9A, 0xDE]]);
@@ -673,5 +673,34 @@ mod tests {
         let data = encode(2, 1, png::ColorType::Grayscale, &[7, 9]).unwrap();
         let bitmap = Bitmap::decode(&data).unwrap();
         assert_eq!(pixels_of(&bitmap), [[7, 7, 7, 255], [9, 9, 9, 255]]);
+    }
+
+    #[test]
+    fn decode_starts_each_packed_row_on_a_byte() {
+        // 3 by 2 at one bit per pixel: each row takes one byte.
+        let data = png_of(
+            (3, 2),
+            png::ColorType::Grayscale,
+            png::BitDepth::One,
+            None,
+            &[0b1010_0000, 0b0100_0000],
+        );
+        let bitmap = Bitmap::decode(&data).unwrap();
+        let (b, w) = ([0, 0, 0, 255], [255, 255, 255, 255]);
+        assert_eq!(pixels_of(&bitmap), [w, b, w, b, w, b]);
+    }
+
+    #[test]
+    fn decode_turns_a_colour_key_into_transparency() {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, 2, 1);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_trns(vec![0, 50]);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[50, 60]).unwrap();
+        writer.finish().unwrap();
+        let bitmap = Bitmap::decode(&out).unwrap();
+        assert_eq!(pixels_of(&bitmap), [[50, 50, 50, 0], [60, 60, 60, 255]]);
     }
 }

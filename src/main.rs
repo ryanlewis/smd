@@ -16,7 +16,7 @@ mod watch;
 
 use std::io::{self, Write};
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
@@ -84,34 +84,76 @@ impl Look {
     }
 }
 
-fn main() -> ExitCode {
-    let args = Args::parse();
-    let no_graphics = args.no_graphics;
-    let config = match config::Config::load() {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("smd: {err}");
-            return ExitCode::from(2);
+/// Why smd stopped early: what it prints after `smd: ` on stderr, and the
+/// exit code.
+#[derive(Debug, PartialEq)]
+struct Failure {
+    message: String,
+    code: u8,
+}
+
+impl Failure {
+    fn new(message: impl std::fmt::Display) -> Failure {
+        Failure {
+            message: message.to_string(),
+            code: 1,
         }
-    };
-    let path = match pick_file(args.file, config.home.clone()) {
-        Ok(path) => path,
-        Err(message) => Args::command()
-            .error(ErrorKind::MissingRequiredArgument, message)
-            .exit(),
-    };
-    let watcher = watch::Watcher::new(path.clone());
-    let source = match std::fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(err) => {
-            eprintln!("smd: {}: {err}", path.display());
-            return ExitCode::FAILURE;
+    }
+}
+
+/// The config, or a failure with exit code 2 when it cannot be read.
+fn loaded(config: Result<config::Config, String>) -> Result<config::Config, Failure> {
+    config.map_err(|err| Failure {
+        message: err,
+        code: 2,
+    })
+}
+
+/// The markdown file's text, or a failure naming the file.
+fn source(path: &Path, read: io::Result<String>) -> Result<String, Failure> {
+    read.map_err(|err| Failure::new(format!("{}: {err}", path.display())))
+}
+
+/// The terminal, or a failure saying it cannot be opened.
+fn opened<T>(terminal: io::Result<T>) -> Result<T, Failure> {
+    terminal.map_err(|err| Failure::new(format!("cannot open the terminal: {err}")))
+}
+
+/// How the browser's run ended, as smd's.
+fn finished(result: io::Result<()>) -> Result<(), Failure> {
+    result.map_err(Failure::new)
+}
+
+/// The exit code for how smd ended, after writing a failure's message to
+/// `err`.
+fn exit_code(result: Result<(), Failure>, err: &mut impl Write) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            let _ = writeln!(err, "smd: {}", failure.message);
+            ExitCode::from(failure.code)
         }
-    };
-    let vault = vault::Vault::for_file(&path);
-    // Asked before the terminal is set up, while nothing else reads its replies.
-    let probe = (!no_graphics).then(kitty::probe);
-    let look = Look::new(probe, config.code_background);
+    }
+}
+
+/// Images drawn at `cell` when the terminal can show them, else as text.
+fn images_for(cell: Option<(u16, u16)>) -> images::Images {
+    match cell {
+        Some(cell) => images::Images::new(cell),
+        None => images::Images::text(),
+    }
+}
+
+/// Turn mouse reporting on or off, when the config lets smd take the mouse.
+fn set_mouse(out: &mut impl Write, enabled: bool, on: bool) {
+    if enabled {
+        let bytes = if on { app::MOUSE_ON } else { app::MOUSE_OFF };
+        let _ = out.write_all(bytes.as_bytes());
+    }
+}
+
+/// Set the theme, code background and heading cell the look says.
+fn apply(look: &Look) {
     theme::set(look.theme);
     if let Some(rgb) = look.background {
         theme::set_background(rgb);
@@ -119,28 +161,38 @@ fn main() -> ExitCode {
     if let Some(rgb) = look.fallback_panel {
         theme::set_fallback_panel(rgb);
     }
-    let images = match look.cell {
-        Some(cell) => {
-            heading::set_cell(cell);
-            images::Images::new(cell)
-        }
-        None => images::Images::text(),
-    };
+    if let Some(cell) = look.cell {
+        heading::set_cell(cell);
+    }
+}
 
-    let mut terminal = match ratatui::try_init() {
-        Ok(terminal) => terminal,
-        Err(err) => {
-            eprintln!("smd: cannot open the terminal: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+fn main() -> ExitCode {
+    let args = Args::parse();
+    exit_code(smd(args), &mut io::stderr())
+}
+
+fn smd(args: Args) -> Result<(), Failure> {
+    let config = loaded(config::Config::load())?;
+    let path = pick_file(args.file, config.home.clone()).unwrap_or_else(|message| {
+        Args::command()
+            .error(ErrorKind::MissingRequiredArgument, message)
+            .exit()
+    });
+    let watcher = watch::Watcher::new(path.clone());
+    let source = source(&path, std::fs::read_to_string(&path))?;
+    let vault = vault::Vault::for_file(&path);
+    // Asked before the terminal is set up, while nothing else reads its replies.
+    let probe = (!args.no_graphics).then(kitty::probe);
+    let look = Look::new(probe, config.code_background);
+    apply(&look);
+    let images = images_for(look.cell);
+
+    let mut terminal = opened(ratatui::try_init())?;
     // Set after ratatui's hook, which restores the terminal, so it runs first.
     // A job's panic is caught and shown as a failed image, so it prints
     // nothing; any other deletes the images before the terminal is restored.
     let mouse = config.mouse;
-    if mouse {
-        let _ = io::stdout().write_all(app::MOUSE_ON.as_bytes());
-    }
+    set_mouse(&mut io::stdout(), mouse, true);
     let uploaded = images.uploaded();
     let restore = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -148,9 +200,7 @@ fn main() -> ExitCode {
             return;
         }
         let _ = uploaded.delete_all(&mut io::stdout());
-        if mouse {
-            let _ = io::stdout().write_all(app::MOUSE_OFF.as_bytes());
-        }
+        set_mouse(&mut io::stdout(), mouse, false);
         restore(info);
     }));
     // Started once the hook is set, like the jobs below.
@@ -161,17 +211,9 @@ fn main() -> ExitCode {
     let view = app::View::new(doc, app::folder(&path), images);
     let browser = app::Browser::new(view, path, watcher, vault, config);
     let result = app::run(&mut terminal, browser);
-    if mouse {
-        let _ = io::stdout().write_all(app::MOUSE_OFF.as_bytes());
-    }
+    set_mouse(&mut io::stdout(), mouse, false);
     ratatui::restore();
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("smd: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    finished(result)
 }
 
 #[cfg(test)]

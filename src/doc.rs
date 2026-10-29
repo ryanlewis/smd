@@ -572,11 +572,13 @@ fn code_lang(kind: CodeBlockKind) -> Option<String> {
     }
 }
 
-/// A fenced block in `mermaid` or `math` is a figure; any other is code.
+/// A fenced block in `mermaid` or `math`, in any case and with any
+/// attributes after a comma, is a figure; any other is code.
 fn code_block(lang: Option<String>, code: String) -> BlockKind {
-    let figure = match lang.as_deref() {
-        Some("mermaid") => FigureKind::Mermaid,
-        Some("math") => FigureKind::Math,
+    let name = lang.as_deref().and_then(|l| l.split(',').next());
+    let figure = match name {
+        Some(n) if n.eq_ignore_ascii_case("mermaid") => FigureKind::Mermaid,
+        Some(n) if n.eq_ignore_ascii_case("math") => FigureKind::Math,
         _ => return BlockKind::Code { lang, code },
     };
     BlockKind::Figure {
@@ -774,6 +776,24 @@ mod tests {
                 code: "fn main() {}\n".into()
             }]
         );
+    }
+
+    #[test]
+    fn figure_fences_ignore_case_and_attributes() {
+        for (md, kind) in [
+            ("```Mermaid\ngraph TD\n```\n", FigureKind::Mermaid),
+            ("```mermaid,foo\ngraph TD\n```\n", FigureKind::Mermaid),
+            ("```MATH\ngraph TD\n```\n", FigureKind::Math),
+        ] {
+            assert_eq!(
+                kinds(md),
+                vec![BlockKind::Figure {
+                    kind,
+                    source: "graph TD\n".into()
+                }],
+                "{md:?}"
+            );
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
     {
       "customType": "regex",
       "description": "The Rust toolchain CI runs on, marked with a renovate comment.",
-      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "managerFilePatterns": ["/^\\.github/workflows/(ci|release)\\.yml$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+RUST_TOOLCHAIN: (?<currentValue>\\S+)"
       ]

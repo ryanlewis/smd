@@ -146,7 +146,15 @@ smd is developed on macOS, and its tests run on Linux.
 
 ## Install
 
-You need Rust 1.99 or later.
+With Homebrew, on macOS (Apple silicon) or Linux (x86_64 or arm64):
+
+```sh
+brew install ryanlewis/tap/smd
+```
+
+Or download a binary from the [releases page](https://github.com/ryanlewis/smd/releases). The Linux builds need glibc 2.30 or later.
+
+With Cargo, you need Rust 1.99 or later:
 
 ```sh
 cargo install --git https://github.com/ryanlewis/smd --locked

@@ -519,9 +519,10 @@ impl Units {
         }
     }
 
-    /// The units and links. A link with no text drawn but spaces is left
-    /// out, as its spaces may merge away or fall at a line break, and is left
-    /// out at every width so the links keep their indices across a resize.
+    /// The units and links. A link whose text is only spaces or has no width
+    /// is left out, as its spaces may merge away or fall at a line break, and
+    /// is left out at every width so the links keep their indices across a
+    /// resize.
     fn finish(mut self) -> (Vec<Unit>, Vec<Link>) {
         self.end_word();
         let mut drawn = vec![false; self.links.len()];
@@ -1098,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn a_link_with_no_cells_is_left_out() {
+    fn a_link_of_only_spaces_is_left_out() {
         // Its space merges into the one before it, so nothing is drawn for it.
         assert_eq!(
             spots("a [ ](x) [b](y)\n", 20),

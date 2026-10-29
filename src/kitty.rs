@@ -142,7 +142,11 @@ pub fn probe() -> Probe {
 }
 
 fn window_cell_size() -> Option<(u16, u16)> {
-    let size = ratatui::crossterm::terminal::window_size().ok()?;
+    cell_size(ratatui::crossterm::terminal::window_size().ok()?)
+}
+
+/// The size of one cell in the window `size` reports, if it reports pixels.
+fn cell_size(size: ratatui::crossterm::terminal::WindowSize) -> Option<(u16, u16)> {
     if size.columns == 0 || size.rows == 0 {
         return None;
     }
@@ -168,43 +172,69 @@ fn query() -> Option<Vec<u8>> {
     if !was_raw {
         terminal::enable_raw_mode().ok()?;
     }
+    let reply = exchange(&mut io::stdout(), libc::STDIN_FILENO);
+    if !was_raw {
+        let _ = terminal::disable_raw_mode();
+    }
+    Some(reply)
+}
+
+/// Send the queries to `out` and read the replies from `fd` until the DA1
+/// reply or the timeout.
+#[cfg(unix)]
+fn exchange(out: &mut impl Write, fd: libc::c_int) -> Vec<u8> {
     // On the alternate screen, so a terminal that prints the graphics query
     // as text (Terminal.app does) leaves nothing behind once it is left.
-    let mut out = io::stdout();
     let sent = write!(out, "\x1b[?1049h{}", queries())
         .and_then(|()| out.flush())
         .is_ok();
+    let reply = if sent {
+        read_replies(Instant::now() + REPLY_TIMEOUT, |left| read_chunk(fd, left))
+    } else {
+        Vec::new()
+    };
+    let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
+    reply
+}
+
+/// Collect chunks from `next` until they hold the DA1 reply or `deadline`
+/// passes. `next` is given the time left and returns `None` when nothing came
+/// in that time or the input ended.
+fn read_replies(deadline: Instant, mut next: impl FnMut(Duration) -> Option<Vec<u8>>) -> Vec<u8> {
     let mut buf = Vec::new();
-    let deadline = Instant::now() + REPLY_TIMEOUT;
-    let fd = libc::STDIN_FILENO;
-    while sent && !has_da1_reply(&buf) {
+    while !has_da1_reply(&buf) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
         }
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
+        let Some(chunk) = next(left) else {
+            break;
         };
-        let ms = left.as_millis().clamp(1, 1000) as libc::c_int;
-        // SAFETY: one valid pollfd for the duration of the call.
-        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
-            break;
-        }
-        let mut chunk = [0u8; 256];
-        // SAFETY: reads at most chunk.len() bytes into chunk.
-        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n as usize]);
+        buf.extend_from_slice(&chunk);
     }
-    let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
-    if !was_raw {
-        let _ = terminal::disable_raw_mode();
+    buf
+}
+
+/// The bytes waiting on `fd`, waiting up to `left` for some to arrive.
+#[cfg(unix)]
+fn read_chunk(fd: libc::c_int, left: Duration) -> Option<Vec<u8>> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = left.as_millis().clamp(1, 1000) as libc::c_int;
+    // SAFETY: one valid pollfd for the duration of the call.
+    if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+        return None;
     }
-    Some(buf)
+    let mut chunk = [0u8; 256];
+    // SAFETY: reads at most chunk.len() bytes into chunk.
+    let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+    if n <= 0 {
+        return None;
+    }
+    Some(chunk[..n as usize].to_vec())
 }
 
 #[cfg(not(unix))]

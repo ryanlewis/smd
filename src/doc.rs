@@ -1322,6 +1322,26 @@ paragraph @21..62
     }
 
     #[test]
+    fn stray_html_and_footnote_references_are_text() {
+        // The parser sends neither today: HTML comes inside an HTML block,
+        // and footnotes are not turned on.
+        use pulldown_cmark::CowStr;
+        let mut builder = Builder::new("x<b>[^1]");
+        builder.event(Event::Start(Tag::Paragraph), 0..8);
+        builder.event(Event::Text(CowStr::from("x")), 0..1);
+        builder.event(Event::Html(CowStr::from("<b>")), 1..4);
+        builder.event(Event::FootnoteReference(CowStr::from("1")), 4..8);
+        builder.event(Event::End(TagEnd::Paragraph), 0..8);
+        let kinds: Vec<BlockKind> = builder
+            .finish()
+            .blocks
+            .into_iter()
+            .map(|b| b.kind)
+            .collect();
+        assert_eq!(kinds, vec![BlockKind::Paragraph(vec![text("x<b>[^1]")])]);
+    }
+
+    #[test]
     fn pin_images() {
         assert_outline(
             "![outer ![inner](i.png) alt](o.png)\n",

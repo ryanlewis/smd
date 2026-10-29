@@ -568,6 +568,9 @@ fn wrap(
         }
     }
     lines.finish_last();
+    // A link whose only text was a space dropped at a line start or merged
+    // into the one before it has nothing drawn, so nothing to select.
+    spots.retain(|spot| !spot.cells.is_empty());
     spots
 }
 
@@ -1077,6 +1080,16 @@ mod tests {
     fn no_break_spaces_keep_words_together() {
         assert_eq!(plain("go 10&nbsp;km\n", 6), vec!["go", "10\u{a0}km"]);
         assert_eq!(plain("a\u{a0}\u{a0}b\n", 20), vec!["a\u{a0}\u{a0}b"]);
+    }
+
+    #[test]
+    fn a_link_with_no_cells_is_left_out() {
+        // Its space merges into the one before it, so nothing is drawn for it.
+        assert_eq!(
+            spots("a [ ](x) [b](y)\n", 20),
+            vec![("y".to_string(), vec![(0, 2..3)])]
+        );
+        assert_eq!(spots("[ ](x) b\n", 20), vec![]);
     }
 
     #[test]

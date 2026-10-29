@@ -2,7 +2,7 @@
 
 A terminal markdown reader that draws mermaid diagrams, maths and headings as images, and keeps the rest as text you can select.
 
-![smd showing a note with a mermaid diagram, maths and a table](docs/images/demo.gif)
+![smd scrolling a note with a mermaid diagram, maths and a table, following a link, then split and resized so the table reflows](docs/images/demo.gif)
 
 ## Features
 

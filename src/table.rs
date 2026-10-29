@@ -8,7 +8,7 @@ use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{Embed, InlineStyle, Link, embed, is_wiki, link_dest};
-use crate::render::breaks_at;
+use crate::render::{LinkSpot, breaks_at};
 
 /// The longest word a column is widened to hold whole. A longer one, such as
 /// a URL, breaks.
@@ -31,14 +31,33 @@ type Cell = Vec<(String, InlineStyle)>;
 /// Characters, each with the index of the run it came from.
 type Chars = Vec<(char, usize)>;
 
+/// A span, and the link its text is part of, by its index in the table's
+/// links.
+type Piece = (Span<'static>, Option<usize>);
+
 /// Lines of styled text.
-type Lines = Vec<Vec<Span<'static>>>;
+type Lines = Vec<Vec<Piece>>;
 
 #[derive(Debug, PartialEq)]
 pub struct Table {
     aligns: Vec<Alignment>,
     /// The header row first. Every row has one cell per column.
     rows: Vec<Vec<Cell>>,
+    /// The links in the cells, in order. Runs next to each other in a cell
+    /// with the same link are one link. A link with nothing to see is left
+    /// out, so the links are the same however the table is drawn.
+    links: Vec<Link>,
+    run_links: RunLinks,
+}
+
+/// For each row, cell and run, its link in the table's links.
+type RunLinks = Vec<Vec<Vec<Option<usize>>>>;
+
+/// A table drawn as lines of text.
+pub struct Drawn {
+    pub lines: Vec<Vec<Span<'static>>>,
+    /// Each link, and the line and columns of each piece of its text.
+    pub links: Vec<LinkSpot>,
 }
 
 impl Table {
@@ -62,7 +81,12 @@ impl Table {
         &self,
         avail: usize,
         styled: impl Fn(Style, &InlineStyle) -> Style + Copy,
-    ) -> Lines {
+    ) -> Drawn {
+        self.drawn(self.layout(avail, styled))
+    }
+
+    /// The lines `lines` draws, as pieces.
+    fn layout(&self, avail: usize, styled: impl Fn(Style, &InlineStyle) -> Style + Copy) -> Lines {
         let avail = avail.max(1);
         let natural = self.natural();
         if frame(&natural) <= avail {
@@ -150,9 +174,9 @@ impl Table {
         let border = Style::new().fg(Color::DarkGray);
         let rule = |left: &str, fill: &str, mid: &str, right: &str| {
             let parts: Vec<String> = widths.iter().map(|w| fill.repeat(w + 2)).collect();
-            vec![Span::styled(
-                format!("{left}{}{right}", parts.join(mid)),
-                border,
+            vec![(
+                Span::styled(format!("{left}{}{right}", parts.join(mid)), border),
+                None,
             )]
         };
         let rows: Vec<Vec<Wrapped>> = self
@@ -178,21 +202,24 @@ impl Table {
                 Style::default()
             };
             hard += cells.iter().map(|w| w.hard).sum::<usize>();
+            let pieces: Vec<Lines> = cells
+                .iter()
+                .enumerate()
+                .map(|(c, cell)| pieces(cell, &self.run_links[r][c], base, &styled))
+                .collect();
             for k in 0..height(cells) {
                 let mut line = Vec::new();
                 for (c, cell) in cells.iter().enumerate() {
                     let edge = if c == 0 { "│ " } else { " │ " };
-                    line.push(Span::styled(edge, border));
+                    line.push((Span::styled(edge, border), None));
                     let part = cell.lines.get(k).map_or(&[][..], Vec::as_slice);
                     let extra = widths[c].saturating_sub(text_width(part));
                     let (before, after) = padding(self.aligns[c], extra);
-                    line.push(Span::raw(" ".repeat(before)));
-                    for (text, style) in part {
-                        line.push(Span::styled(text.clone(), styled(base, style)));
-                    }
-                    line.push(Span::raw(" ".repeat(after)));
+                    line.push((Span::raw(" ".repeat(before)), None));
+                    line.extend(pieces[c].get(k).cloned().unwrap_or_default());
+                    line.push((Span::raw(" ".repeat(after)), None));
                 }
-                line.push(Span::styled(" │", border));
+                line.push((Span::styled(" │", border), None));
                 lines.push(line);
             }
             if r + 1 < rows.len() {
@@ -213,16 +240,18 @@ impl Table {
     /// each cell that has text, the value wrapped under itself. A table with
     /// no body shows its header as one card.
     fn cards(&self, width: usize, styled: impl Fn(Style, &InlineStyle) -> Style + Copy) -> Lines {
-        let rule = vec![Span::styled(
-            "─".repeat(width),
-            Style::new().fg(Color::DarkGray),
+        let rule = vec![(
+            Span::styled("─".repeat(width), Style::new().fg(Color::DarkGray)),
+            None,
         )];
         let bold = Style::new().add_modifier(Modifier::BOLD);
         let heads = &self.rows[0];
         if self.rows.len() == 1 {
             let mut lines = vec![rule.clone()];
-            for head in heads.iter().filter(|h| !h.is_empty()) {
-                lines.extend(spans(&wrap(head, width).lines, bold, styled));
+            for (head, ids) in heads.iter().zip(&self.run_links[0]) {
+                if !head.is_empty() {
+                    lines.extend(pieces(&wrap(head, width), ids, bold, styled));
+                }
             }
             lines.push(rule);
             return lines;
@@ -237,32 +266,35 @@ impl Table {
             .min(width / 3);
         let indent = label + 2;
         let mut lines = Vec::new();
-        for row in &self.rows[1..] {
+        for (r, row) in self.rows.iter().enumerate().skip(1) {
             lines.push(rule.clone());
-            for (head, cell) in heads.iter().zip(row) {
+            for (c, (head, cell)) in heads.iter().zip(row).enumerate() {
                 if cell.is_empty() {
                     continue;
                 }
+                let head_ids = &self.run_links[0][c];
                 let value = wrap(cell, width.saturating_sub(indent));
-                let mut values = spans(&value.lines, Style::default(), styled).into_iter();
+                let value = pieces(&value, &self.run_links[r][c], Style::default(), styled);
+                let mut values = value.into_iter();
                 let head_width = text_width(head) + 1;
                 if head_width <= label + 1 {
-                    let mut line = spans(std::slice::from_ref(head), bold, styled).remove(0);
+                    let whole = Wrapped::whole(head);
+                    let mut line = pieces(&whole, head_ids, bold, styled).remove(0);
                     let pad = " ".repeat(indent - head_width);
-                    line.push(Span::styled(format!(":{pad}"), bold));
+                    line.push((Span::styled(format!(":{pad}"), bold), None));
                     line.extend(values.next().unwrap_or_default());
                     lines.push(line);
                 } else {
                     // The header on lines of its own, the value under it.
-                    let mut heading =
-                        spans(&wrap(head, width.saturating_sub(1)).lines, bold, styled);
+                    let head = wrap(head, width.saturating_sub(1));
+                    let mut heading = pieces(&head, head_ids, bold, styled);
                     if let Some(last) = heading.last_mut() {
-                        last.push(Span::styled(":", bold));
+                        last.push((Span::styled(":", bold), None));
                     }
                     lines.extend(heading);
                 }
                 for value in values {
-                    let mut line = vec![Span::raw(" ".repeat(indent))];
+                    let mut line = vec![(Span::raw(" ".repeat(indent)), None)];
                     line.extend(value);
                     lines.push(line);
                 }
@@ -273,14 +305,60 @@ impl Table {
     }
 }
 
-/// Lines of cell text as spans on top of `base`.
-fn spans(lines: &[Cell], base: Style, styled: impl Fn(Style, &InlineStyle) -> Style) -> Lines {
-    let line = |runs: &Cell| {
-        let runs = runs.iter();
-        runs.map(|(text, style)| Span::styled(text.clone(), styled(base, style)))
+impl Table {
+    /// The spans of `lines`, and the columns each link's pieces take.
+    fn drawn(&self, lines: Lines) -> Drawn {
+        let mut links: Vec<LinkSpot> = self
+            .links
+            .iter()
+            .map(|link| LinkSpot {
+                link: link.clone(),
+                cells: Vec::new(),
+            })
+            .collect();
+        let lines = lines
+            .into_iter()
+            .enumerate()
+            .map(|(row, line)| {
+                let mut col = 0;
+                let mut spans = Vec::with_capacity(line.len());
+                for (span, link) in line {
+                    let start = col;
+                    col += span.width() as u16;
+                    if let Some(i) = link {
+                        let cells = &mut links[i].cells;
+                        match cells.last_mut() {
+                            Some((r, cols)) if *r == row && cols.end == start => cols.end = col,
+                            _ => cells.push((row, start..col)),
+                        }
+                    }
+                    spans.push(span);
+                }
+                spans
+            })
+            .collect();
+        Drawn { lines, links }
+    }
+}
+
+/// A wrapped cell's lines as pieces on top of `base`, given each of the
+/// cell's runs' links.
+fn pieces(
+    cell: &Wrapped,
+    run_links: &[Option<usize>],
+    base: Style,
+    styled: impl Fn(Style, &InlineStyle) -> Style,
+) -> Lines {
+    let line = |(runs, sources): (&Cell, &Vec<usize>)| {
+        runs.iter()
+            .zip(sources)
+            .map(|((text, style), &i)| {
+                let span = Span::styled(text.clone(), styled(base, style));
+                (span, run_links.get(i).copied().flatten())
+            })
             .collect()
     };
-    lines.iter().map(line).collect()
+    cell.lines.iter().zip(&cell.sources).map(line).collect()
 }
 
 /// Columns taken by box rules and padding around columns of these widths.
@@ -300,6 +378,8 @@ struct Grid {
 /// A cell broken into lines.
 struct Wrapped {
     lines: Vec<Cell>,
+    /// For each run in `lines`, the run in the cell it came from.
+    sources: Vec<Vec<usize>>,
     /// Words broken mid-word: not at a space or after `BREAK_AFTER`.
     hard: usize,
 }
@@ -359,22 +439,41 @@ fn wrap(cell: &Cell, width: usize) -> Wrapped {
         used = chars_width(rest);
     }
 
+    let mut sources = Vec::with_capacity(lines.len());
     let lines = lines
         .into_iter()
         .map(|line| {
             let mut runs: Cell = Vec::new();
-            let mut last = None;
+            let mut from = Vec::new();
             for (c, i) in line {
                 match runs.last_mut() {
-                    Some((s, _)) if last == Some(i) => s.push(c),
-                    _ => runs.push((c.to_string(), cell[i].1.clone())),
+                    Some((s, _)) if from.last() == Some(&i) => s.push(c),
+                    _ => {
+                        runs.push((c.to_string(), cell[i].1.clone()));
+                        from.push(i);
+                    }
                 }
-                last = Some(i);
             }
+            sources.push(from);
             runs
         })
         .collect();
-    Wrapped { lines, hard }
+    Wrapped {
+        lines,
+        sources,
+        hard,
+    }
+}
+
+impl Wrapped {
+    /// `cell` on one line as it is.
+    fn whole(cell: &Cell) -> Wrapped {
+        Wrapped {
+            lines: vec![cell.clone()],
+            sources: vec![(0..cell.len()).collect()],
+            hard: 0,
+        }
+    }
 }
 
 /// Where to break a word too wide for `width`: how many characters stay on
@@ -543,11 +642,63 @@ impl Builder {
         for row in &mut self.rows {
             row.resize_with(columns, Vec::new);
         }
+        let (links, run_links) = cell_links(&self.rows);
         Table {
             aligns: self.aligns,
             rows: self.rows,
+            links,
+            run_links,
         }
     }
+}
+
+/// The links in `rows`, and each run's link among them. Runs next to each
+/// other in a cell with the same link are one link. A link with nothing
+/// drawn whether the table is a grid or cards is left out: one whose text is
+/// only spaces, where a cell's lines break, or one in the header of a column
+/// with nothing in it, which no card shows.
+fn cell_links(rows: &[Vec<Cell>]) -> (Vec<Link>, RunLinks) {
+    // Each link found, and whether any of its text shows.
+    let mut found: Vec<(Link, bool)> = Vec::new();
+    let mut run_links: RunLinks = Vec::new();
+    let unseen = |c: usize| rows.len() > 1 && rows[1..].iter().all(|row| row[c].is_empty());
+    for (r, row) in rows.iter().enumerate() {
+        let mut row_links = Vec::new();
+        for (c, cell) in row.iter().enumerate() {
+            let hidden = r == 0 && unseen(c);
+            let mut ids: Vec<Option<usize>> = Vec::with_capacity(cell.len());
+            for (text, style) in cell {
+                let open = ids.last().copied().flatten();
+                let id = style.link.as_ref().map(|link| match open {
+                    Some(i) if found[i].0 == *link => i,
+                    _ => {
+                        found.push((link.clone(), false));
+                        found.len() - 1
+                    }
+                });
+                if let Some(i) = id {
+                    let drawn = |c: char| !breaks_at(c) && c.width().unwrap_or(0) > 0;
+                    found[i].1 |= !hidden && text.chars().any(drawn);
+                }
+                ids.push(id);
+            }
+            row_links.push(ids);
+        }
+        run_links.push(row_links);
+    }
+    // Each link's new index, if it is kept.
+    let mut index = Vec::with_capacity(found.len());
+    let mut links = Vec::new();
+    for (link, shows) in found {
+        index.push(shows.then_some(links.len()));
+        if shows {
+            links.push(link);
+        }
+    }
+    for id in run_links.iter_mut().flatten().flatten() {
+        *id = id.and_then(|i| index[i]);
+    }
+    (links, run_links)
 }
 
 /// Go in or out of a span that nests. Returns whether still inside one.
@@ -587,7 +738,7 @@ mod tests {
     use super::*;
 
     fn plain(table: &Table, avail: usize) -> Vec<String> {
-        let lines = table.lines(avail, |base, _| base);
+        let lines = table.lines(avail, |base, _| base).lines;
         let text = |line: &Vec<Span>| line.iter().map(|s| s.content.as_ref()).collect();
         lines.iter().map(text).collect()
     }
@@ -735,7 +886,7 @@ mod tests {
     #[test]
     fn the_header_is_bold() {
         let table = Table::parse("| h |\n|---|\n| b |");
-        let lines = table.lines(80, |base, _| base);
+        let lines = table.lines(80, |base, _| base).lines;
         assert!(lines[1][2].style.add_modifier.contains(Modifier::BOLD));
         assert!(!lines[3][2].style.add_modifier.contains(Modifier::BOLD));
     }

@@ -612,29 +612,33 @@ mod tests {
         // without SA_RESTART, as with any handler.
         extern "C" fn ignore(_: libc::c_int) {}
         // SAFETY: a zeroed sigaction is valid; the handler is async-signal
-        // safe as it does nothing.
-        unsafe {
+        // safe as it does nothing. The old handler is put back below.
+        let old = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
-            assert_eq!(
-                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
-                0
-            );
-        }
+            let mut old: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, &mut old), 0);
+            old
+        };
         let pipe = Pipe::new(b"", false);
         let write = pipe.write.unwrap();
         // SAFETY: pthread_self has no preconditions.
         let waiting = unsafe { libc::pthread_self() } as usize;
         let terminal = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            // SAFETY: the waiting thread is alive until this thread is joined.
-            unsafe { libc::pthread_kill(waiting as libc::pthread_t, libc::SIGUSR1) };
-            std::thread::sleep(Duration::from_millis(50));
+            // Several signals, so some land while the probe is in poll.
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(10));
+                // SAFETY: the waiting thread is alive until this thread is
+                // joined.
+                unsafe { libc::pthread_kill(waiting as libc::pthread_t, libc::SIGUSR1) };
+            }
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
         });
         let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10));
         terminal.join().unwrap();
+        // SAFETY: puts back the handler saved above.
+        unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) };
         assert_eq!(reply, b"\x1b[?62c");
     }
 

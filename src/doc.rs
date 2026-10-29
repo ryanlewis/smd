@@ -1276,6 +1276,11 @@ paragraph @21..62
             "![[pic.png |300]]\n",
             "image \"pic.png\" alt=\"300\" wiki=true @0..18\n",
         );
+        // Only a backslash right before the alias's pipe is an escape.
+        assert_outline(
+            "[[a\\ |t]]\n",
+            "paragraph @0..10\n  \"t\" link=\"a\\\\\" wiki=true\n",
+        );
         assert_outline(
             "![[pic.png #small]]\n",
             "image \"pic.png\" alt=\"pic.png #small\" wiki=true @0..20\n",

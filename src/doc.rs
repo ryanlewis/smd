@@ -8,6 +8,8 @@ use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
+use crate::theme::Theme;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
     pub source: String,
@@ -122,6 +124,15 @@ pub fn is_image(name: &str) -> bool {
         .any(|e| ext.eq_ignore_ascii_case(e))
 }
 
+/// The end of an image's address that says a page shows it only on the
+/// background of the theme other than `theme`.
+fn other_theme(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Dark => "#gh-light-mode-only",
+        Theme::Light => "#gh-dark-mode-only",
+    }
+}
+
 /// What an image tag stands for.
 #[derive(Debug, PartialEq)]
 pub enum Embed {
@@ -193,13 +204,24 @@ fn without_fragment(name: &str) -> &str {
     name.split_once('#').map_or(name, |(name, _)| name)
 }
 
+/// `source` parsed with no theme known.
+#[cfg(test)]
 pub fn parse(source: &str) -> Document {
+    parse_for(source, None)
+}
+
+/// `source` parsed for a background of `theme`, when the terminal reported
+/// it. An image a page on the web shows only on the other theme's
+/// background, such as one of a README's two logos, is left out, with a
+/// link, paragraph, quote, list item or list it leaves empty.
+pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS;
     let mut builder = Builder::new(source);
+    builder.hide = theme.map(other_theme);
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
         builder.event(event, range);
     }
@@ -218,6 +240,10 @@ struct Builder<'a> {
     /// wiki embed.
     image: Option<(String, String, bool)>,
     image_depth: u32,
+    /// Images ending with this are left out.
+    hide: Option<&'static str>,
+    /// How deep in an image being left out.
+    hidden: u32,
     /// For each image started and not yet ended, whether it was a wiki embed
     /// of a note, read as a link instead.
     embeds: Vec<bool>,
@@ -236,6 +262,8 @@ struct Frame {
     display_math: Vec<String>,
     images: Vec<(String, String, bool)>,
     other_inline: bool,
+    /// Whether an image or block in it was left out for the theme.
+    left_out: bool,
 }
 
 enum FrameKind {
@@ -269,6 +297,7 @@ impl Frame {
             display_math: Vec::new(),
             images: Vec::new(),
             other_inline: false,
+            left_out: false,
         }
     }
 
@@ -290,6 +319,9 @@ fn paragraph_blocks(frame: &mut Frame, span: Range<usize>) -> Vec<Block> {
     let maths = std::mem::take(&mut frame.display_math);
     let mut images = std::mem::take(&mut frame.images);
     let other = std::mem::replace(&mut frame.other_inline, false);
+    if frame.left_out && maths.is_empty() && images.is_empty() && !other {
+        return Vec::new();
+    }
     if maths.is_empty() && images.len() == 1 && !other {
         let (src, alt, wiki) = images.remove(0);
         return vec![Block {
@@ -327,6 +359,8 @@ impl<'a> Builder<'a> {
             in_table: false,
             image: None,
             image_depth: 0,
+            hide: None,
+            hidden: 0,
             embeds: Vec::new(),
         }
     }
@@ -371,6 +405,15 @@ impl<'a> Builder<'a> {
         if self.in_table {
             if matches!(event, Event::End(TagEnd::Table)) {
                 self.in_table = false;
+            }
+            return;
+        }
+        // An image left out takes its alt text with it.
+        if self.hidden > 0 {
+            match event {
+                Event::Start(Tag::Image { .. }) => self.hidden += 1,
+                Event::End(TagEnd::Image) => self.hidden -= 1,
+                _ => {}
             }
             return;
         }
@@ -479,6 +522,14 @@ impl<'a> Builder<'a> {
     }
 
     fn start_image(&mut self, wiki: bool, dest: &str, range: Range<usize>) {
+        if let Some(end) = self.hide
+            && link_dest(dest, wiki).ends_with(end)
+            && embed(dest, wiki) == Embed::Image
+        {
+            self.hidden = 1;
+            self.top().left_out = true;
+            return;
+        }
         if let Embed::Note(link) = embed(dest, wiki) {
             self.embeds.push(true);
             self.links.push(link);
@@ -535,6 +586,11 @@ impl<'a> Builder<'a> {
     fn close(&mut self) {
         let mut frame = self.stack.pop().expect("frame to close");
         let span = frame.span.clone();
+        // A block left empty by an image left out for the theme goes too.
+        let emptied = |frame: &Frame| frame.left_out && frame.blocks.is_empty();
+        if frame.left_out {
+            self.top().left_out = true;
+        }
         let kind = match std::mem::replace(&mut frame.kind, FrameKind::Root) {
             FrameKind::Root => unreachable!("root frame is never closed"),
             FrameKind::Paragraph => {
@@ -544,6 +600,9 @@ impl<'a> Builder<'a> {
             }
             FrameKind::Item { task } => {
                 frame.flush_inlines();
+                if emptied(&frame) {
+                    return;
+                }
                 if let FrameKind::List { items, .. } = &mut self.top().kind {
                     items.push(ListItem {
                         task,
@@ -552,16 +611,21 @@ impl<'a> Builder<'a> {
                 }
                 return;
             }
+            FrameKind::Heading(_) if frame.left_out && !frame.other_inline => return,
             FrameKind::Heading(level) => BlockKind::Heading {
                 level,
                 content: frame.inlines,
             },
             FrameKind::Quote => {
                 frame.flush_inlines();
+                if emptied(&frame) {
+                    return;
+                }
                 BlockKind::Quote(frame.blocks)
             }
             FrameKind::Code { lang, code } => code_block(lang, code),
             FrameKind::Html(html) => BlockKind::Html(html),
+            FrameKind::List { items, .. } if frame.left_out && items.is_empty() => return,
             FrameKind::List {
                 start,
                 tight,
@@ -1205,6 +1269,69 @@ mod tests {
     #[track_caller]
     fn assert_outline(md: &str, expected: &str) {
         assert_eq!(outline(md), expected, "markdown: {md:?}");
+    }
+
+    fn themed(md: &str, theme: Theme) -> String {
+        let mut out = String::new();
+        outline_blocks(&parse_for(md, Some(theme)).blocks, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn an_inline_logo_for_the_other_background_is_left_out() {
+        // Two logos on a line, each in a link: the one left out takes its
+        // link with it.
+        let md = "[![d](d.png#gh-dark-mode-only)](u) [![l](l.png#gh-light-mode-only)](v)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..71\n  \"[image: d]\" link=\"u\" wiki=false\n  \" \"\n"
+        );
+        assert_eq!(
+            themed(md, Theme::Light),
+            "paragraph @0..71\n  \" \"\n  \"[image: l]\" link=\"v\" wiki=false\n"
+        );
+        // A wiki embed, whose fragment is not part of its name.
+        let md = "![[logo.png#gh-dark-mode-only]]\n\nafter\n";
+        assert_eq!(themed(md, Theme::Light), "paragraph @33..39\n  \"after\"\n");
+        // Two logos on a line with no links.
+        let md = "![d](d.png#gh-dark-mode-only) ![l](l.png#gh-light-mode-only)\n";
+        assert_eq!(
+            themed(md, Theme::Light),
+            "image \"l.png#gh-light-mode-only\" alt=\"l\" wiki=false @0..61\n"
+        );
+    }
+
+    #[test]
+    fn a_logo_for_the_other_background_leaves_no_empty_block() {
+        let md = "![logo](dark.png#gh-dark-mode-only)\n\n![logo](light.png#gh-light-mode-only)\n\n\
+                  > ![logo](light.png#gh-light-mode-only)\n\n![shot](shot.png)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "image \"dark.png#gh-dark-mode-only\" alt=\"logo\" wiki=false @0..36\n\
+             image \"shot.png\" alt=\"shot\" wiki=false @117..135\n"
+        );
+        // A quote, list item or list left with nothing goes too.
+        let md = "- ![logo](light.png#gh-light-mode-only)\n- one\n\n\
+                  > ![logo](light.png#gh-light-mode-only)\n\n\
+                  - ![logo](light.png#gh-light-mode-only)\n";
+        let blocks = parse_for(md, Some(Theme::Dark)).blocks;
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let BlockKind::List { items, .. } = &blocks[0].kind else {
+            panic!("{blocks:?}");
+        };
+        assert_eq!(items.len(), 1);
+        // A heading or paragraph left with nothing to show goes too.
+        let md = "# ![l](l.png#gh-light-mode-only)\n\n\
+                  ![l](l.png#gh-light-mode-only)\\\n![l](l2.png#gh-light-mode-only)\n\ntext\n";
+        assert_eq!(themed(md, Theme::Dark), "paragraph @99..104\n  \"text\"\n");
+        // And on a light background, the other logo.
+        let md = "> ![logo](dark.png#gh-dark-mode-only)\n\n![logo](light.png#gh-light-mode-only)\n";
+        assert_eq!(
+            themed(md, Theme::Light),
+            "image \"light.png#gh-light-mode-only\" alt=\"logo\" wiki=false @39..77\n"
+        );
+        // With no theme known, both logos stay.
+        assert_eq!(parse_for(md, None).blocks, parse(md).blocks);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontRef, FontVec, GlyphImageFormat, PxScale, ScaleFont, point};
 
 use crate::images::Png;
 
@@ -97,6 +97,162 @@ fn load((path, index): Face) -> Option<FontVec> {
     FontVec::try_from_vec_and_index(data, index).ok()
 }
 
+/// Colour emoji fonts to look for, for emoji in headings.
+const EMOJI: &[Face] = &[
+    ("/System/Library/Fonts/Apple Color Emoji.ttc", 0),
+    ("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 0),
+    ("/usr/share/fonts/noto/NotoColorEmoji.ttf", 0),
+    ("/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf", 0),
+];
+
+/// A colour emoji font, whose glyphs are PNG images rather than outlines.
+pub struct Emoji(FontRef<'static>);
+
+/// The system's colour emoji font, read once.
+pub fn emoji() -> Option<&'static Emoji> {
+    static FOUND: OnceLock<Option<Emoji>> = OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            EMOJI.iter().find_map(|&(path, index)| {
+                let data = map(path)?;
+                FontRef::try_from_slice_and_index(data, index)
+                    .ok()
+                    .map(Emoji)
+            })
+        })
+        .as_ref()
+}
+
+/// The file at `path`, mapped into memory for the rest of the run. Apple's
+/// emoji font is about 200 MB, and a heading reads a few of its images.
+#[cfg(unix)]
+fn map(path: &str) -> Option<&'static [u8]> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open(path).ok()?;
+    let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: a read-only private mapping of a whole file that stays open
+    // until the mapping is made. It is never unmapped, so the slice lives as
+    // long as the program. System fonts are not rewritten in place.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return None;
+    }
+    // SAFETY: the mapping is `len` readable bytes and is never unmapped.
+    Some(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) })
+}
+
+#[cfg(not(unix))]
+fn map(path: &str) -> Option<&'static [u8]> {
+    Some(std::fs::read(path).ok()?.leak())
+}
+
+impl Emoji {
+    /// Whether the font has a colour image for `c`.
+    pub fn has(&self, c: char) -> bool {
+        let id = self.0.glyph_id(c);
+        id.0 != 0
+            && self
+                .0
+                .glyph_raster_image2(id, 64)
+                .is_some_and(|img| matches!(img.format, GlyphImageFormat::Png))
+    }
+
+    /// The image for `c` from the strike nearest `size` pixels per em, and
+    /// that strike's pixels per em.
+    pub fn bitmap(&self, c: char, size: f32) -> Option<(Bitmap, f32)> {
+        let id = self.0.glyph_id(c);
+        let want = size.ceil().clamp(1.0, f32::from(u16::MAX)) as u16;
+        let img = self.0.glyph_raster_image2(id, want)?;
+        if !matches!(img.format, GlyphImageFormat::Png) || img.pixels_per_em == 0 {
+            return None;
+        }
+        Some((Bitmap::decode(img.data)?, f32::from(img.pixels_per_em)))
+    }
+}
+
+/// A decoded image in straight RGBA.
+pub struct Bitmap {
+    pub width: u32,
+    pub height: u32,
+    pixels: Vec<Rgba>,
+}
+
+impl Bitmap {
+    /// Decode a PNG of any colour type to RGBA.
+    pub fn decode(data: &[u8]) -> Option<Bitmap> {
+        let mut decoder = png::Decoder::new(data);
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = decoder.read_info().ok()?;
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).ok()?;
+        let bytes = &buf[..info.buffer_size()];
+        let pixels: Vec<Rgba> = match info.color_type {
+            png::ColorType::Rgba => bytes.as_chunks::<4>().0.to_vec(),
+            png::ColorType::Rgb => bytes
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| [p[0], p[1], p[2], 255])
+                .collect(),
+            png::ColorType::GrayscaleAlpha => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| [p[0], p[0], p[0], p[1]])
+                .collect(),
+            png::ColorType::Grayscale => bytes.iter().map(|&g| [g, g, g, 255]).collect(),
+            png::ColorType::Indexed => return None,
+        };
+        (pixels.len() == info.width as usize * info.height as usize).then_some(Bitmap {
+            width: info.width,
+            height: info.height,
+            pixels,
+        })
+    }
+
+    /// The average colour of the area from `left`, `top` to `right`,
+    /// `bottom`, in pixels, weighted by how much of each pixel it covers.
+    fn average(&self, left: f32, top: f32, right: f32, bottom: f32) -> Rgba {
+        let mut sum = [0.0f32; 4];
+        let mut area = 0.0;
+        for y in top.floor() as u32..(bottom.ceil() as u32).min(self.height) {
+            let h = (bottom.min(y as f32 + 1.0) - top.max(y as f32)).max(0.0);
+            for x in left.floor() as u32..(right.ceil() as u32).min(self.width) {
+                let w = (right.min(x as f32 + 1.0) - left.max(x as f32)).max(0.0);
+                let p = self.pixels[(y * self.width + x) as usize];
+                let a = f32::from(p[3]) / 255.0 * w * h;
+                for i in 0..3 {
+                    sum[i] += f32::from(p[i]) * a;
+                }
+                sum[3] += a;
+                area += w * h;
+            }
+        }
+        if sum[3] <= 0.0 || area <= 0.0 {
+            return [0; 4];
+        }
+        [
+            (sum[0] / sum[3]).round() as u8,
+            (sum[1] / sum[3]).round() as u8,
+            (sum[2] / sum[3]).round() as u8,
+            (sum[3] / area * 255.0).round() as u8,
+        ]
+    }
+}
+
 /// Straight (not premultiplied) RGBA.
 pub type Rgba = [u8; 4];
 
@@ -119,6 +275,11 @@ impl Canvas {
     #[cfg(test)]
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    #[cfg(test)]
+    pub fn pixels(&self) -> impl Iterator<Item = &Rgba> {
+        self.pixels.iter()
     }
 
     /// Paint `colour` over the pixel at `x`, `y`, `coverage` of it covered.
@@ -172,6 +333,38 @@ impl Canvas {
             previous = Some(id);
         }
         x
+    }
+
+    /// Draw `bitmap` scaled into the box from `x`, `y`, `width` by `height`
+    /// pixels. Each pixel takes the average of the image under it.
+    pub fn image(&mut self, bitmap: &Bitmap, x: f32, y: f32, width: f32, height: f32) {
+        if width <= 0.0 || height <= 0.0 || bitmap.width == 0 || bitmap.height == 0 {
+            return;
+        }
+        let (sx, sy) = (bitmap.width as f32 / width, bitmap.height as f32 / height);
+        let x0 = x.floor() as i64;
+        let y0 = y.floor() as i64;
+        let x1 = (x + width).ceil() as i64;
+        let y1 = (y + height).ceil() as i64;
+        for py in y0..y1 {
+            // The part of the image row range under this pixel.
+            let top = ((py as f32 - y) * sy).max(0.0);
+            let bottom = ((py as f32 + 1.0 - y) * sy).min(bitmap.height as f32);
+            if bottom <= top {
+                continue;
+            }
+            for px in x0..x1 {
+                let left = ((px as f32 - x) * sx).max(0.0);
+                let right = ((px as f32 + 1.0 - x) * sx).min(bitmap.width as f32);
+                if right <= left {
+                    continue;
+                }
+                let colour = bitmap.average(left, top, right, bottom);
+                // Partly covered edge pixels take part of the colour.
+                let cover = (right - left) / sx * (bottom - top) / sy;
+                self.blend(px, py, colour, cover);
+            }
+        }
     }
 
     pub fn png(&self) -> Result<Png, String> {
@@ -266,6 +459,24 @@ mod tests {
         canvas.blend(-1, 0, [0, 0, 0, 255], 1.0);
         canvas.blend(2, 0, [0, 0, 0, 255], 1.0);
         assert_eq!(canvas.pixels[1], [0; 4]);
+    }
+
+    #[test]
+    fn an_image_is_averaged_into_its_box() {
+        // Two by one: opaque red, then clear. Squeezed into one pixel, it is
+        // red at half cover.
+        let mut canvas = Canvas::new(2, 1);
+        canvas.blend(0, 0, [255, 0, 0, 255], 1.0);
+        let bitmap = Bitmap::decode(&canvas.encode().unwrap()).unwrap();
+        assert_eq!((bitmap.width, bitmap.height), (2, 1));
+        let mut out = Canvas::new(1, 1);
+        out.image(&bitmap, 0.0, 0.0, 1.0, 1.0);
+        assert_eq!(out.pixels[0], [255, 0, 0, 128]);
+        // Stretched to four pixels, it is red then clear.
+        let mut out = Canvas::new(4, 1);
+        out.image(&bitmap, 0.0, 0.0, 4.0, 1.0);
+        assert_eq!(out.pixels[1], [255, 0, 0, 255]);
+        assert_eq!(out.pixels[2], [0; 4]);
     }
 
     #[test]

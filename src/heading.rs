@@ -1,9 +1,10 @@
 //! Headings drawn as images in a real font, larger for higher levels.
 //!
 //! The font is read from the machine rather than bundled (see
-//! [`raster::sans_bold`]), with the monospace bold face for inline code. A
-//! heading with a character neither font has, or with no font found at all,
-//! stays as text.
+//! [`raster::sans_bold`]), with the monospace bold face for inline code and
+//! the colour emoji font for emoji. A heading with a character none of them
+//! has, an emoji sequence that needs shaping (a flag, a skin tone, a joined
+//! family), or with no font found at all, stays as text.
 //!
 //! Each level is drawn at a fixed height in whole cell rows, so the image does
 //! not change when the pane is resized. A heading wider than the pane is
@@ -17,7 +18,7 @@ use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use crate::doc::Inline;
 use crate::images::Job;
 use crate::kitty;
-use crate::raster::{self, Canvas, Rgba};
+use crate::raster::{self, Canvas, Emoji, Rgba};
 use crate::theme::Theme;
 
 /// Cell size used by heading jobs, set once at start-up.
@@ -83,20 +84,52 @@ fn runs(content: &[Inline]) -> Vec<Run> {
     out
 }
 
-/// Text drawn in one font and colour.
+/// Where a piece's glyphs come from.
+#[derive(Clone, Copy)]
+enum Face<'a> {
+    Outline(&'a FontVec),
+    Emoji(&'a Emoji),
+}
+
+impl Face<'_> {
+    fn same(self, other: Face) -> bool {
+        match (self, other) {
+            (Face::Outline(a), Face::Outline(b)) => std::ptr::eq(a, b),
+            (Face::Emoji(_), Face::Emoji(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Text drawn in one face and colour.
 struct Piece<'a> {
-    font: &'a FontVec,
+    face: Face<'a>,
     text: String,
     colour: Rgba,
 }
 
-/// The runs split by font: text in `sans`, code in `mono` where it has the
-/// glyph and in `sans` where only that does. `None` when a character is in
-/// neither.
+/// Characters that change the emoji before them. Drawing them one by one
+/// would be wrong, so a heading with any of them stays text: the zero-width
+/// joiner, the keycap mark, skin tones, flag letters and tag characters.
+fn needs_shaping(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200D}'
+            | '\u{20E3}'
+            | '\u{1F3FB}'..='\u{1F3FF}'
+            | '\u{1F1E6}'..='\u{1F1FF}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// The runs split by face: text in `sans`, code in `mono` where it has the
+/// glyph and in `sans` where only that does, and emoji in `emoji`. Variation
+/// selectors are dropped. `None` when a character is in none of them.
 fn pieces<'a>(
     runs: &[Run],
     sans: &'a FontVec,
     mono: &'a FontVec,
+    emoji: Option<&'a Emoji>,
     (text, code): (Rgba, Rgba),
 ) -> Option<Vec<Piece<'a>>> {
     let has = |font: &FontVec, c: char| c.is_whitespace() || font.glyph_id(c).0 != 0;
@@ -104,15 +137,23 @@ fn pieces<'a>(
     for (s, is_code) in runs {
         let colour = if *is_code { code } else { text };
         for c in s.chars() {
-            let font = match (*is_code && has(mono, c), has(sans, c)) {
-                (true, _) => mono,
-                (false, true) => sans,
-                (false, false) => return None,
+            if matches!(c, '\u{FE0E}' | '\u{FE0F}') {
+                continue;
+            }
+            if needs_shaping(c) {
+                return None;
+            }
+            let face = if *is_code && has(mono, c) {
+                Face::Outline(mono)
+            } else if has(sans, c) {
+                Face::Outline(sans)
+            } else {
+                Face::Emoji(emoji.filter(|e| e.has(c))?)
             };
             match out.last_mut() {
-                Some(p) if std::ptr::eq(p.font, font) && p.colour == colour => p.text.push(c),
+                Some(p) if p.face.same(face) && p.colour == colour => p.text.push(c),
                 _ => out.push(Piece {
-                    font,
+                    face,
                     text: c.to_string(),
                     colour,
                 }),
@@ -136,7 +177,8 @@ fn fonts() -> Option<(&'static FontVec, &'static FontVec)> {
 pub fn name(level: u8, content: &[Inline], theme: Theme) -> Option<String> {
     let runs = runs(content);
     let (sans, mono) = fonts()?;
-    if runs.is_empty() || pieces(&runs, sans, mono, colours(level, theme)).is_none() {
+    let emoji = raster::emoji();
+    if runs.is_empty() || pieces(&runs, sans, mono, emoji, colours(level, theme)).is_none() {
         return None;
     }
     let (w, h) = cell();
@@ -183,6 +225,8 @@ fn colours(level: u8, theme: Theme) -> (Rgba, Rgba) {
 
 /// Where a heading's text goes in its image.
 struct Plan<'a> {
+    /// The text font, which emoji are centred against.
+    sans: &'a FontVec,
     pieces: Vec<Piece<'a>>,
     /// Font size in pixels.
     size: f32,
@@ -200,12 +244,13 @@ fn plan<'a>(
     cell: (u16, u16),
     theme: Theme,
 ) -> Result<Plan<'a>, String> {
-    let pieces = pieces(runs, sans, mono, colours(level, theme)).ok_or("missing glyph")?;
+    let emoji = raster::emoji();
+    let pieces = pieces(runs, sans, mono, emoji, colours(level, theme)).ok_or("missing glyph")?;
     let (cw, ch) = (u32::from(cell.0.max(1)), u32::from(cell.1.max(1)));
     let (rows, size) = SIZES[usize::from(level.clamp(1, 6)) - 1];
     let height = rows * ch;
     let mut size = size * ch as f32;
-    let (mut advance, mut ink) = measure(&pieces, size);
+    let (mut advance, mut ink) = measure(sans, &pieces, size);
     // Accented capitals rise above the font's ascent: make the type smaller
     // rather than cut them off.
     // The ink is rounded out to whole pixels, so one step may not be enough.
@@ -215,7 +260,7 @@ fn plan<'a>(
             break;
         }
         size *= (height as f32 - 1.0) / tall;
-        (advance, ink) = measure(&pieces, size);
+        (advance, ink) = measure(sans, &pieces, size);
     }
     // Centre the line in the rows, then move it to keep all the ink inside.
     // The ink was measured on a whole-pixel baseline, so keep it whole.
@@ -229,6 +274,7 @@ fn plan<'a>(
         return Err("too wide".into());
     }
     Ok(Plan {
+        sans,
         pieces,
         size,
         left,
@@ -240,16 +286,45 @@ fn plan<'a>(
 
 /// How far the pieces advance, and the pixels their ink covers on the
 /// baseline 0 from x 0: left, top, right, bottom.
-fn measure(pieces: &[Piece], size: f32) -> (f32, [f32; 4]) {
+fn measure(sans: &FontVec, pieces: &[Piece], size: f32) -> (f32, [f32; 4]) {
     let mut x = 0.0;
     let mut ink = [0.0f32; 4];
+    let mut add = |[l, t, r, b]: [f32; 4]| {
+        ink = [ink[0].min(l), ink[1].min(t), ink[2].max(r), ink[3].max(b)];
+    };
     for p in pieces {
-        if let Some([l, t, r, b]) = raster::ink(p.font, size, x, &p.text) {
-            ink = [ink[0].min(l), ink[1].min(t), ink[2].max(r), ink[3].max(b)];
+        match p.face {
+            Face::Outline(font) => {
+                if let Some(bounds) = raster::ink(font, size, x, &p.text) {
+                    add(bounds);
+                }
+                x += raster::measure(font, size, &p.text);
+            }
+            Face::Emoji(emoji) => {
+                for c in p.text.chars() {
+                    let [l, t, r, b] = emoji_box(sans, emoji, c, size, x);
+                    add([l.floor(), t.floor(), r.ceil(), b.ceil()]);
+                    x = r;
+                }
+            }
         }
-        x += raster::measure(p.font, size, &p.text);
     }
     (x, ink)
+}
+
+/// Where emoji `c` goes when drawn from `x` on the baseline 0, at its own
+/// shape and as tall as the type: left, top, right, bottom. It is centred on
+/// the capitals, as emoji sit in running text.
+fn emoji_box(sans: &FontVec, emoji: &Emoji, c: char, size: f32, x: f32) -> [f32; 4] {
+    let (w, h) = emoji
+        .bitmap(c, size)
+        .map_or((size, size), |(bitmap, ppem)| {
+            let scale = size / ppem;
+            (bitmap.width as f32 * scale, bitmap.height as f32 * scale)
+        });
+    let middle =
+        raster::ink(sans, size, 0.0, "H").map_or(-0.35 * size, |[_, t, _, b]| (t + b) / 2.0);
+    [x, middle - h / 2.0, x + w, middle + h / 2.0]
 }
 
 /// Draw `runs` on a clear background, a whole number of cells wide and tall.
@@ -258,7 +333,21 @@ fn draw(level: u8, runs: &[Run], cell: (u16, u16), theme: Theme) -> Result<Canva
     let mut canvas = Canvas::new(plan.width, plan.height);
     let mut x = plan.left;
     for p in &plan.pieces {
-        x = canvas.text(p.font, plan.size, x, plan.baseline, &p.text, p.colour);
+        match p.face {
+            Face::Outline(font) => {
+                x = canvas.text(font, plan.size, x, plan.baseline, &p.text, p.colour);
+            }
+            Face::Emoji(emoji) => {
+                for c in p.text.chars() {
+                    let [l, t, r, b] = emoji_box(plan.sans, emoji, c, plan.size, x);
+                    if let Some((bitmap, _)) = emoji.bitmap(c, plan.size) {
+                        let top = t + plan.baseline;
+                        canvas.image(&bitmap, l, top, r - l, b - t);
+                    }
+                    x = r;
+                }
+            }
+        }
     }
     Ok(canvas)
 }
@@ -351,7 +440,9 @@ mod tests {
             return;
         }
         for level in 1..=6 {
-            for text in ["Évolution", "Å jÄ fÉ", "j`ÉÅ`f"] {
+            let emoji = raster::emoji().is_some();
+            let texts = ["Évolution", "Å jÄ fÉ", "j`ÉÅ`f", "🏠 Home ✅"];
+            for text in texts.into_iter().filter(|t| emoji || !t.contains('🏠')) {
                 let (_, content) = heading(&format!("# {text}\n"));
                 let plan = plan(
                     fonts().unwrap(),
@@ -361,7 +452,7 @@ mod tests {
                     Theme::Dark,
                 )
                 .unwrap();
-                let (_, [l, t, r, b]) = measure(&plan.pieces, plan.size);
+                let (_, [l, t, r, b]) = measure(plan.sans, &plan.pieces, plan.size);
                 let case = format!("h{level} {text}");
                 assert!(l + plan.left >= 0.0, "{case}");
                 assert!(t + plan.baseline >= 0.0, "{case}");
@@ -378,8 +469,42 @@ mod tests {
         }
         let (level, content) = heading("# 日本\n");
         assert_eq!(name(level, &content, Theme::Dark), None);
+        // Emoji sequences that need shaping: a flag, a skin tone, a family.
+        for text in ["🇬🇧 Home", "👋🏽 Hi", "👨\u{200D}👩\u{200D}👧 Us"] {
+            let (level, content) = heading(&format!("# {text}\n"));
+            assert_eq!(name(level, &content, Theme::Dark), None, "{text}");
+        }
         let runs = vec![("word ".repeat(400), false)];
         assert!(draw(1, &runs, (10, 20), Theme::Dark).is_err());
+    }
+
+    #[test]
+    fn emoji_are_drawn_in_colour() {
+        if fonts().is_none() || raster::emoji().is_none() {
+            return;
+        }
+        let (level, content) = heading("# 🏠 Dashboard ❤️\n");
+        assert!(name(level, &content, Theme::Dark).is_some());
+        let plan = plan(
+            fonts().unwrap(),
+            level,
+            &runs(&content),
+            (10, 20),
+            Theme::Dark,
+        )
+        .unwrap();
+        // The variation selector is dropped, and the emoji are their own pieces.
+        let emoji: Vec<&str> = plan
+            .pieces
+            .iter()
+            .filter(|p| matches!(p.face, Face::Emoji(_)))
+            .map(|p| p.text.as_str())
+            .collect();
+        assert_eq!(emoji, ["🏠", "❤"]);
+        // The house has colours the heading text does not.
+        let canvas = drawn("# 🏠\n", (10, 20), Theme::Dark);
+        let text = colours(1, Theme::Dark).0;
+        assert!(canvas.pixels().any(|p| p[3] == 255 && p[..3] != text[..3]));
     }
 
     #[test]

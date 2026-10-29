@@ -76,18 +76,24 @@ impl Vault {
             Some((name, heading)) => (name, Some(heading)),
             None => (dest, None),
         };
-        // A block reference, `#^id`, has no heading to go to, and one after a
-        // heading, `Heading#^id`, goes to the heading.
+        // Decoded first, so `%5E` and `%23` count. A block reference, `#^id`,
+        // has no heading to go to, and one after a heading, `Heading#^id`,
+        // goes to the heading.
         let heading = heading
-            .map(|h| h.split_once("#^").map_or(h, |(head, _)| head))
-            .filter(|h| !h.is_empty() && !h.starts_with('^'))
             .map(|h| {
                 if link.wiki {
                     h.to_string()
                 } else {
                     percent_decode(h)
                 }
-            });
+            })
+            .map(|h| {
+                h.split_once("#^")
+                    .map_or(h.as_str(), |(head, _)| head)
+                    .trim()
+                    .to_string()
+            })
+            .filter(|h| !h.is_empty() && !h.starts_with('^'));
         if name.is_empty() {
             return match heading {
                 Some(h) => Target::Heading(h),
@@ -480,6 +486,37 @@ mod tests {
         assert_eq!(
             vault.follow(&wiki("#100%25"), &home),
             Target::Heading("100%25".into())
+        );
+    }
+
+    #[test]
+    fn block_references_and_spaces_are_found_after_decoding() {
+        let v = TempVault::new("decodeorder", &["HOME.md", "Plan.md"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let home = v.path("HOME.md");
+        let plan = v.path("Plan.md");
+        // An encoded `^` still makes a block reference.
+        assert_eq!(
+            vault.follow(&md("Plan.md#%5Eabc"), &home),
+            note(plan.clone(), None)
+        );
+        // An encoded `#^` after a heading is cut like a plain one.
+        assert_eq!(
+            vault.follow(&md("Plan.md#Goals%23%5Eabc"), &home),
+            note(plan.clone(), Some("Goals"))
+        );
+        assert_eq!(
+            vault.follow(&md("#Goals%23%5Eabc"), &home),
+            Target::Heading("Goals".into())
+        );
+        // Space before the block reference is not part of the heading.
+        assert_eq!(
+            vault.follow(&wiki("Plan#Goals #^abc"), &home),
+            note(plan.clone(), Some("Goals"))
+        );
+        assert_eq!(
+            vault.follow(&md("Plan.md#Goals%20#^abc"), &home),
+            note(plan, Some("Goals"))
         );
     }
 

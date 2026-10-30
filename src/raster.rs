@@ -97,6 +97,47 @@ fn load((path, index): Face) -> Option<FontVec> {
     FontVec::try_from_vec_and_index(data, index).ok()
 }
 
+/// Proportional fonts to look for, regular then bold, for mermaid labels and
+/// SVG text. They stand in for mermaid's own "trebuchet ms", verdana, arial.
+const SANS: &[(&str, &str)] = &[
+    (
+        "/System/Library/Fonts/Supplemental/Trebuchet MS.ttf",
+        "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
+    ),
+    (
+        "/System/Library/Fonts/Supplemental/Verdana.ttf",
+        "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ),
+];
+
+/// The first of the proportional fonts found: its regular file, and its
+/// bold one when that is there too.
+pub fn sans_files() -> Option<(&'static str, Option<&'static str>)> {
+    let is_file = |p: &str| std::path::Path::new(p).is_file();
+    let &(regular, bold) = SANS.iter().find(|(r, _)| is_file(r))?;
+    Some((regular, is_file(bold).then_some(bold)))
+}
+
+/// The first monospace font file found, holding the regular face.
+pub fn mono_file() -> Option<&'static str> {
+    FONTS
+        .iter()
+        .map(|&((path, _), _)| path)
+        .find(|p| std::path::Path::new(p).is_file())
+}
+
 /// Colour emoji fonts to look for, for emoji in headings.
 const EMOJI: &[Face] = &[
     ("/System/Library/Fonts/Apple Color Emoji.ttc", 0),

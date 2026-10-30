@@ -22,6 +22,7 @@ libc = "=0.2.191"
 # Draws mermaid diagrams. ELK layout is left out: it is EPL-2.0.
 merman = { version = "=0.9.2", default-features = false, features = ["all-diagrams", "png", "layout-cytoscape", "native-fonts"] }
 png = { version = "=0.17.16", default-features = false }
+resvg = { version = "=0.47.0", default-features = false, features = ["text", "raster-images"] }
 pulldown-cmark = { version = "=0.13.5", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }

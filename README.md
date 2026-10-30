@@ -9,7 +9,7 @@ A sexy markdown reader for the terminal that draws mermaid diagrams, maths and h
 - **Diagrams.** A ` ```mermaid ` code block is drawn as an image by [merman](https://github.com/Latias94/merman), built into smd, with no Node.js or browser. Diagrams are cached on disk, so a file opens fast the second time.
 - **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image in pure Rust, with no TeX install. Inline maths stays as text.
 - **Headings.** Headings are drawn as images in a real font, larger for higher levels, including colour emoji.
-- **Images.** A paragraph that holds only a local PNG, GIF (first frame) or JPEG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder.
+- **Images.** A paragraph that holds only a local PNG, GIF (first frame), JPEG or SVG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder.
 - **Code blocks.** Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours, on a panel a little lighter than the background (darker on a light one).
 - **Tables.** A table wider than the pane wraps its cells. A table with too many columns to wrap well is shown as one card per row, with a `Header: value` line for each cell.
 - **Links and notes.** Follow links with the keyboard or the mouse, with a back and forward toolbar. Links to other notes open in smd, and Obsidian wiki links work.
@@ -188,7 +188,7 @@ smd does not bundle fonts. It draws headings with fonts from the system: a bold 
 
 A heading with a character none of the fonts has, or an emoji that needs shaping (a flag, a skin tone, a joined family), is shown as text.
 
-Diagram labels use Trebuchet MS or Verdana on macOS, and DejaVu Sans or Liberation Sans on Linux. Text in a script these fonts lack, such as Chinese or Japanese, and emoji are drawn as boxes. With none of the fonts, smd guesses how wide labels are, and long ones may be cut short.
+Diagram labels and text in SVG images use Trebuchet MS or Verdana on macOS, and DejaVu Sans or Liberation Sans on Linux; monospace SVG text uses the monospace font above. Text in a script these fonts lack, such as Chinese or Japanese, and emoji are drawn as boxes. With none of the fonts, smd guesses how wide diagram labels are, and long ones may be cut short.
 
 ## Usage
 
@@ -284,6 +284,7 @@ A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `b
 - Links in headings drawn as images cannot be selected or clicked yet.
 - Only the first frame of a GIF is shown.
 - Only local images are shown; images from the web are not fetched.
+- SVGs are drawn by resvg, which covers most of SVG but not all of CSS. Text in an SVG is set in the diagram fonts (see [Fonts](#fonts)), whatever font it names.
 - Diagrams are drawn by merman, which follows mermaid closely but not exactly: a diagram may be laid out a little differently from mermaid's own, and a few that mermaid rejects are drawn. Set `mermaid = "mmdc"` to use mermaid-cli.
 - Diagram labels in Chinese, Japanese and other scripts outside the diagram font, and emoji in labels, are drawn as boxes.
 

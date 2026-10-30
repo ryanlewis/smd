@@ -77,6 +77,4 @@ homebrew_casks:
     commit_msg_template: "chore(brew): {{ .ProjectName }} {{ .Tag }}"
     # No de-quarantine hook: the binary is signed and notarized.
     caveats: |
-      Diagrams need mermaid-cli (`mmdc`) on your PATH:
-        npm install -g @mermaid-js/mermaid-cli
       Images, diagrams and maths need a terminal with kitty graphics, such as Ghostty.

@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::mermaid::Renderer;
 use crate::theme::Rgb;
 
 /// What the reader can do from the keyboard.
@@ -214,6 +215,8 @@ struct File {
     code_background: Option<String>,
     mouse: Option<bool>,
     #[serde(default)]
+    mermaid: Renderer,
+    #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
 
@@ -227,6 +230,8 @@ pub struct Config {
     pub code_background: Option<Rgb>,
     /// Whether smd takes the mouse, to follow clicked links and scroll.
     pub mouse: bool,
+    /// What draws mermaid diagrams.
+    pub mermaid: Renderer,
     keys: HashMap<Key, Action>,
 }
 
@@ -288,6 +293,7 @@ impl Config {
             web_links: file.web_links,
             code_background,
             mouse: file.mouse.unwrap_or(true),
+            mermaid: file.mermaid,
             keys,
         })
     }
@@ -344,6 +350,7 @@ mod tests {
     #[test]
     fn the_defaults_are_the_usual_keys() {
         let c = Config::default();
+        assert_eq!(c.mermaid, Renderer::Builtin);
         let none = KeyModifiers::NONE;
         assert_eq!(
             c.action(press(KeyCode::Char('j'), none)),
@@ -410,7 +417,7 @@ mod tests {
     #[test]
     fn naming_an_action_replaces_its_keys() {
         let c = Config::from_str(
-            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
+            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\nmermaid = \"mmdc\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
         )
         .unwrap();
         let none = KeyModifiers::NONE;
@@ -427,6 +434,7 @@ mod tests {
         assert_eq!(c.home, Some(PathBuf::from("/n/HOME.md")));
         assert_eq!(c.code_background, Some((0x20, 0x24, 0x2a)));
         assert!(!c.mouse);
+        assert_eq!(c.mermaid, Renderer::Mmdc);
     }
 
     #[test]
@@ -437,6 +445,7 @@ mod tests {
             ("[keys]\nfly = [\"x\"]\n", "fly"),
             ("colour = 1\n", "colour"),
             ("web_links = \"shout\"\n", "shout"),
+            ("mermaid = \"chrome\"\n", "chrome"),
             ("code_background = \"grey\"\n", "grey"),
             ("code_background = \"#12345\"\n", "#12345"),
         ] {

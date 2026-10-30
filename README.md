@@ -6,7 +6,7 @@ A sexy markdown reader for the terminal that draws mermaid diagrams, maths and h
 
 ## Features
 
-- **Diagrams.** A ` ```mermaid ` code block is drawn as an image by [mermaid-cli](https://github.com/mermaid-js/mermaid-cli) (`mmdc`). Diagrams are cached on disk, so a file opens fast the second time.
+- **Diagrams.** A ` ```mermaid ` code block is drawn as an image by [merman](https://github.com/Latias94/merman), built into smd, with no Node.js or browser. Diagrams are cached on disk, so a file opens fast the second time.
 - **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image in pure Rust, with no TeX install. Inline maths stays as text.
 - **Headings.** Headings are drawn as images in a real font, larger for higher levels, including colour emoji.
 - **Images.** A paragraph that holds only a local PNG, GIF (first frame) or JPEG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder.
@@ -171,13 +171,13 @@ cargo build --release --locked
 
 ### Optional: mermaid-cli
 
-Diagrams need `mmdc` on your `PATH`:
+smd draws diagrams itself. To have [mermaid-cli](https://github.com/mermaid-js/mermaid-cli) draw them instead, as a browser would, install it and set `mermaid = "mmdc"` in the config:
 
 ```sh
 npm install -g @mermaid-js/mermaid-cli
 ```
 
-Without it, each diagram is shown as its source, with a note saying `mmdc` was not found.
+With that set and `mmdc` not on your `PATH`, each diagram is shown as its source, with a note saying `mmdc` was not found.
 
 ### Fonts
 
@@ -187,6 +187,8 @@ smd does not bundle fonts. It draws headings with fonts from the system: a bold 
 - Linux: DejaVu Sans or Liberation Sans, DejaVu Sans Mono or Liberation Mono, and Noto Color Emoji, from your distribution's packages.
 
 A heading with a character none of the fonts has, or an emoji that needs shaping (a flag, a skin tone, a joined family), is shown as text.
+
+Diagram labels use Trebuchet MS or Verdana on macOS, and DejaVu Sans or Liberation Sans on Linux. Text in a script these fonts lack, such as Chinese or Japanese, and emoji are drawn as boxes. With none of the fonts, smd guesses how wide labels are, and long ones may be cut short.
 
 ## Usage
 
@@ -250,6 +252,10 @@ code_background = "#20242a"
 # wheel (the default). With false, links are hyperlinks the terminal opens.
 mouse = true
 
+# What draws mermaid diagrams: "builtin" (the default), or "mmdc" for
+# mermaid-cli, which starts a headless browser for each one.
+mermaid = "builtin"
+
 # Keys for each action. Naming an action replaces its default keys.
 [keys]
 next_link = ["tab", "n"]
@@ -278,7 +284,8 @@ A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `b
 - Links in headings drawn as images cannot be selected or clicked yet.
 - Only the first frame of a GIF is shown.
 - Only local images are shown; images from the web are not fetched.
-- Each mermaid diagram starts `mmdc`, which starts a browser, so the first open of a file with many diagrams is slow. Later opens use the cache.
+- Diagrams are drawn by merman, which follows mermaid closely but not exactly: a diagram may be laid out a little differently from mermaid's own, and a few that mermaid rejects are drawn. Set `mermaid = "mmdc"` to use mermaid-cli.
+- Diagram labels in Chinese, Japanese and other scripts outside the diagram font, and emoji in labels, are drawn as boxes.
 
 ## Licence
 

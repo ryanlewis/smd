@@ -4,6 +4,7 @@ This folder holds the notes shown in the README's recording and screenshots, and
 
 - `Weather station.md`: the main note, with emoji headings, a mermaid diagram, maths, a Rust code block, a table, an image and wiki links.
 - `Sensors.md` and `Calibration.md`: small notes it links to.
+- `Diagrams.md`: one diagram of each common mermaid type, for checking how smd draws them. It is not in the recording.
 - `mandelbrot.png`: the image in the main note, made with `ffmpeg -f lavfi -i "mandelbrot=size=480x240:start_scale=2.5:maxiter=200" -frames:v 1 mandelbrot.png`.
 - `features/`: one small note per feature for the README's screenshots. The README shows each note as a snippet, so keep the two the same. `features/links/` has its own `.obsidian` folder and two notes that link to each other.
 
@@ -36,7 +37,7 @@ docs/demo/record/to-gif.sh "$HOME/Desktop/Screen Recording 2026-10-29 at 21.40.0
 
 ## Recording automatically
 
-Asciinema and vhs cannot show kitty graphics, so `record.sh` records a real Ghostty window. You need macOS, `/Applications/Ghostty.app`, `ffmpeg`, `mmdc`, the Xcode command line tools (for `swiftc`) and a Retina display (the crop sizes assume 2x).
+Asciinema and vhs cannot show kitty graphics, so `record.sh` records a real Ghostty window. You need macOS, `/Applications/Ghostty.app`, `ffmpeg`, the Xcode command line tools (for `swiftc`) and a Retina display (the crop sizes assume 2x).
 
 ```sh
 cargo build --release

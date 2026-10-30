@@ -152,6 +152,14 @@ With Homebrew, on macOS (Apple silicon) or Linux (x86_64 or arm64):
 brew install ryanlewis/tap/smd
 ```
 
+Or with the install script, which downloads the latest release, checks it against the release's checksums and puts `smd` in `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ryanlewis/smd/main/install.sh | sh
+```
+
+Set `SMD_INSTALL_DIR` to install somewhere else, or `SMD_VERSION` to pick a release, such as `curl -fsSL ... | SMD_VERSION=0.2.0 sh`.
+
 Or download a binary from the [releases page](https://github.com/ryanlewis/smd/releases). The Linux builds need glibc 2.30 or later.
 
 With Cargo, you need Rust 1.99 or later:

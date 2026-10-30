@@ -1,5 +1,6 @@
-//! Mermaid diagrams, drawn to PNG by mermaid-cli (`mmdc`) and kept in a disk
-//! cache so a file opens fast the second time.
+//! Mermaid diagrams, drawn to PNG and kept in a disk cache so a file opens
+//! fast the second time. smd draws them itself with merman; mermaid-cli
+//! (`mmdc`), which starts a headless browser, can be chosen instead.
 //!
 //! Diagrams are drawn at a fixed scale, not the pane width, so the cache and
 //! the image key stay the same on resize; [`crate::images::fit`] shrinks them.
@@ -9,35 +10,75 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use merman::svg::export::{NativeFontOptions, RasterOptions};
+use merman::{
+    Engine, MermaidConfig, OperationControl, PngRequest, RenderOutput, RenderRequest,
+    SvgEnvironment, SvgRequest,
+};
+use serde::Deserialize;
 
 use crate::images::{Job, Png};
 use crate::theme::Theme;
 
 const PROGRAM: &str = "mmdc";
 
-/// Puppeteer's scale factor: two pixels per CSS pixel keeps text sharp.
-const SCALE: &str = "2";
+/// Two pixels per CSS pixel keeps text sharp.
+const SCALE: u8 = 2;
 
 /// Part of every cache name. Change it when the way diagrams are drawn
 /// changes, so old files are not used.
-const VERSION: &str = "1";
+const VERSION: &str = "2";
 
 /// Default size cap of the disk cache.
 const CACHE_CAP: u64 = 100 * 1024 * 1024;
 
-/// How long one diagram may take before `mmdc` is stopped.
+/// How long one diagram may take before it is given up on.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Each `mmdc` starts a browser, so only a few run at once.
+/// Diagrams drawn at once. Each `mmdc` starts a browser, and merman keeps a
+/// core busy.
 const MAX_RUNNING: usize = 4;
+
+/// What draws the diagrams.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Renderer {
+    /// merman, inside smd.
+    #[default]
+    Builtin,
+    /// mermaid-cli, found on `PATH`.
+    Mmdc,
+}
+
+impl Renderer {
+    fn name(self) -> &'static str {
+        match self {
+            Renderer::Builtin => "builtin",
+            Renderer::Mmdc => "mmdc",
+        }
+    }
+}
+
+static RENDERER: OnceLock<Renderer> = OnceLock::new();
+
+/// Set what draws diagrams for the rest of the run. Only the first call counts.
+pub fn set_renderer(renderer: Renderer) {
+    let _ = RENDERER.set(renderer);
+}
+
+fn renderer() -> Renderer {
+    RENDERER.get().copied().unwrap_or_default()
+}
 
 /// A name for the diagram drawn from `source` for `theme`, used both as the
 /// image key and as the cache file name.
 pub fn name(source: &str, theme: Theme) -> String {
     let mut hash = Fnv::new();
-    for part in [VERSION, theme.name(), SCALE, source] {
+    let scale = SCALE.to_string();
+    for part in [VERSION, renderer().name(), theme.name(), &scale, source] {
         hash.write(part.as_bytes());
         hash.write(&[0]);
     }
@@ -47,10 +88,19 @@ pub fn name(source: &str, theme: Theme) -> String {
 /// Draw `source` for `theme`, from the cache when it is there.
 pub fn job(source: String, theme: Theme) -> Job {
     let cache = cache_dir().map(|dir| dir.join(format!("{}.png", name(&source, theme))));
-    Box::new(move || draw(PROGRAM, &source, theme, cache.as_deref()))
+    Box::new(move || match renderer() {
+        Renderer::Builtin => draw("merman", || merman(&source, theme), cache.as_deref()),
+        Renderer::Mmdc => draw(PROGRAM, || mmdc(PROGRAM, &source, theme), cache.as_deref()),
+    })
 }
 
-fn draw(program: &str, source: &str, theme: Theme, cache: Option<&Path>) -> Result<Png, String> {
+/// Use the cached PNG, or make one with `render` and cache it. `by` names
+/// what drew it, for errors.
+fn draw(
+    by: &str,
+    render: impl FnOnce() -> Result<Vec<u8>, String>,
+    cache: Option<&Path>,
+) -> Result<Png, String> {
     if let Some(png) = cache.and_then(|path| Png::new(std::fs::read(path).ok()?).ok()) {
         // Reading is a use: keep the file ahead of eviction.
         if let Some(path) = cache {
@@ -60,9 +110,9 @@ fn draw(program: &str, source: &str, theme: Theme, cache: Option<&Path>) -> Resu
     }
     let data = {
         let _slot = Slot::take();
-        run(program, source, theme, TIMEOUT)?
+        render()?
     };
-    let png = Png::new(data.clone()).map_err(|e| format!("mermaid: mmdc gave {e}"))?;
+    let png = Png::new(data.clone()).map_err(|e| format!("mermaid: {by} gave {e}"))?;
     if let Some(path) = cache {
         // A diagram that cannot be cached is still shown.
         if store(path, &data).is_ok()
@@ -72,6 +122,88 @@ fn draw(program: &str, source: &str, theme: Theme, cache: Option<&Path>) -> Resu
         }
     }
     Ok(png)
+}
+
+/// Draw `source` with merman, in mermaid's own theme for `theme`, on a clear
+/// background.
+fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
+    let config = MermaidConfig::from_value(serde_json::json!({ "theme": mermaid_theme(theme) }));
+    let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
+    let request = PngRequest {
+        svg: SvgRequest {
+            environment: environment().clone(),
+            ..SvgRequest::default()
+        },
+        options: RasterOptions::default().with_scale(f32::from(SCALE)),
+    };
+    let control = OperationControl::new().with_deadline(TIMEOUT);
+    match renderer.render(RenderRequest::png(source, control, request)) {
+        Ok(RenderOutput::Png(Some(png))) => Ok(png.bytes),
+        Ok(_) => Err("mermaid: not a diagram merman knows".to_string()),
+        Err(e) => Err(format!("mermaid: {e}")),
+    }
+}
+
+/// Fonts to measure and draw text in, regular then bold, standing in for
+/// mermaid's own "trebuchet ms", verdana, arial. The first found is used.
+/// They are named rather than searched for: merman's search reads every
+/// font on the machine, and its platform lookup links CoreText, which the
+/// release's cross-build cannot.
+const FONTS: &[(&str, &str)] = &[
+    (
+        "/System/Library/Fonts/Supplemental/Trebuchet MS.ttf",
+        "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
+    ),
+    (
+        "/System/Library/Fonts/Supplemental/Verdana.ttf",
+        "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ),
+];
+
+/// How merman measures text: in the first of [`FONTS`] found, read once.
+/// With none, it estimates widths, and long labels may be cut short.
+fn environment() -> &'static SvgEnvironment {
+    static ENVIRONMENT: OnceLock<SvgEnvironment> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| {
+        let estimated = SvgEnvironment::deterministic();
+        let Some(&(regular, bold)) = FONTS.iter().find(|(r, _)| Path::new(r).is_file()) else {
+            return estimated;
+        };
+        let mut options = NativeFontOptions::default().with_font_file(regular);
+        if Path::new(bold).is_file() {
+            options = options.with_font_file(bold);
+        }
+        options
+            .load(&OperationControl::new())
+            .ok()
+            .and_then(|fonts| estimated.clone().with_native_font_context(fonts).ok())
+            .unwrap_or(estimated)
+    })
+}
+
+/// Mermaid's name for the theme that suits `theme`.
+fn mermaid_theme(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Dark => "dark",
+        Theme::Light => "default",
+    }
+}
+
+/// Draw `source` with `mmdc`, stopping it after [`TIMEOUT`].
+fn mmdc(program: &str, source: &str, theme: Theme) -> Result<Vec<u8>, String> {
+    run(program, source, theme, TIMEOUT)
 }
 
 /// Set the file's modified time to now, so it counts as recently used.
@@ -123,14 +255,18 @@ fn evict(dir: &Path, cap: u64) {
 /// Run `mmdc`, reading the diagram from stdin and the PNG from stdout. It is
 /// stopped, with the browser it started, after `timeout`.
 fn run(program: &str, source: &str, theme: Theme, timeout: Duration) -> Result<Vec<u8>, String> {
-    let mmdc_theme = match theme {
-        Theme::Dark => "dark",
-        Theme::Light => "default",
-    };
+    let scale = SCALE.to_string();
     let mut command = Command::new(program);
     command
         .args(["-i", "-", "-o", "-", "-e", "png", "-q"])
-        .args(["-t", mmdc_theme, "-b", "transparent", "-s", SCALE])
+        .args([
+            "-t",
+            mermaid_theme(theme),
+            "-b",
+            "transparent",
+            "-s",
+            &scale,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -289,6 +425,16 @@ mod tests {
     use super::*;
     use crate::images::tests::png;
 
+    /// Draw with `mmdc` as `program`, through the cache at `cache`.
+    fn draw_mmdc(
+        program: &str,
+        source: &str,
+        theme: Theme,
+        cache: Option<&Path>,
+    ) -> Result<Png, String> {
+        draw(PROGRAM, || mmdc(program, source, theme), cache)
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("smd-mermaid-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -329,6 +475,34 @@ mod tests {
     }
 
     #[test]
+    fn merman_draws_a_diagram_in_either_theme() {
+        let source = "flowchart LR\n  A[Start] --> B[Done]\n";
+        let light = merman(source, Theme::Light).unwrap();
+        let dark = merman(source, Theme::Dark).unwrap();
+        assert!(Png::new(light.clone()).is_ok());
+        // Wider than tall, as a left-to-right flowchart is.
+        let be = |at: usize| u32::from_be_bytes(light[at..at + 4].try_into().unwrap());
+        assert!(be(16) > be(20));
+        assert_ne!(light, dark);
+    }
+
+    #[test]
+    fn merman_says_what_is_wrong_with_a_diagram() {
+        let got = merman("sequenceDiagram\n  A->>: hi\n", Theme::Dark).unwrap_err();
+        assert!(
+            got.starts_with("mermaid: ") && got.contains("parse error"),
+            "{got}"
+        );
+        let cache = scratch("merman-bad").join("bad.png");
+        let got = draw(
+            "merman",
+            || merman("flowchart LR\n  A[a(b] --> B\n", Theme::Dark),
+            Some(&cache),
+        );
+        assert!(got.is_err() && !cache.exists(), "{got:?}");
+    }
+
+    #[test]
     fn cache_lives_in_the_platform_cache_directory() {
         let os = |s: &str| Some(OsString::from(s));
         assert_eq!(
@@ -355,7 +529,7 @@ mod tests {
         let dir = scratch("hit");
         let path = dir.join("d.png");
         std::fs::write(&path, png(30, 10)).unwrap();
-        let got = draw(
+        let got = draw_mmdc(
             "smd-no-such-program",
             "graph LR\n",
             Theme::Dark,
@@ -369,7 +543,7 @@ mod tests {
     fn missing_mmdc_is_an_error_and_nothing_is_cached() {
         let dir = scratch("missing");
         let path = dir.join("d.png");
-        let got = draw(
+        let got = draw_mmdc(
             "smd-no-such-program",
             "graph LR\n",
             Theme::Dark,
@@ -397,10 +571,10 @@ mod tests {
         let program = fake.to_str().unwrap();
         let source = "graph LR\n  A-->B\n";
         let path = dir.join("cache").join("d.png");
-        let got = draw(program, source, Theme::Light, Some(&path));
+        let got = draw_mmdc(program, source, Theme::Light, Some(&path));
         let cached = std::fs::read(&path).ok();
-        let bad = draw(program, "bad", Theme::Light, Some(&dir.join("bad.png")));
-        let not_png = draw(program, "text", Theme::Light, None);
+        let bad = draw_mmdc(program, "bad", Theme::Light, Some(&dir.join("bad.png")));
+        let not_png = draw_mmdc(program, "text", Theme::Light, None);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Png::new(png(12, 34)));
         assert_eq!(cached, Some(png(12, 34)));
@@ -531,7 +705,7 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        let got = draw("smd-no-such-program", "g", Theme::Dark, Some(&used));
+        let got = draw_mmdc("smd-no-such-program", "g", Theme::Dark, Some(&used));
         assert!(got.is_ok());
         evict(&dir, std::fs::metadata(&used).unwrap().len());
         let left = names(&dir);

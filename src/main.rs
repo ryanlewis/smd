@@ -203,6 +203,7 @@ fn smd(args: Args) -> Result<(), Failure> {
     let probe = (!args.no_graphics).then(kitty::probe);
     let look = Look::new(probe, config.code_background);
     apply(&look);
+    mermaid::set_renderer(config.mermaid);
     let images = images_for(look.cell);
 
     let mut terminal = opened(ratatui::try_init())?;

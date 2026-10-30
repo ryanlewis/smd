@@ -19,12 +19,12 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame, Terminal};
 
-use crate::config::{Action, Config, WebLinks};
+use crate::config::{Action, Config, Tasks, WebLinks};
 use crate::doc::{self, BlockKind, Document, Inline, Link};
 use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
-use crate::render::{Layout, LinkSpot, render};
+use crate::render::{Layout, render};
 use crate::theme;
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
@@ -49,11 +49,22 @@ pub struct View {
     scroll: usize,
     /// A message shown on the bottom row, such as the file being deleted.
     notice: Option<String>,
-    /// The selected link, as an index into the layout's links.
-    selected: Option<usize>,
+    /// The selected link or checkbox.
+    selected: Option<Stop>,
+    /// Whether checkboxes can be ticked: the config allows it and the file
+    /// can be written. When not, Tab, Enter and clicks pass over them.
+    tasks: bool,
     /// Other notes, with their image directories, whose images are kept so
     /// they show at once when the reader goes back to them.
     kept: Vec<(Rc<Document>, PathBuf)>,
+}
+
+/// Something Tab stops at: a link or a task's checkbox, by its index in the
+/// layout's links or tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    Link(usize),
+    Task(usize),
 }
 
 /// What an action asks of the browser around the view.
@@ -61,6 +72,11 @@ pub struct View {
 pub enum Go {
     Quit,
     Follow(Link),
+    /// Tick or untick the task whose mark is at this byte of the source.
+    Toggle {
+        mark: usize,
+        done: bool,
+    },
     Back,
     Forward,
 }
@@ -111,6 +127,7 @@ impl View {
             scroll: 0,
             notice: None,
             selected: None,
+            tasks: false,
             kept: Vec::new(),
         };
         view.want_images();
@@ -143,6 +160,10 @@ impl View {
     /// view in place, or the same line number when that block is gone. Images
     /// it no longer has are deleted on the next flush.
     pub fn reload(&mut self, doc: Document) {
+        // Such as the watcher seeing a checkbox this view already ticked.
+        if doc.source == self.doc.source {
+            return;
+        }
         let anchor = self.anchor();
         let old = std::mem::replace(&mut self.doc, Rc::new(doc));
         let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
@@ -170,7 +191,7 @@ impl View {
             }
         }
         self.scroll = self.scroll.min(self.max_scroll());
-        self.selected = self.selected.filter(|&i| i < self.layout.links.len());
+        self.selected = self.selected.filter(|&s| self.has(s));
     }
 
     /// What to keep at the top of the view. A view at the very top stays there.
@@ -246,7 +267,7 @@ impl View {
             self.layout = render(&self.doc, width, &self.images);
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
-            self.selected = self.selected.filter(|&i| i < self.layout.links.len());
+            self.selected = self.selected.filter(|&s| self.has(s));
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
@@ -290,11 +311,10 @@ impl View {
         let end = (self.scroll + area.height as usize).min(lines.len());
         let visible = Text::from(lines[self.scroll..end].to_vec());
         frame.render_widget(Paragraph::new(visible), area);
-        // The cells of a link that are in view.
+        // The cells of a link or checkbox that are in view.
         let scroll = self.scroll;
-        let cells = |spot: &LinkSpot| -> Vec<Rect> {
-            spot.cells
-                .iter()
+        let cells = |spot: &[(usize, std::ops::Range<u16>)]| -> Vec<Rect> {
+            spot.iter()
                 .filter(|(row, cols)| (scroll..end).contains(row) && cols.start < area.width)
                 .map(|(row, cols)| {
                     let y = area.y + (row - scroll) as u16;
@@ -304,14 +324,14 @@ impl View {
                 .collect()
         };
         let buf = frame.buffer_mut();
-        // The selected link is shown in reverse.
-        if let Some(spot) = self.selected.and_then(|i| self.layout.links.get(i)) {
-            for rect in cells(spot) {
+        // The selected link or checkbox is shown in reverse.
+        if let Some(stop) = self.selected {
+            for rect in cells(&self.cells(stop)) {
                 buf.set_style(rect, Style::new().add_modifier(Modifier::REVERSED));
             }
         }
         for (i, spot) in self.layout.links.iter().enumerate() {
-            let rects = cells(spot);
+            let rects = cells(&spot.cells);
             if rects.is_empty() {
                 continue;
             }
@@ -328,17 +348,58 @@ impl View {
         }
     }
 
-    /// The link drawn at column `x` of row `y` of the view, if any.
-    fn link_at(&self, x: u16, y: u16) -> Option<usize> {
+    /// The link or checkbox drawn at column `x` of row `y` of the view, if any.
+    fn stop_at(&self, x: u16, y: u16) -> Option<Stop> {
         if y >= self.height {
             return None;
         }
         let line = self.scroll + y as usize;
-        self.layout.links.iter().position(|spot| {
-            spot.cells
+        self.stops().into_iter().find(|&stop| {
+            self.cells(stop)
                 .iter()
                 .any(|(row, cols)| *row == line && cols.contains(&x))
         })
+    }
+
+    /// The links, and the checkboxes when they can be ticked, in the order
+    /// they are drawn.
+    fn stops(&self) -> Vec<Stop> {
+        let links = (0..self.layout.links.len()).map(Stop::Link);
+        let tasks = (0..self.layout.tasks.len()).map(Stop::Task);
+        let tasks = tasks.filter(|_| self.tasks);
+        let mut stops: Vec<Stop> = links.chain(tasks).collect();
+        stops.sort_by_key(|&s| self.cells(s).first().map(|(row, cols)| (*row, cols.start)));
+        stops
+    }
+
+    /// Whether `stop` is in the layout and can be selected.
+    fn has(&self, stop: Stop) -> bool {
+        match stop {
+            Stop::Link(i) => i < self.layout.links.len(),
+            Stop::Task(i) => self.tasks && i < self.layout.tasks.len(),
+        }
+    }
+
+    /// The cells `stop` is drawn on, line by line.
+    fn cells(&self, stop: Stop) -> Vec<(usize, std::ops::Range<u16>)> {
+        match stop {
+            Stop::Link(i) => self.layout.links[i].cells.clone(),
+            Stop::Task(i) => vec![self.layout.tasks[i].cell.clone()],
+        }
+    }
+
+    /// What choosing `stop` does: follow the link, or tick the checkbox.
+    fn choose(&self, stop: Stop) -> Go {
+        match stop {
+            Stop::Link(i) => Go::Follow(self.layout.links[i].link.clone()),
+            Stop::Task(i) => {
+                let task = &self.layout.tasks[i];
+                Go::Toggle {
+                    mark: task.mark,
+                    done: task.done,
+                }
+            }
+        }
     }
 
     /// Do what an action says. Returns what the browser must do, if anything.
@@ -357,10 +418,12 @@ impl View {
             Action::Bottom => self.scroll = self.max_scroll(),
             Action::NextLink => self.select_link(true),
             Action::PrevLink => self.select_link(false),
-            Action::Follow => {
-                let spot = self.selected.and_then(|i| self.layout.links.get(i))?;
-                return Some(Go::Follow(spot.link.clone()));
-            }
+            Action::Follow => return Some(self.choose(self.selected?)),
+            // Only a checkbox: a selected link stays where it is.
+            Action::Toggle => match self.selected? {
+                stop @ Stop::Task(_) => return Some(self.choose(stop)),
+                Stop::Link(_) => {}
+            },
             Action::Back => return Some(Go::Back),
             Action::Forward => return Some(Go::Forward),
         }
@@ -372,13 +435,21 @@ impl View {
         self.scroll..self.scroll + self.height as usize
     }
 
-    /// Select the next or previous link, going round at the ends. With no
-    /// link selected in view, start from the first or last one in view.
+    /// Select the next or previous link or checkbox, going round at the
+    /// ends. With none selected in view, start from the first or last one in
+    /// view.
     fn select_link(&mut self, forward: bool) {
-        let links = &self.layout.links;
-        let row = |i: usize| links[i].cells.first().map_or(0, |c| c.0);
+        let links = self.stops();
+        let rows: Vec<usize> = links
+            .iter()
+            .map(|&s| self.cells(s).first().map_or(0, |c| c.0))
+            .collect();
+        let row = |i: usize| rows[i];
         let view = self.in_view();
-        let selected = self.selected.filter(|&i| view.contains(&row(i)));
+        let at = self
+            .selected
+            .and_then(|s| links.iter().position(|&l| l == s));
+        let selected = at.filter(|&i| view.contains(&row(i)));
         let next = match (selected, forward) {
             (Some(i), true) => Some((i + 1) % links.len()),
             (Some(i), false) => Some((i + links.len() - 1) % links.len()),
@@ -393,7 +464,7 @@ impl View {
         let Some(next) = next else {
             return;
         };
-        self.selected = Some(next);
+        self.selected = Some(links[next]);
         // Bring it into view, a little way down the page when that moves it.
         let row = row(next);
         if !self.in_view().contains(&row) {
@@ -473,6 +544,44 @@ fn apply(view: &mut View, path: &Path, vault: &Vault, change: Change) {
     }
 }
 
+/// Whether the file at `path` can be written. Opening it to write changes
+/// nothing until something is written.
+fn writable(path: &Path) -> bool {
+    std::fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
+/// Write the task mark at byte `mark` of the file at `path` as ticked, or as
+/// unticked when it was `done`, and return the file's new text. Only that
+/// byte is written, in place, so the file keeps its other bytes, its
+/// permissions and its links. The file is read again first, and must still
+/// be `shown`, so a change made elsewhere since is not written over.
+fn toggle_task(path: &Path, shown: &str, mark: usize, done: bool) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let fail = |e: io::Error| format!("cannot tick the task: {e}: {}", path.display());
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(fail)?;
+    let mut source = String::new();
+    file.read_to_string(&mut source).map_err(fail)?;
+    if source != shown {
+        return Err("the file changed on disk; showing the new version first".into());
+    }
+    let was = source.as_bytes().get(mark).copied();
+    let now = match (was, done) {
+        (Some(b'x' | b'X'), true) => b' ',
+        (Some(b' '), false) => b'x',
+        _ => return Err("cannot tick the task: its checkbox is not where it was".into()),
+    };
+    file.seek(SeekFrom::Start(mark as u64)).map_err(fail)?;
+    file.write_all(&[now]).map_err(fail)?;
+    // One ASCII byte for another keeps the text valid UTF-8.
+    let mut bytes = source.into_bytes();
+    bytes[mark] = now;
+    Ok(String::from_utf8(bytes).expect("an ASCII byte for an ASCII byte"))
+}
+
 /// `source`, the note at `path`, parsed with its embedded images found.
 pub fn parse(vault: &Vault, source: &str, path: &Path) -> Document {
     // Without a reported background the theme is a guess, and the logo
@@ -499,7 +608,7 @@ struct Visited {
     path: PathBuf,
     doc: Rc<Document>,
     scroll: usize,
-    selected: Option<usize>,
+    selected: Option<Stop>,
 }
 
 /// The view and the note it shows, the way back, and what is needed to
@@ -530,7 +639,7 @@ pub struct Browser {
 
 impl Browser {
     pub fn new(view: View, path: PathBuf, watcher: Watcher, vault: Vault, config: Config) -> Self {
-        Browser {
+        let mut browser = Browser {
             view,
             path,
             watcher,
@@ -543,7 +652,9 @@ impl Browser {
             missed: None,
             clipboard: Box::new(io::stdout()),
             opener: open_with_system,
-        }
+        };
+        browser.check_tasks();
+        browser
     }
 
     /// Show a short message until the next key.
@@ -571,10 +682,9 @@ impl Browser {
                     }
                     return;
                 };
-                if let Some(i) = self.view.link_at(event.column, row) {
-                    self.view.selected = Some(i);
-                    let link = self.view.layout.links[i].link.clone();
-                    self.follow(&link);
+                if let Some(stop) = self.view.stop_at(event.column, row) {
+                    self.view.selected = Some(stop);
+                    self.go(self.view.choose(stop));
                 }
             }
             MouseEventKind::ScrollDown => self.view.scroll_by(WHEEL_LINES),
@@ -596,12 +706,45 @@ impl Browser {
         };
         match self.view.act(action) {
             Some(Go::Quit) => return true,
-            Some(Go::Follow(link)) => self.follow(&link),
-            Some(Go::Back) => self.back(),
-            Some(Go::Forward) => self.forward(),
+            Some(go) => self.go(go),
             None => {}
         }
         false
+    }
+
+    /// Do what the view asks, other than quit.
+    fn go(&mut self, go: Go) {
+        match go {
+            Go::Quit => {}
+            Go::Follow(link) => self.follow(&link),
+            Go::Toggle { mark, done } => self.toggle(mark, done),
+            Go::Back => self.back(),
+            Go::Forward => self.forward(),
+        }
+    }
+
+    /// Tick or untick a task in the file, and show the file as it now is,
+    /// with the same checkbox selected.
+    fn toggle(&mut self, mark: usize, done: bool) {
+        match toggle_task(&self.path, &self.view.doc.source, mark, done) {
+            Ok(source) => {
+                let selected = self.view.selected;
+                self.view.reload(parse(&self.vault, &source, &self.path));
+                self.view.selected = selected.filter(|&s| self.view.has(s));
+            }
+            Err(err) => self.say(err),
+        }
+    }
+
+    /// Let checkboxes be ticked when the config allows it and the note can
+    /// be written.
+    fn check_tasks(&mut self) {
+        self.view.tasks = self.config.tasks == Tasks::Toggle && writable(&self.path);
+        if let Some(Stop::Task(_)) = self.view.selected
+            && !self.view.tasks
+        {
+            self.view.selected = None;
+        }
     }
 
     /// Whether `key` is part of a terminal reply. A reply to a start-up
@@ -804,6 +947,7 @@ impl Browser {
         self.missed = None;
         self.watcher = watcher;
         self.path = path;
+        self.check_tasks();
         true
     }
 
@@ -938,6 +1082,8 @@ fn run_browser<W: Write>(
             last_check = input.now();
             if let Some(change) = browser.watcher.check() {
                 apply(&mut browser.view, &browser.path, &browser.vault, change);
+                // Its permissions may have changed too.
+                browser.check_tasks();
                 redraw = true;
             }
             let view = &mut browser.view;
@@ -1294,19 +1440,19 @@ mod tests {
         assert_eq!(v.act(Action::Follow), Some(Go::Follow("b.md".into())));
         // The next one is off the page, so the view moves to it.
         tab(&mut v);
-        assert_eq!(v.selected, Some(2));
+        assert_eq!(v.selected, Some(Stop::Link(2)));
         assert!(v.in_view().contains(&v.layout.links[2].cells[0].0));
         // Round to the first, and back again.
         tab(&mut v);
-        assert_eq!(v.selected, Some(0));
+        assert_eq!(v.selected, Some(Stop::Link(0)));
         v.act(Action::PrevLink);
-        assert_eq!(v.selected, Some(2));
+        assert_eq!(v.selected, Some(Stop::Link(2)));
         // Scrolled away from the selection, Tab starts from the view.
         v.act(Action::Top);
         v.act(Action::Down);
         v.act(Action::Down);
         tab(&mut v);
-        assert_eq!(v.selected, Some(2));
+        assert_eq!(v.selected, Some(Stop::Link(2)));
     }
 
     #[test]
@@ -1368,9 +1514,111 @@ mod tests {
         // The toolbar's Back and Forward buttons.
         b.mouse(click(2, 0));
         assert_eq!(b.path, dir.join("HOME.md"));
-        assert_eq!(b.view.selected, Some(0));
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
         b.mouse(click(BACK_BUTTON.width() as u16 + 2, 0));
         assert_eq!(b.path, dir.join("Plan.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tab_stops_at_checkboxes_and_enter_ticks_them_in_the_file() {
+        let note = "- [ ] buy [[Bread]]\n- [x] milk\n";
+        let (mut b, dir) = browser("tick", &[("HOME.md", note), ("Bread.md", "b\n")]);
+        let path = dir.join("HOME.md");
+        // In the order they are drawn: the box, its link, the next box.
+        let mut stops = Vec::new();
+        for _ in 0..3 {
+            enter(&mut b, KeyCode::Tab);
+            stops.push(b.view.selected.unwrap());
+        }
+        assert_eq!(stops, [Stop::Task(0), Stop::Link(0), Stop::Task(1)]);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "- [ ] buy [[Bread]]\n- [ ] milk\n"
+        );
+        // Shown at once, still selected, so it can be ticked again, with x.
+        assert_eq!(b.view.selected, Some(Stop::Task(1)));
+        assert!(!b.view.layout.tasks[1].done);
+        enter(&mut b, KeyCode::Char('x'));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), note);
+        // The watcher seeing the write changes nothing on screen.
+        b.view.reload(parse(note));
+        assert_eq!(b.view.selected, Some(Stop::Task(1)));
+        // x leaves a selected link alone.
+        enter(&mut b, KeyCode::BackTab);
+        enter(&mut b, KeyCode::Char('x'));
+        assert_eq!(b.path, path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_ticks_a_checkbox() {
+        let (mut b, dir) = browser("tick-click", &[("HOME.md", "- [ ] one\n")]);
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Not the text after the box. The note starts below the toolbar.
+        b.mouse(click(7));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("HOME.md")).unwrap(),
+            "- [ ] one\n"
+        );
+        b.mouse(click(3));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("HOME.md")).unwrap(),
+            "- [x] one\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkboxes_are_passed_over_when_they_cannot_be_ticked() {
+        let note = "- [ ] buy [[Bread]]\n";
+        // A file smd cannot write.
+        let (mut b, dir) = browser("tick-locked", &[("HOME.md", note), ("Bread.md", "b\n")]);
+        let path = dir.join("HOME.md");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        b.check_tasks();
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
+        // A file it can write, with the config saying not to.
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        b.config.tasks = Tasks::ReadOnly;
+        b.check_tasks();
+        b.view.selected = None;
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
+        b.config.tasks = Tasks::Toggle;
+        b.check_tasks();
+        b.view.selected = None;
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.selected, Some(Stop::Task(0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_task_is_not_ticked_over_a_change_made_elsewhere() {
+        let (mut b, dir) = browser("tick-changed", &[("HOME.md", "- [ ] one\n")]);
+        let path = dir.join("HOME.md");
+        std::fs::write(&path, "- [ ] one\n- [ ] two\n").unwrap();
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "- [ ] one\n- [ ] two\n"
+        );
+        assert!(b.view.notice.as_ref().unwrap().contains("changed on disk"));
+        // A mark that is no longer a checkbox is not written either.
+        let got = toggle_task(&path, "- [ ] one\n- [ ] two\n", 0, false);
+        assert!(got.unwrap_err().contains("not where it was"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1650,7 +1898,7 @@ mod tests {
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(b.path, dir.join("HOME.md"));
         assert_eq!(b.view.scroll, scroll);
-        assert_eq!(b.view.selected, Some(0));
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
         // A link to nothing says so until the next key.
         enter(&mut b, KeyCode::Tab);
         enter(&mut b, KeyCode::Enter);

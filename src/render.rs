@@ -26,6 +26,8 @@ pub struct Layout {
     pub blocks: Vec<BlockRows>,
     /// Every link drawn as text, in document order.
     pub links: Vec<LinkSpot>,
+    /// Every task's checkbox, in document order.
+    pub tasks: Vec<TaskSpot>,
 }
 
 /// A link and the cells its text takes, which may be on several lines.
@@ -34,6 +36,16 @@ pub struct LinkSpot {
     pub link: Link,
     /// The line and the columns on it, for each line the link is on.
     pub cells: Vec<(usize, Range<u16>)>,
+}
+
+/// A task's checkbox and the cells it takes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskSpot {
+    /// Where its mark is in the source: the byte between the brackets.
+    pub mark: usize,
+    pub done: bool,
+    /// The line and the columns of `[ ]` on it.
+    pub cell: (usize, Range<u16>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -391,14 +403,21 @@ fn list(
         }
         let mut marker = format!("{marker:>marker_width$}");
         let mut indent = marker_width;
+        let prefix = if i == 0 { first } else { rest };
         if let Some(done) = item.task {
             marker.push_str(if done { "[x] " } else { "[ ] " });
             indent += 4;
+            if let Some(mark) = item.mark {
+                // The item's first line is the next one out.
+                let at = (spans_width(prefix) + marker_width) as u16;
+                ctx.layout.tasks.push(TaskSpot {
+                    mark,
+                    done,
+                    cell: (ctx.layout.lines.len(), at..at + 3),
+                });
+            }
         }
-        let item_first = with(
-            if i == 0 { first } else { rest },
-            Span::styled(marker, Style::new().fg(Color::Blue)),
-        );
+        let item_first = with(prefix, Span::styled(marker, Style::new().fg(Color::Blue)));
         let item_rest = with(rest, Span::raw(" ".repeat(indent)));
         if item.blocks.is_empty() {
             emit(&item_first, Vec::new(), &mut ctx.layout.lines);
@@ -872,6 +891,43 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn each_checkbox_is_found_where_it_is_drawn() {
+        let md = "- [ ] one\n- [x] two\n  - [ ] nested\n\n> 9. [ ] quoted\n> 10. [x] ten\n";
+        let doc = parse(md);
+        let layout = render(&doc, 40, &no_images());
+        let text = |row: usize| -> String {
+            layout.lines[row]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let drawn: Vec<_> = layout
+            .tasks
+            .iter()
+            .map(|t| {
+                let (row, cols) = &t.cell;
+                let chars: String = text(*row)
+                    .chars()
+                    .skip(cols.start.into())
+                    .take(cols.len())
+                    .collect();
+                (chars, t.done, md.as_bytes()[t.mark])
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                ("[ ]".to_string(), false, b' '),
+                ("[x]".to_string(), true, b'x'),
+                ("[ ]".to_string(), false, b' '),
+                ("[ ]".to_string(), false, b' '),
+                ("[x]".to_string(), true, b'x'),
+            ]
+        );
     }
 
     #[test]

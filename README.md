@@ -206,8 +206,9 @@ With no file, smd opens the `home` note from the config. `smd --help` lists the 
 | Space, PgDn, PgUp, Ctrl-F, Ctrl-B | Scroll a page |
 | Ctrl-D, Ctrl-U | Scroll half a page |
 | `g`, `G`, Home, End | Go to the top or bottom |
-| Tab, Shift-Tab | Select the next or previous link |
-| Enter | Follow the selected link |
+| Tab, Shift-Tab | Select the next or previous link or checkbox |
+| Enter | Follow the selected link, or tick or untick the selected checkbox |
+| `x` | Tick or untick the selected checkbox |
 | Backspace, `H`, Alt-Left | Go back |
 | `L`, Alt-Right | Go forward |
 | `q`, Esc, Ctrl-C | Quit |
@@ -216,9 +217,15 @@ The keys can be changed in the [config](#config).
 
 ### Mouse
 
-Click a link to follow it, click the toolbar's Back and Forward buttons, and scroll with the wheel. While smd has the mouse, dragging does not select text; most terminals let you select with Option (macOS) or Shift held.
+Click a link to follow it, click a checkbox to tick or untick it, click the toolbar's Back and Forward buttons, and scroll with the wheel. While smd has the mouse, dragging does not select text; most terminals let you select with Option (macOS) or Shift held.
 
 With `mouse = false` in the config, smd leaves the mouse to the terminal and marks links as terminal hyperlinks (OSC 8) instead, so the terminal opens them: a web link in the browser, and a note in whatever app opens `.md` files.
+
+### Tasks
+
+A task list item, `- [ ] buy bread`, can be ticked from smd: select its checkbox with Tab and press Enter or `x`, or click it. smd changes the one character between the brackets in the file, in place, and leaves the rest of the file as it was. If the file changed on disk since smd last read it, nothing is written and smd shows the new version instead, so you can try again.
+
+Checkboxes in a file smd cannot write to are shown but passed over by Tab and clicks. Set `tasks = "read_only"` in the config to do the same everywhere.
 
 ### Links and Obsidian notes
 
@@ -252,6 +259,10 @@ code_background = "#20242a"
 # wheel (the default). With false, links are hyperlinks the terminal opens.
 mouse = true
 
+# Whether task checkboxes can be ticked: "toggle" (the default), or
+# "read_only" so smd never writes to your notes.
+tasks = "toggle"
+
 # What draws mermaid diagrams: "builtin" (the default), or "mmdc" for
 # mermaid-cli, which starts a headless browser for each one.
 mermaid = "builtin"
@@ -274,7 +285,8 @@ The actions and their default keys:
 | `page_down`, `page_up` | `space`, `pagedown`, `ctrl-f`; `pageup`, `ctrl-b` |
 | `top`, `bottom` | `g`, `home`; `G`, `end` |
 | `next_link`, `prev_link` | `tab`; `shift-tab` |
-| `follow` | `enter` |
+| `follow` | `enter` (also ticks a selected checkbox) |
+| `toggle` | `x` |
 | `back`, `forward` | `backspace`, `H`, `alt-left`; `L`, `alt-right` |
 
 A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. With `ctrl-`, the letters `a` to `z` ignore case, so `ctrl-o` and `ctrl-O` are the same key. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.

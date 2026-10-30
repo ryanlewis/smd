@@ -45,6 +45,7 @@ pub enum Action {
     NextLink,
     PrevLink,
     Follow,
+    Toggle,
     Back,
     Forward,
 }
@@ -65,6 +66,7 @@ impl Action {
             Action::NextLink => &["tab"],
             Action::PrevLink => &["shift-tab"],
             Action::Follow => &["enter"],
+            Action::Toggle => &["x"],
             Action::Back => &["backspace", "H", "alt-left"],
             Action::Forward => &["L", "alt-right"],
         }
@@ -79,7 +81,7 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 14] = [
+    const ALL: [Action; 15] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -92,6 +94,7 @@ impl Action {
         Action::NextLink,
         Action::PrevLink,
         Action::Follow,
+        Action::Toggle,
         Action::Back,
         Action::Forward,
     ];
@@ -108,6 +111,18 @@ pub enum WebLinks {
     Copy,
     /// Do nothing.
     Ignore,
+}
+
+/// Whether task checkboxes can be ticked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tasks {
+    /// Tab and Enter, or a click, tick and untick them in the file, when
+    /// smd can write to it.
+    #[default]
+    Toggle,
+    /// They are only shown.
+    ReadOnly,
 }
 
 /// The named keys, as the config spells them in lower case.
@@ -217,6 +232,8 @@ struct File {
     #[serde(default)]
     mermaid: Renderer,
     #[serde(default)]
+    tasks: Tasks,
+    #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
 
@@ -232,6 +249,8 @@ pub struct Config {
     pub mouse: bool,
     /// What draws mermaid diagrams.
     pub mermaid: Renderer,
+    /// Whether task checkboxes can be ticked.
+    pub tasks: Tasks,
     keys: HashMap<Key, Action>,
 }
 
@@ -294,6 +313,7 @@ impl Config {
             code_background,
             mouse: file.mouse.unwrap_or(true),
             mermaid: file.mermaid,
+            tasks: file.tasks,
             keys,
         })
     }
@@ -351,6 +371,7 @@ mod tests {
     fn the_defaults_are_the_usual_keys() {
         let c = Config::default();
         assert_eq!(c.mermaid, Renderer::Builtin);
+        assert_eq!(c.tasks, Tasks::Toggle);
         let none = KeyModifiers::NONE;
         assert_eq!(
             c.action(press(KeyCode::Char('j'), none)),
@@ -369,7 +390,7 @@ mod tests {
             Some(Action::PrevLink)
         );
         assert_eq!(c.action(press(KeyCode::Enter, none)), Some(Action::Follow));
-        assert_eq!(c.action(press(KeyCode::Char('x'), none)), None);
+        assert_eq!(c.action(press(KeyCode::Char('z'), none)), None);
         assert_eq!(c.web_links, WebLinks::Open);
         assert_eq!(c.home, None);
         assert_eq!(c.code_background, None);
@@ -417,7 +438,7 @@ mod tests {
     #[test]
     fn naming_an_action_replaces_its_keys() {
         let c = Config::from_str(
-            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\nmermaid = \"mmdc\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
+            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\nmermaid = \"mmdc\"\ntasks = \"read_only\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
         )
         .unwrap();
         let none = KeyModifiers::NONE;
@@ -435,6 +456,7 @@ mod tests {
         assert_eq!(c.code_background, Some((0x20, 0x24, 0x2a)));
         assert!(!c.mouse);
         assert_eq!(c.mermaid, Renderer::Mmdc);
+        assert_eq!(c.tasks, Tasks::ReadOnly);
     }
 
     #[test]
@@ -446,6 +468,7 @@ mod tests {
             ("colour = 1\n", "colour"),
             ("web_links = \"shout\"\n", "shout"),
             ("mermaid = \"chrome\"\n", "chrome"),
+            ("tasks = \"maybe\"\n", "maybe"),
             ("code_background = \"grey\"\n", "grey"),
             ("code_background = \"#12345\"\n", "#12345"),
         ] {

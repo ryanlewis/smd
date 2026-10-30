@@ -42,13 +42,15 @@ Keys:
   PgUp, ctrl-b            scroll a page up
   ctrl-d, ctrl-u          scroll half a page
   g, G, home, end         go to the top or bottom
-  tab, shift-tab          select the next or previous link
-  enter                   follow the selected link
+  tab, shift-tab          select the next or previous link or checkbox
+  enter                   follow the selected link, or tick the checkbox
+  x                       tick or untick the selected checkbox
   backspace, H, alt-left  go back
   L, alt-right            go forward
   q, esc, ctrl-c          quit
 
-Click a link to follow it, and the toolbar's buttons to go back and forward.
+Click a link to follow it, a checkbox to tick it, and the toolbar's buttons to
+go back and forward.
 The keys can be changed in the config file; see the README.";
 
 /// The file to open: the one given, else the home note from the config.

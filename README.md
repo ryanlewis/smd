@@ -6,8 +6,8 @@ A sexy markdown reader for the terminal that draws mermaid diagrams, maths and h
 
 ## Features
 
-- **Diagrams.** A ` ```mermaid ` code block is drawn as an image by [merman](https://github.com/Latias94/merman), built into smd, with no Node.js or browser. Diagrams are cached on disk, so a file opens fast the second time.
-- **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image in pure Rust, with no TeX install. Inline maths stays as text.
+- **Diagrams.** A ` ```mermaid ` code block is drawn as an image, by [merman](https://github.com/Latias94/merman).
+- **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image. Inline maths stays as text.
 - **Headings.** Headings are drawn as images in a real font, larger for higher levels, including colour emoji.
 - **Images.** A paragraph that holds only a local PNG, GIF (first frame), JPEG or SVG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder.
 - **Code blocks.** Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours, on a panel a little lighter than the background (darker on a light one).

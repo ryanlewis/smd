@@ -110,6 +110,18 @@ pub enum WebLinks {
     Ignore,
 }
 
+/// Whether task checkboxes can be ticked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tasks {
+    /// Tab and Enter, or a click, tick and untick them in the file, when
+    /// smd can write to it.
+    #[default]
+    Toggle,
+    /// They are only shown.
+    ReadOnly,
+}
+
 /// The named keys, as the config spells them in lower case.
 const NAMED_KEYS: &[(&str, KeyCode)] = &[
     ("enter", KeyCode::Enter),
@@ -217,6 +229,8 @@ struct File {
     #[serde(default)]
     mermaid: Renderer,
     #[serde(default)]
+    tasks: Tasks,
+    #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
 
@@ -232,6 +246,8 @@ pub struct Config {
     pub mouse: bool,
     /// What draws mermaid diagrams.
     pub mermaid: Renderer,
+    /// Whether task checkboxes can be ticked.
+    pub tasks: Tasks,
     keys: HashMap<Key, Action>,
 }
 
@@ -294,6 +310,7 @@ impl Config {
             code_background,
             mouse: file.mouse.unwrap_or(true),
             mermaid: file.mermaid,
+            tasks: file.tasks,
             keys,
         })
     }
@@ -351,6 +368,7 @@ mod tests {
     fn the_defaults_are_the_usual_keys() {
         let c = Config::default();
         assert_eq!(c.mermaid, Renderer::Builtin);
+        assert_eq!(c.tasks, Tasks::Toggle);
         let none = KeyModifiers::NONE;
         assert_eq!(
             c.action(press(KeyCode::Char('j'), none)),
@@ -417,7 +435,7 @@ mod tests {
     #[test]
     fn naming_an_action_replaces_its_keys() {
         let c = Config::from_str(
-            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\nmermaid = \"mmdc\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
+            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\nmermaid = \"mmdc\"\ntasks = \"read_only\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
         )
         .unwrap();
         let none = KeyModifiers::NONE;
@@ -435,6 +453,7 @@ mod tests {
         assert_eq!(c.code_background, Some((0x20, 0x24, 0x2a)));
         assert!(!c.mouse);
         assert_eq!(c.mermaid, Renderer::Mmdc);
+        assert_eq!(c.tasks, Tasks::ReadOnly);
     }
 
     #[test]
@@ -446,6 +465,7 @@ mod tests {
             ("colour = 1\n", "colour"),
             ("web_links = \"shout\"\n", "shout"),
             ("mermaid = \"chrome\"\n", "chrome"),
+            ("tasks = \"maybe\"\n", "maybe"),
             ("code_background = \"grey\"\n", "grey"),
             ("code_background = \"#12345\"\n", "#12345"),
         ] {

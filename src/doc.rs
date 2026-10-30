@@ -65,6 +65,9 @@ pub enum BlockKind {
 pub struct ListItem {
     /// `Some(done)` for a task list item.
     pub task: Option<bool>,
+    /// Where a task's mark is in the source: the byte between its brackets,
+    /// a space or an `x`.
+    pub mark: Option<usize>,
     pub blocks: Vec<Block>,
 }
 
@@ -276,6 +279,7 @@ enum FrameKind {
     },
     Item {
         task: Option<bool>,
+        mark: Option<usize>,
     },
     Paragraph,
     Heading(u8),
@@ -440,7 +444,7 @@ impl<'a> Builder<'a> {
             Event::SoftBreak => self.text(" ", self.style(), range),
             Event::HardBreak => self.inline(Inline::Break, range),
             Event::Rule => self.push_block(BlockKind::Rule, range),
-            Event::TaskListMarker(done) => self.mark_task(done),
+            Event::TaskListMarker(done) => self.mark_task(done, range),
         }
     }
 
@@ -506,7 +510,10 @@ impl<'a> Builder<'a> {
                 tight: true,
                 items: Vec::new(),
             },
-            Tag::Item => FrameKind::Item { task: None },
+            Tag::Item => FrameKind::Item {
+                task: None,
+                mark: None,
+            },
             _ => return None,
         })
     }
@@ -598,7 +605,7 @@ impl<'a> Builder<'a> {
                 self.top().blocks.extend(blocks);
                 return;
             }
-            FrameKind::Item { task } => {
+            FrameKind::Item { task, mark } => {
                 frame.flush_inlines();
                 if emptied(&frame) {
                     return;
@@ -606,6 +613,7 @@ impl<'a> Builder<'a> {
                 if let FrameKind::List { items, .. } = &mut self.top().kind {
                     items.push(ListItem {
                         task,
+                        mark,
                         blocks: frame.blocks,
                     });
                 }
@@ -647,17 +655,22 @@ impl<'a> Builder<'a> {
 
     /// Mark the open list item as a task. In a loose list the marker comes
     /// inside the item's paragraph, so the item is the frame below it.
-    fn mark_task(&mut self, done: bool) {
+    fn mark_task(&mut self, done: bool, range: Range<usize>) {
+        // The marker's range can take in the spaces around `[ ]`.
+        let at = self.source[range.clone()]
+            .find('[')
+            .map(|i| range.start + i + 1);
         let item = match self.top().kind {
             FrameKind::Item { .. } => self.stack.last_mut(),
             _ => self.under_top(),
         };
         if let Some(Frame {
-            kind: FrameKind::Item { task },
+            kind: FrameKind::Item { task, mark },
             ..
         }) = item
         {
             *task = Some(done);
+            *mark = at;
         }
     }
 
@@ -900,6 +913,31 @@ mod tests {
             &items[1].blocks[1].kind,
             BlockKind::List { items, .. } if items.len() == 1
         ));
+    }
+
+    #[test]
+    fn task_marks_point_at_the_byte_between_the_brackets() {
+        let source = "- [ ] one\n- [x] two\n> - [X] quoted\n\n1.  [ ]  loose\n\n2. [x] b\n";
+        let doc = parse(source);
+        let mut marks = Vec::new();
+        let collect = |blocks: &[Block], marks: &mut Vec<u8>| {
+            for b in blocks {
+                if let BlockKind::List { items, .. } = &b.kind {
+                    marks.extend(
+                        items
+                            .iter()
+                            .filter_map(|i| i.mark)
+                            .map(|m| source.as_bytes()[m]),
+                    );
+                }
+            }
+        };
+        collect(&doc.blocks, &mut marks);
+        if let BlockKind::Quote(inner) = &doc.blocks[1].kind {
+            collect(inner, &mut marks);
+        }
+        // The top-level lists first, then the one in the quote.
+        assert_eq!(marks, b" x xX");
     }
 
     #[test]
@@ -1220,7 +1258,7 @@ mod tests {
                 }
                 BlockKind::Quote(blocks) => outline_blocks(blocks, depth + 1, out),
                 BlockKind::List { items, .. } => {
-                    for ListItem { task, blocks } in items {
+                    for ListItem { task, blocks, .. } in items {
                         out.push_str(&format!("{pad}  item task={task:?}\n"));
                         outline_blocks(blocks, depth + 2, out);
                     }

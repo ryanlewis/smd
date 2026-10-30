@@ -36,6 +36,10 @@ const VERSION: &str = "2";
 /// Default size cap of the disk cache.
 const CACHE_CAP: u64 = 100 * 1024 * 1024;
 
+/// How old a temporary cache file must be before eviction deletes it. A write
+/// takes well under a second, so one this old was left by a crash.
+const STALE_TMP: Duration = Duration::from_secs(60 * 60);
+
 /// How long one diagram may take before it is given up on.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -199,21 +203,33 @@ fn cache_cap() -> u64 {
 }
 
 /// Delete the least recently used `.png` files in `dir` until the rest fit in
-/// `cap` bytes. Temporary files are another write in progress and are left
-/// alone. The jobs run off the UI thread, so this does too.
+/// `cap` bytes. A temporary file is another write in progress and is left
+/// alone, unless it is older than [`STALE_TMP`], when it was left by a write
+/// that never finished. The jobs run off the UI thread, so this does too.
 fn evict(dir: &Path, cap: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let now = std::time::SystemTime::now();
     let mut files: Vec<_> = entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.extension()? != "png" {
-                return None;
-            }
             let meta = entry.metadata().ok()?;
-            Some((meta.modified().ok()?, path, meta.len()))
+            let modified = meta.modified().ok()?;
+            match path.extension()?.to_str()? {
+                "png" => Some((modified, path, meta.len())),
+                "tmp" => {
+                    if now
+                        .duration_since(modified)
+                        .is_ok_and(|age| age > STALE_TMP)
+                    {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    None
+                }
+                _ => None,
+            }
         })
         .collect();
     let mut total: u64 = files.iter().map(|f| f.2).sum();
@@ -659,9 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn eviction_leaves_temporary_files_alone() {
+    fn eviction_leaves_new_temporary_files_and_deletes_stale_ones() {
         let dir = scratch("evict-tmp");
         aged(&dir, "a.png.1.0.tmp", 100, 500);
+        aged(&dir, "c.png.1.1.tmp", 100, STALE_TMP.as_secs() + 60);
         aged(&dir, "b.png", 10, 100);
         evict(&dir, 0);
         assert_eq!(names(&dir), ["a.png.1.0.tmp"]);

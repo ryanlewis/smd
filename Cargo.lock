@@ -1984,6 +1984,7 @@ dependencies = [
  "png 0.17.16",
  "pulldown-cmark",
  "ratatui",
+ "resvg",
  "serde",
  "serde_json",
  "syntect",

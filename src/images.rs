@@ -20,7 +20,9 @@ use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use resvg::usvg::fontdb::Database;
 
 use crate::doc::{Block, BlockKind, FigureKind};
 use crate::theme;
@@ -484,11 +486,17 @@ fn percent_decode(src: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// A PNG, GIF or JPEG file, told apart by its first bytes. A GIF shows its
-/// first frame.
+/// A PNG, GIF or JPEG file, told apart by its first bytes, or an SVG, told
+/// by its name. A GIF shows its first frame.
 fn load(path: &Path) -> Result<Png, String> {
     let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if data.starts_with(b"GIF8") {
+    let named = |ext: &str| {
+        path.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+    };
+    if named("svg") || named("svgz") {
+        svg(&data, path.parent())
+    } else if data.starts_with(b"GIF8") {
         gif(&data)
     } else if data.starts_with(b"\xff\xd8\xff") {
         jpeg(&data)
@@ -528,6 +536,119 @@ fn gif(data: &[u8]) -> Result<Png, String> {
     }
     let data = raster::encode(width as u32, height as u32, png::ColorType::Rgba, &pixels)?;
     Png::new(data)
+}
+
+/// Pixels per SVG user unit (a CSS pixel), as on a high-density screen, as
+/// diagrams are drawn.
+const SVG_SCALE: f32 = 2.0;
+
+/// An SVG, drawn at [`SVG_SCALE`], or smaller to keep within
+/// [`GIF_MAX_PIXELS`]. Images it names are read from `dir`; text is set in
+/// the fonts mermaid labels use.
+fn svg(data: &[u8], dir: Option<&Path>) -> Result<Png, String> {
+    let options = resvg::usvg::Options {
+        resources_dir: dir.map(Path::to_path_buf),
+        fontdb: svg_fonts().clone(),
+        ..Default::default()
+    };
+    let fallbacks = std::str::from_utf8(data).ok().map(css_fallbacks);
+    let data = fallbacks.as_deref().map_or(data, str::as_bytes);
+    let tree = resvg::usvg::Tree::from_data(data, &options).map_err(|e| format!("SVG: {e}"))?;
+    let (w, h) = (tree.size().width(), tree.size().height());
+    let most = (GIF_MAX_PIXELS as f32 / (w * h)).sqrt();
+    let scale = SVG_SCALE.min(most);
+    // Rounded down, so a shrunk SVG stays within the limit.
+    let (width, height) = ((w * scale) as u32, (h * scale) as u32);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or("SVG has no size")?;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let pixels: Vec<u8> = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    Png::new(raster::encode(
+        width,
+        height,
+        png::ColorType::Rgba,
+        &pixels,
+    )?)
+}
+
+/// `text` with each CSS `var(--name, fallback)` replaced by its fallback.
+/// SVGs made for web pages colour themselves this way, and resvg does not
+/// read `var()`. One with no fallback is left alone.
+fn css_fallbacks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("var(") {
+        out.push_str(&rest[..at]);
+        let inner = &rest[at + 4..];
+        // The closing bracket, past any brackets inside, such as rgb(...).
+        let mut depth = 0;
+        let end = inner.char_indices().find_map(|(i, c)| match c {
+            '(' => {
+                depth += 1;
+                None
+            }
+            ')' if depth == 0 => Some(i),
+            ')' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        });
+        match end.and_then(|end| Some((end, inner[..end].split_once(',')?.1))) {
+            Some((end, fallback)) => {
+                out.push_str(&css_fallbacks(fallback.trim()));
+                rest = &inner[end + 1..];
+            }
+            None => {
+                out.push_str("var(");
+                rest = inner;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The fonts SVG text is set in: the proportional ones mermaid labels use,
+/// for every family but monospace, and the monospace one code uses. Read
+/// once. Named fonts an SVG asks for that are not here fall back to these.
+fn svg_fonts() -> &'static Arc<Database> {
+    static FONTS: OnceLock<Arc<Database>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut db = Database::new();
+        let family = |db: &Database| {
+            db.faces()
+                .last()
+                .and_then(|f| f.families.first())
+                .map(|(name, _)| name.clone())
+        };
+        if let Some((regular, bold)) = raster::sans_files() {
+            let _ = db.load_font_file(regular);
+            if let Some(sans) = family(&db) {
+                db.set_sans_serif_family(&sans);
+                db.set_serif_family(&sans);
+                db.set_cursive_family(&sans);
+                db.set_fantasy_family(&sans);
+            }
+            if let Some(bold) = bold {
+                let _ = db.load_font_file(bold);
+            }
+        }
+        if let Some(mono) = raster::mono_file() {
+            let _ = db.load_font_file(mono);
+            if let Some(mono) = family(&db) {
+                db.set_monospace_family(mono);
+            }
+        }
+        Arc::new(db)
+    })
 }
 
 /// A JPEG in the colours the decoder gives.
@@ -851,6 +972,88 @@ pub mod tests {
         assert!(load_bytes("a.txt", b"hello").is_err());
         assert!(load_bytes("cut.gif", b"GIF89a").is_err());
         assert!(load_bytes("cut.jpg", b"\xff\xd8\xff\xe0").is_err());
+        assert!(load_bytes("cut.svg", b"<svg").is_err());
+    }
+
+    /// An SVG `width` by `height` holding `body`.
+    fn svg_bytes(width: u32, height: u32, body: &str) -> Vec<u8> {
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' \
+             width='{width}' height='{height}'>{body}</svg>"
+        )
+        .into_bytes()
+    }
+
+    /// Every pixel of an RGBA PNG.
+    fn pixels_rgba(png: &Png) -> Vec<[u8; 4]> {
+        let mut reader = png::Decoder::new(&png.data[..]).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        reader.next_frame(&mut buf).unwrap();
+        buf.as_chunks::<4>().0.to_vec()
+    }
+
+    #[test]
+    fn an_svg_is_drawn_at_twice_its_size() {
+        let red = svg_bytes(5, 3, "<rect width='5' height='3' fill='red'/>");
+        let png = load_bytes("red.svg", &red).unwrap();
+        assert_eq!((png.width, png.height), (10, 6));
+        assert!(pixels_rgba(&png).iter().all(|&p| p == [255, 0, 0, 255]));
+        // Told by its name, in any case; what it does not cover stays clear.
+        let empty = load_bytes("EMPTY.SVG", &svg_bytes(4, 4, "")).unwrap();
+        assert!(pixels_rgba(&empty).iter().all(|p| p[3] == 0));
+    }
+
+    #[test]
+    fn css_variables_give_way_to_their_fallbacks() {
+        assert_eq!(
+            css_fallbacks("fill=\"var(--ink, #1c1b18)\""),
+            "fill=\"#1c1b18\""
+        );
+        assert_eq!(
+            css_fallbacks("var(--a, var(--b, rgb(1, 2, 3))) var(--c)"),
+            "rgb(1, 2, 3) var(--c)"
+        );
+        assert_eq!(css_fallbacks("no vars, var("), "no vars, var(");
+        let teal = "<rect width='2' height='2' fill='var(--accent, #0b6e6e)'/>";
+        let png = load_bytes("vars.svg", &svg_bytes(2, 2, teal)).unwrap();
+        assert_eq!(pixels_rgba(&png)[0], [0x0b, 0x6e, 0x6e, 255]);
+    }
+
+    #[test]
+    fn a_huge_svg_is_drawn_smaller() {
+        let png = load_bytes("huge.svg", &svg_bytes(40_000, 20_000, "")).unwrap();
+        let pixels = u64::from(png.width) * u64::from(png.height);
+        assert!(
+            pixels <= GIF_MAX_PIXELS as u64,
+            "{} x {}",
+            png.width,
+            png.height
+        );
+        assert_eq!(png.width, png.height * 2);
+    }
+
+    #[test]
+    fn an_svg_reads_images_beside_it_and_sets_text() {
+        let dir = std::env::temp_dir().join(format!("smd-images-svg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("red.jpg"),
+            include_bytes!("../tests/fixtures/red-5x3.jpg"),
+        )
+        .unwrap();
+        let body = "<image xlink:href='red.jpg' width='5' height='3'/>";
+        std::fs::write(dir.join("a.svg"), svg_bytes(5, 3, body)).unwrap();
+        let text = "<text x='2' y='30' font-family='No Such Font' font-size='24'>Hi</text>";
+        std::fs::write(dir.join("t.svg"), svg_bytes(60, 40, text)).unwrap();
+        let image = load(&dir.join("a.svg"));
+        let text = load(&dir.join("t.svg"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let [r, g, b, a] = pixels_rgba(&image.unwrap())[0];
+        assert!(r > 150 && g < 80 && b < 80 && a == 255, "{r} {g} {b} {a}");
+        // Set in the fallback font, when the machine has one.
+        if raster::sans_files().is_some() {
+            assert!(pixels_rgba(&text.unwrap()).iter().any(|p| p[3] > 0));
+        }
     }
 
     #[test]

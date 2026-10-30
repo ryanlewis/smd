@@ -21,6 +21,7 @@ use merman::{
 use serde::Deserialize;
 
 use crate::images::{Job, Png};
+use crate::raster;
 use crate::theme::Theme;
 
 const PROGRAM: &str = "mmdc";
@@ -144,45 +145,20 @@ fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Fonts to measure and draw text in, regular then bold, standing in for
-/// mermaid's own "trebuchet ms", verdana, arial. The first found is used.
-/// They are named rather than searched for: merman's search reads every
-/// font on the machine, and its platform lookup links CoreText, which the
-/// release's cross-build cannot.
-const FONTS: &[(&str, &str)] = &[
-    (
-        "/System/Library/Fonts/Supplemental/Trebuchet MS.ttf",
-        "/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf",
-    ),
-    (
-        "/System/Library/Fonts/Supplemental/Verdana.ttf",
-        "/System/Library/Fonts/Supplemental/Verdana Bold.ttf",
-    ),
-    (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ),
-    (
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    ),
-    (
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ),
-];
-
-/// How merman measures text: in the first of [`FONTS`] found, read once.
-/// With none, it estimates widths, and long labels may be cut short.
+/// How merman measures text: in [`raster::sans_files`], read once. They are
+/// named rather than searched for: merman's search reads every font on the
+/// machine, and its platform lookup links CoreText, which the release's
+/// cross-build cannot. With none, it estimates widths, and long labels may be
+/// cut short.
 fn environment() -> &'static SvgEnvironment {
     static ENVIRONMENT: OnceLock<SvgEnvironment> = OnceLock::new();
     ENVIRONMENT.get_or_init(|| {
         let estimated = SvgEnvironment::deterministic();
-        let Some(&(regular, bold)) = FONTS.iter().find(|(r, _)| Path::new(r).is_file()) else {
+        let Some((regular, bold)) = raster::sans_files() else {
             return estimated;
         };
         let mut options = NativeFontOptions::default().with_font_file(regular);
-        if Path::new(bold).is_file() {
+        if let Some(bold) = bold {
             options = options.with_font_file(bold);
         }
         options

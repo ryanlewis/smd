@@ -45,6 +45,7 @@ pub enum Action {
     NextLink,
     PrevLink,
     Follow,
+    Toggle,
     Back,
     Forward,
 }
@@ -65,6 +66,7 @@ impl Action {
             Action::NextLink => &["tab"],
             Action::PrevLink => &["shift-tab"],
             Action::Follow => &["enter"],
+            Action::Toggle => &["x"],
             Action::Back => &["backspace", "H", "alt-left"],
             Action::Forward => &["L", "alt-right"],
         }
@@ -79,7 +81,7 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 14] = [
+    const ALL: [Action; 15] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -92,6 +94,7 @@ impl Action {
         Action::NextLink,
         Action::PrevLink,
         Action::Follow,
+        Action::Toggle,
         Action::Back,
         Action::Forward,
     ];
@@ -387,7 +390,7 @@ mod tests {
             Some(Action::PrevLink)
         );
         assert_eq!(c.action(press(KeyCode::Enter, none)), Some(Action::Follow));
-        assert_eq!(c.action(press(KeyCode::Char('x'), none)), None);
+        assert_eq!(c.action(press(KeyCode::Char('z'), none)), None);
         assert_eq!(c.web_links, WebLinks::Open);
         assert_eq!(c.home, None);
         assert_eq!(c.code_background, None);

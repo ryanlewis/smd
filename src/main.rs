@@ -44,6 +44,7 @@ Keys:
   g, G, home, end         go to the top or bottom
   tab, shift-tab          select the next or previous link or checkbox
   enter                   follow the selected link, or tick the checkbox
+  x                       tick or untick the selected checkbox
   backspace, H, alt-left  go back
   L, alt-right            go forward
   q, esc, ctrl-c          quit

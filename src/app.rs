@@ -419,6 +419,11 @@ impl View {
             Action::NextLink => self.select_link(true),
             Action::PrevLink => self.select_link(false),
             Action::Follow => return Some(self.choose(self.selected?)),
+            // Only a checkbox: a selected link stays where it is.
+            Action::Toggle => match self.selected? {
+                stop @ Stop::Task(_) => return Some(self.choose(stop)),
+                Stop::Link(_) => {}
+            },
             Action::Back => return Some(Go::Back),
             Action::Forward => return Some(Go::Forward),
         }
@@ -1532,14 +1537,18 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "- [ ] buy [[Bread]]\n- [ ] milk\n"
         );
-        // Shown at once, still selected, so Enter ticks it again.
+        // Shown at once, still selected, so it can be ticked again, with x.
         assert_eq!(b.view.selected, Some(Stop::Task(1)));
         assert!(!b.view.layout.tasks[1].done);
-        enter(&mut b, KeyCode::Enter);
+        enter(&mut b, KeyCode::Char('x'));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), note);
         // The watcher seeing the write changes nothing on screen.
         b.view.reload(parse(note));
         assert_eq!(b.view.selected, Some(Stop::Task(1)));
+        // x leaves a selected link alone.
+        enter(&mut b, KeyCode::BackTab);
+        enter(&mut b, KeyCode::Char('x'));
+        assert_eq!(b.path, path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

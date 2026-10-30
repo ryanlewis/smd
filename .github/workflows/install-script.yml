@@ -1,0 +1,35 @@
+name: install-script
+
+# install.sh installs the latest published release, so this checks the
+# script, not the Rust code. It runs only when the script changes.
+on:
+  pull_request:
+    paths: [install.sh, .github/workflows/install-script.yml]
+  push:
+    branches: [main]
+    paths: [install.sh, .github/workflows/install-script.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-script-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: shellcheck install.sh
+      - run: sh install.sh
+        env:
+          SMD_INSTALL_DIR: ${{ runner.temp }}/bin/
+      - run: '"$RUNNER_TEMP/bin/smd" --version'

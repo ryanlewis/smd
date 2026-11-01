@@ -374,10 +374,11 @@ impl View {
             Align::Centre => (area.width - width) / 2,
             Align::Left => 0,
         };
+        // The status row keeps the whole width.
+        let row = Rect::new(area.x, area.y + area.height, area.width, 1);
         let area = Rect::new(area.x + self.left, area.y, width, area.height);
         self.resize(area.width, area.height);
         if status {
-            let row = Rect::new(area.x, area.y + area.height, area.width, 1);
             self.draw_status(frame, row);
         }
         let lines = &self.layout.lines;
@@ -2021,7 +2022,8 @@ mod tests {
             assert_eq!((v.width, v.left), (20, left));
             assert!(v.layout.lines.iter().all(|l| l.width() <= 20));
             let buf = terminal.backend().buffer();
-            for y in 0..12 {
+            // Every row but the status row at the bottom.
+            for y in 0..11 {
                 let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
                 let (before, rest) = row.split_at(left as usize);
                 let (_, after) = rest.split_at(20);
@@ -2053,6 +2055,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal.draw(|f| b.draw(f)).unwrap();
         assert_eq!(b.view.left, 20);
+        // The status row keeps the whole width: the page sits at its right end.
+        let buf = terminal.backend().buffer();
+        let status: String = (0..60).map(|x| buf[(x, 5)].symbol().to_string()).collect();
+        assert!(status.trim_end().len() > 50, "{status:?}");
+        assert_eq!(buf[(0, 5)].style(), buf[(59, 5)].style());
         // A search match is marked where its text is drawn.
         for code in "/now".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
             enter(&mut b, code);

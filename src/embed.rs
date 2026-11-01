@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::doc::{self, Block, BlockKind, Document, Inline, Link};
+use crate::images;
 use crate::theme::Theme;
 use crate::vault::{self, Target, Vault};
 
@@ -15,35 +16,145 @@ pub const MAX_DEPTH: usize = 3;
 
 /// Swap each lone note embed in `doc`, the note at `path`, for the note.
 pub fn embed_notes(vault: &Vault, doc: &mut Document, path: &Path, theme: Option<Theme>) {
-    let mut seen = vec![same_file(path)];
-    embed_in(vault, &mut doc.blocks, &doc.source, path, theme, &mut seen);
+    let mut embedder = Embedder {
+        vault,
+        theme,
+        host: path,
+        seen: vec![same_file(path)],
+    };
+    embedder.embed_in(&mut doc.blocks, &doc.source, path);
 }
 
-/// `seen` holds the notes being embedded, the outermost first.
-fn embed_in(
-    vault: &Vault,
-    blocks: &mut [Block],
-    source: &str,
-    from: &Path,
+struct Embedder<'a> {
+    vault: &'a Vault,
     theme: Option<Theme>,
-    seen: &mut Vec<PathBuf>,
-) {
-    for block in blocks {
-        if let Some((title, link)) = lone_embed(block, source) {
-            if let Some(doc) = embedded(vault, &link, from, theme, seen) {
-                block.kind = BlockKind::Embed { title, link, doc };
-            }
-            continue;
-        }
-        match &mut block.kind {
-            BlockKind::Quote(inner) => embed_in(vault, inner, source, from, theme, seen),
-            BlockKind::List { items, .. } => {
-                for item in items {
-                    embed_in(vault, &mut item.blocks, source, from, theme, seen);
+    /// The note shown, as it was named.
+    host: &'a Path,
+    /// The notes being embedded, the note shown first.
+    seen: Vec<PathBuf>,
+}
+
+impl Embedder<'_> {
+    fn embed_in(&mut self, blocks: &mut [Block], source: &str, from: &Path) {
+        for block in blocks {
+            if let Some((title, link)) = lone_embed(block, source) {
+                if let Some(doc) = self.embedded(&link, from) {
+                    block.kind = BlockKind::Embed { title, link, doc };
                 }
+                continue;
             }
-            _ => {}
+            match &mut block.kind {
+                BlockKind::Quote(inner) => self.embed_in(inner, source, from),
+                BlockKind::List { items, .. } => {
+                    for item in items {
+                        self.embed_in(&mut item.blocks, source, from);
+                    }
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// The note, or its section, that `link` in the note at `from` embeds,
+    /// parsed, with its own embeds swapped in and its links and images made
+    /// to work from the note shown.
+    fn embedded(&mut self, link: &Link, from: &Path) -> Option<Document> {
+        if self.seen.len() > MAX_DEPTH {
+            return None;
+        }
+        let Target::Note { path, heading } = self.vault.follow(link, from) else {
+            return None;
+        };
+        let path = absolute(path);
+        let file = same_file(&path);
+        if self.seen.contains(&file) {
+            return None;
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        let mut doc = doc::parse_for(without_frontmatter(&text), self.theme);
+        if let Some(heading) = heading {
+            doc.blocks = section(std::mem::take(&mut doc.blocks), &heading)?;
+        }
+        self.seen.push(file);
+        self.embed_in(&mut doc.blocks, &doc.source, &path);
+        self.seen.pop();
+        self.rebase(&mut doc.blocks, &path);
+        Some(doc)
+    }
+
+    /// Point the links and images in blocks from the note at `from` at what
+    /// they lead to there, so they lead to the same place from the note
+    /// shown.
+    fn rebase(&self, blocks: &mut [Block], from: &Path) {
+        for block in blocks {
+            match &mut block.kind {
+                BlockKind::Paragraph(content) | BlockKind::Heading { content, .. } => {
+                    for inline in content {
+                        if let Inline::Text { style, .. } = inline
+                            && let Some(link) = &mut style.link
+                        {
+                            *link = self.rebased(link, from);
+                        }
+                    }
+                }
+                BlockKind::Image { src, wiki, .. } => {
+                    let found = if *wiki {
+                        self.vault.wiki(src, from)
+                    } else {
+                        is_relative(src).then(|| folder(from).join(&*src))
+                    };
+                    if let Some(path) = found {
+                        *src = absolute(path).to_string_lossy().into_owned();
+                        *wiki = false;
+                    }
+                }
+                BlockKind::Quote(inner) => self.rebase(inner, from),
+                BlockKind::List { items, .. } => {
+                    for item in items {
+                        self.rebase(&mut item.blocks, from);
+                    }
+                }
+                // Its own blocks were rebased on its own note.
+                BlockKind::Embed { link, .. } => *link = self.rebased(link, from),
+                _ => {}
+            }
+        }
+    }
+
+    /// `link` in the note at `from` as a path to the file it leads to, with
+    /// the heading, if any. A link back to the note shown leads into it, as
+    /// that note's own links do. A web address is kept, and so is a wiki
+    /// link that leads nowhere, which leads nowhere from any note in the
+    /// vault.
+    fn rebased(&self, link: &Link, from: &Path) -> Link {
+        let (path, heading) = match self.vault.follow(link, from) {
+            Target::Note { path, heading } => (path, heading),
+            Target::Heading(heading) => (from.to_path_buf(), Some(heading)),
+            Target::Other(path) => (path, None),
+            Target::Missing(name) if !link.wiki => (folder(from).join(name), None),
+            Target::Web(_) | Target::Missing(_) => return link.clone(),
+        };
+        // `follow` decodes these, and takes a `#` as the start of a heading.
+        let encode = |s: &str| s.replace('%', "%25");
+        let mut dest = if same_file(&path) == self.seen[0] {
+            match &heading {
+                Some(_) => String::new(),
+                None => self
+                    .host
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            }
+        } else {
+            absolute(path).to_string_lossy().into_owned()
+        };
+        dest = encode(&dest).replace('#', "%23");
+        if let Some(heading) = heading {
+            dest.push('#');
+            dest.push_str(&encode(&heading));
+        }
+        Link { dest, wiki: false }
     }
 }
 
@@ -71,40 +182,6 @@ fn lone_embed(block: &Block, source: &str) -> Option<(String, Link)> {
         title.push_str(text);
     }
     Some((title, link?.clone()))
-}
-
-/// The note, or its section, that `link` in the note at `from` embeds,
-/// parsed, with its own embeds swapped in and its links and images made to
-/// work from any note.
-fn embedded(
-    vault: &Vault,
-    link: &Link,
-    from: &Path,
-    theme: Option<Theme>,
-    seen: &mut Vec<PathBuf>,
-) -> Option<Document> {
-    if seen.len() > MAX_DEPTH {
-        return None;
-    }
-    let Target::Note { path, heading } = vault.follow(link, from) else {
-        return None;
-    };
-    let path = absolute(path);
-    let file = same_file(&path);
-    if seen.contains(&file) {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    let mut doc = doc::parse_for(without_frontmatter(&text), theme);
-    if let Some(heading) = heading {
-        doc.blocks = section(std::mem::take(&mut doc.blocks), &heading)?;
-    }
-    vault.resolve_embeds(&mut doc.blocks, &path);
-    seen.push(file);
-    embed_in(vault, &mut doc.blocks, &doc.source, &path, theme, seen);
-    seen.pop();
-    rebase(vault, &mut doc.blocks, &path);
-    Some(doc)
 }
 
 /// `source` without the `---` block of properties at its top, if it has
@@ -157,69 +234,8 @@ fn plain(content: &[Inline]) -> String {
         .collect()
 }
 
-/// Point the links and images in blocks from the note at `from` at what they
-/// lead to there, so they lead to the same place from the note embedding
-/// them.
-fn rebase(vault: &Vault, blocks: &mut [Block], from: &Path) {
-    for block in blocks {
-        match &mut block.kind {
-            BlockKind::Paragraph(content) | BlockKind::Heading { content, .. } => {
-                for inline in content {
-                    if let Inline::Text { style, .. } = inline
-                        && let Some(link) = &mut style.link
-                    {
-                        *link = rebased(vault, link, from);
-                    }
-                }
-            }
-            BlockKind::Image {
-                src, wiki: false, ..
-            } if is_relative(src) => {
-                *src = absolute(folder(from).join(&*src))
-                    .to_string_lossy()
-                    .into_owned();
-            }
-            BlockKind::Quote(inner) => rebase(vault, inner, from),
-            BlockKind::List { items, .. } => {
-                for item in items {
-                    rebase(vault, &mut item.blocks, from);
-                }
-            }
-            // Its own blocks were rebased on its own note.
-            BlockKind::Embed { link, .. } => *link = rebased(vault, link, from),
-            _ => {}
-        }
-    }
-}
-
-/// `link` in the note at `from` as a path to the file it leads to, with the
-/// heading, if any. A web address or a link that leads nowhere is kept.
-fn rebased(vault: &Vault, link: &Link, from: &Path) -> Link {
-    let to = |path: &Path, heading: Option<&str>| {
-        // `follow` decodes these, and takes a `#` as the start of a heading.
-        let mut dest = path
-            .to_string_lossy()
-            .replace('%', "%25")
-            .replace('#', "%23");
-        if let Some(heading) = heading {
-            dest.push('#');
-            dest.push_str(&heading.replace('%', "%25"));
-        }
-        Link { dest, wiki: false }
-    };
-    match vault.follow(link, from) {
-        Target::Note { path, heading } => to(&absolute(path), heading.as_deref()),
-        Target::Heading(heading) => to(from, Some(&heading)),
-        Target::Other(path) => to(&absolute(path), None),
-        Target::Web(_) | Target::Missing(_) => link.clone(),
-    }
-}
-
 fn is_relative(src: &str) -> bool {
-    !src.is_empty()
-        && !src.contains("://")
-        && !src.starts_with("data:")
-        && Path::new(src).is_relative()
+    images::is_local(src) && Path::new(src).is_relative()
 }
 
 fn folder(file: &Path) -> &Path {
@@ -459,6 +475,101 @@ mod tests {
             v.lines("a.md"),
             ["• ╭─ Bee", "  │ hi", "  ╰─", "", "│ ╭─ b", "│ │ hi", "│ ╰─"]
         );
+    }
+
+    /// `path` relative to the current folder, as when smd is started there.
+    fn relative(path: &Path) -> PathBuf {
+        let here = std::env::current_dir().unwrap();
+        let ups = here.components().count() - 1;
+        let mut out: PathBuf = std::iter::repeat_n("..", ups).collect();
+        out.push(path.strip_prefix("/").unwrap());
+        out
+    }
+
+    /// The link destinations in the first paragraph of the first embed.
+    fn embedded_dests(doc: &Document) -> Vec<String> {
+        let BlockKind::Embed { doc, .. } = &doc.blocks[0].kind else {
+            panic!("not embedded: {:?}", doc.blocks);
+        };
+        let BlockKind::Paragraph(content) = &doc.blocks[0].kind else {
+            panic!("no paragraph");
+        };
+        content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Text { style, .. } => style.link.as_ref().map(|l| l.dest.clone()),
+                Inline::Break => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_wiki_image_in_an_embed_is_found_from_a_vault_named_relatively() {
+        let v = TempVault::new(
+            "relimage",
+            &[
+                ("a.md", "![[sub/b]]"),
+                ("sub/b.md", "![[p.png]]"),
+                ("pics/p.png", ""),
+            ],
+        );
+        let path = relative(&v.0.join("a.md"));
+        let source = std::fs::read_to_string(&path).unwrap();
+        let mut doc = doc::parse(&source);
+        embed_notes(&Vault::for_file(&path), &mut doc, &path, None);
+        let BlockKind::Embed { doc, .. } = &doc.blocks[0].kind else {
+            panic!("not embedded");
+        };
+        let BlockKind::Image { src, .. } = &doc.blocks[0].kind else {
+            panic!("no image");
+        };
+        assert_eq!(
+            same_file(Path::new(src)),
+            same_file(&v.0.join("pics/p.png"))
+        );
+    }
+
+    #[test]
+    fn a_link_from_an_embed_back_to_the_note_shown_stays_in_it() {
+        let v = TempVault::new(
+            "back",
+            &[
+                ("a.md", "![[sub/b]]\n\n# Top"),
+                ("sub/b.md", "[[a#Top]] [[a]]"),
+            ],
+        );
+        let path = relative(&v.0.join("a.md"));
+        let source = std::fs::read_to_string(&path).unwrap();
+        let mut doc = doc::parse(&source);
+        let vault = Vault::for_file(&path);
+        embed_notes(&vault, &mut doc, &path, None);
+        let dests = embedded_dests(&doc);
+        assert_eq!(dests, ["#Top", "a.md"]);
+        let back = Link::from("a.md");
+        assert_eq!(
+            vault.follow(&back, &path),
+            Target::Note {
+                path: path.clone(),
+                heading: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_link_missing_from_an_embed_does_not_find_a_file_beside_the_note_shown() {
+        let v = TempVault::new(
+            "missing",
+            &[
+                ("a.md", "![[sub/b]]"),
+                ("sub/b.md", "[t](todo.md)"),
+                ("todo.md", ""),
+            ],
+        );
+        let doc = v.open("a.md");
+        let dests = embedded_dests(&doc);
+        let vault = Vault::for_file(&v.0.join("a.md"));
+        let got = vault.follow(&Link::from(dests[0].as_str()), &v.0.join("a.md"));
+        assert!(matches!(got, Target::Missing(_)), "{got:?}");
     }
 
     #[test]

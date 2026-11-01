@@ -458,7 +458,7 @@ fn candidates(src: &str) -> impl Iterator<Item = String> {
 }
 
 /// Images on the web are left as text.
-fn is_local(src: &str) -> bool {
+pub(crate) fn is_local(src: &str) -> bool {
     !src.is_empty() && !src.contains("://") && !src.starts_with("data:")
 }
 

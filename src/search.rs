@@ -38,7 +38,7 @@ impl Search {
     }
 
     /// Find the term again, as in a new layout. The matches may have moved
-    /// or changed in number, so none is current.
+    /// or changed in number, so none is current until the caller says which.
     pub fn refresh(&mut self, layout: &Layout, doc: &Document) {
         self.matches = find(&self.term, layout, doc);
         self.current = None;
@@ -130,9 +130,12 @@ pub fn find(term: &str, layout: &Layout, doc: &Document) -> Vec<Match> {
     let images: Vec<_> = layout.blocks.iter().filter(|b| b.image.is_some()).collect();
     let mut out = Vec::new();
     let mut image = images.iter().peekable();
+    let mut sized = layout.sized.iter().peekable();
     for (row, line) in layout.lines.iter().enumerate() {
-        // Image blocks are in document order, so their rows only go up.
+        // Image blocks and sized lines are in document order, so their rows
+        // only go up.
         while image.next_if(|b| b.rows.end <= row).is_some() {}
+        while sized.next_if(|l| l.row < row).is_some() {}
         if let Some(b) = image.peek()
             && b.rows.contains(&row)
         {
@@ -146,7 +149,7 @@ pub fn find(term: &str, layout: &Layout, doc: &Document) -> Vec<Match> {
             }
             continue;
         }
-        match layout.sized.iter().find(|l| l.row == row) {
+        match sized.peek().filter(|l| l.row == row) {
             Some(sized) => in_sized(sized, &wanted, ignore, &mut out),
             None => in_line(line, &wanted, ignore, row, &mut out),
         }

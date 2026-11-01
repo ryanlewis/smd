@@ -229,8 +229,10 @@ impl View {
     /// have changed.
     fn replace(&mut self, doc: Document) {
         let anchor = self.anchor();
+        let kept = self.current_match();
         let old = std::mem::replace(&mut self.doc, Rc::new(doc));
         let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
+        let kept = kept.and_then(|(a, nth)| Some((a.moved(&old.source, &self.doc.source)?, nth)));
         let flipped = std::mem::take(&mut self.flipped);
         let flipped = flipped.into_iter();
         self.flipped = flipped
@@ -238,7 +240,7 @@ impl View {
             .collect();
         self.selected = None;
         self.want_images();
-        self.relayout(anchor);
+        self.relayout_keeping(anchor, kept);
     }
 
     fn want_images(&mut self) {
@@ -252,13 +254,20 @@ impl View {
     }
 
     fn relayout(&mut self, anchor: Option<Anchor>) {
+        let kept = self.current_match();
+        self.relayout_keeping(anchor, kept);
+    }
+
+    /// `relayout`, with the match the reader is on given by `kept`, as
+    /// `current_match` gives it.
+    fn relayout_keeping(&mut self, anchor: Option<Anchor>, kept: Option<(Anchor, usize)>) {
         if self.width > 0 {
             self.highlighted = highlight::ready().is_some();
             self.layout = render_folds(&self.doc, self.width, &self.images, &self.flipped);
             if let Some(row) = anchor.and_then(|a| self.find(&a)) {
                 self.scroll = row;
             }
-            self.refresh_search();
+            self.refresh_search(kept);
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.selected = self.selected.filter(|&s| self.has(s));
@@ -270,28 +279,53 @@ impl View {
             return None;
         }
         let (index, offset) = self.layout.anchor(self.scroll)?;
+        Some(self.anchor_of(index, offset))
+    }
+
+    /// The anchor of the block at `index` in the layout, `offset` lines into it.
+    fn anchor_of(&self, index: usize, offset: isize) -> Anchor {
         let blocks = &self.layout.blocks;
         let start = blocks[index].span.start;
         let rank = blocks[..index]
             .iter()
             .filter(|b| b.span.start == start)
             .count();
-        Some(Anchor {
+        Anchor {
             start,
             rank,
             offset,
-        })
+        }
+    }
+
+    /// The block `anchor` names in the layout.
+    fn block(&self, anchor: &Anchor) -> Option<&crate::render::BlockRows> {
+        self.layout
+            .blocks
+            .iter()
+            .filter(|b| b.span.start == anchor.start)
+            .nth(anchor.rank)
+    }
+
+    /// The match the reader is on, as the innermost block it is in and how
+    /// many matches come before it in that block, so a new layout can find
+    /// it again even when the block's lines wrap differently.
+    fn current_match(&self) -> Option<(Anchor, usize)> {
+        let i = self.search.current?;
+        let row = self.search.matches.get(i)?.row;
+        let blocks = &self.layout.blocks;
+        let index = blocks.iter().rposition(|b| b.rows.contains(&row))?;
+        let start = blocks[index].rows.start;
+        let nth = self.search.matches[..i]
+            .iter()
+            .filter(|m| m.row >= start)
+            .count();
+        Some((self.anchor_of(index, 0), nth))
     }
 
     /// The top line that puts `anchor` back where it was: the same offset into
     /// its block. A block that got shorter keeps the view on its last line.
     fn find(&self, anchor: &Anchor) -> Option<usize> {
-        let b = self
-            .layout
-            .blocks
-            .iter()
-            .filter(|b| b.span.start == anchor.start)
-            .nth(anchor.rank)?;
+        let b = self.block(anchor)?;
         let last = b.rows.len().saturating_sub(1) as isize;
         Some(b.rows.start.saturating_add_signed(anchor.offset.min(last)))
     }
@@ -333,13 +367,14 @@ impl View {
     /// same part of it in view.
     fn resize(&mut self, width: u16, height: u16) {
         if width != self.width {
+            let kept = self.current_match();
             let old_len = self.layout.lines.len().max(1);
             self.highlighted = highlight::ready().is_some();
             self.layout = render_folds(&self.doc, width, &self.images, &self.flipped);
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
             self.selected = self.selected.filter(|&s| self.has(s));
-            self.refresh_search();
+            self.refresh_search(kept);
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
@@ -412,7 +447,11 @@ impl View {
         // reverse.
         if self.search.active() {
             let marked = Style::new().fg(Color::Black).bg(Color::Yellow);
-            for (i, m) in self.search.matches.iter().enumerate() {
+            // Matches are in row order, so only those in view are looked at.
+            let matches = &self.search.matches;
+            let first = matches.partition_point(|m| m.row < scroll);
+            let last = matches.partition_point(|m| m.row < end);
+            for (i, m) in matches.iter().enumerate().take(last).skip(first) {
                 let Some(cols) = &m.cols else {
                     continue;
                 };
@@ -592,8 +631,8 @@ impl View {
             Action::Back => return Some(Go::Back),
             Action::Forward => return Some(Go::Forward),
             Action::Search => self.start_search(),
-            Action::NextMatch => return Some(self.next_match(true)),
-            Action::PrevMatch => return Some(self.next_match(false)),
+            Action::NextMatch => return Some(self.next_match(true, times)),
+            Action::PrevMatch => return Some(self.next_match(false, times)),
             Action::Reload => return Some(Go::Reload),
             Action::Help => return Some(Go::Help),
         }
@@ -640,17 +679,29 @@ impl View {
             }
             _ => return None,
         }
-        self.refresh_search();
+        // A new term numbers its matches anew, so none is current.
+        self.refresh_search(None);
         None
     }
 
     /// Find the search term in the layout again, keeping the prompt's count
-    /// up to date while it is typed.
-    fn refresh_search(&mut self) {
+    /// up to date while it is typed. The match `kept` names, as
+    /// `current_match` gave it in the old layout, stays current when it is
+    /// still there.
+    fn refresh_search(&mut self, kept: Option<(Anchor, usize)>) {
         self.search.refresh(&self.layout, &self.doc);
         if self.search.typing {
             self.prompt = Some(self.search.prompt());
         }
+        let Some((anchor, nth)) = kept else {
+            return;
+        };
+        let Some(rows) = self.block(&anchor).map(|b| b.rows.clone()) else {
+            return;
+        };
+        let matches = &self.search.matches;
+        let i = matches.partition_point(|m| m.row < rows.start) + nth;
+        self.search.current = matches.get(i).filter(|m| rows.contains(&m.row)).map(|_| i);
     }
 
     /// Give up the search and stop marking its matches.
@@ -659,12 +710,21 @@ impl View {
         self.prompt = None;
     }
 
-    /// Go to the next or previous match of the search.
-    fn next_match(&mut self, forward: bool) -> Go {
+    /// Go `times` matches on or back in the search, going round at the
+    /// ends.
+    fn next_match(&mut self, forward: bool, times: usize) -> Go {
         if !self.search.active() {
             return Go::Say("no search: press / to search".into());
         }
-        let found = self.search.step(forward, self.in_view());
+        let found = self.search.step(forward, self.in_view()).map(|(i, round)| {
+            // The first step is from the view; the rest are from that match.
+            let (len, more) = (self.search.matches.len(), times.saturating_sub(1));
+            if forward {
+                ((i + more % len) % len, round || more >= len - i)
+            } else {
+                ((i + len - more % len) % len, round || more > i)
+            }
+        });
         self.go_to_match(found.map(|(i, round)| (i, round.then_some(forward))))
     }
 
@@ -1903,6 +1963,47 @@ mod tests {
         v
     }
 
+    /// Search `v` for `term` and go to match `i`.
+    fn on_match(v: &mut View, term: &str, i: usize) {
+        v.search.term = term.into();
+        v.refresh_search(None);
+        v.go_to_match(Some((i, None)));
+    }
+
+    #[test]
+    fn the_current_match_stays_when_images_arrive_or_the_width_changes() {
+        use crate::images::tests::png;
+        let dir = std::env::temp_dir().join(format!("smd-app-{}-kept", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
+        let md = "pin\n\n![a](a.png)\n\npin one pin two\n\npin\n";
+        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        v.resize(20, 5);
+        // The second "pin" in the paragraph after the image.
+        on_match(&mut v, "pin", 2);
+        let before = v.search.matches[2].clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !v.receive_images() {
+            assert!(Instant::now() < deadline, "image not ready");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // The image is five lines, not one, so the match moved down.
+        assert_eq!(v.search.current, Some(2));
+        assert_eq!(v.search.matches[2].row, before.row + 4);
+        assert_eq!(v.search.matches[2].cols, before.cols);
+        // Narrower, the paragraph wraps and the match starts its second line.
+        v.resize(10, 5);
+        assert_eq!(v.search.current, Some(2));
+        let now = &v.search.matches[2];
+        assert_eq!((now.row, now.cols.clone()), (before.row + 5, Some(0..3)));
+        // A match that is gone leaves none current.
+        on_match(&mut v, "two", 0);
+        v.reload(parse("pin\n"));
+        assert_eq!(v.search.current, None);
+    }
+
     fn paragraphs(n: usize) -> String {
         (0..n).map(|n| format!("line {n}\n\n")).collect()
     }
@@ -2772,13 +2873,43 @@ mod tests {
         enter(&mut b, KeyCode::Enter);
         enter(&mut b, KeyCode::Char('n'));
         assert_eq!(b.view.notice.as_deref(), Some("match 2/2"));
-        // A new layout numbers the matches anew, so none is current: "needle
-        // b" would be the third match now, not the second.
+        // A new layout keeps the reader on the same match, "needle b",
+        // though it is the third match now, not the second.
         b.view.fold(at);
-        assert_eq!(b.view.search.current, None);
+        assert_eq!(b.view.search.current, Some(2));
+        enter(&mut b, KeyCode::Char('/'));
+        assert_eq!(b.view.search.current, None, "a new search starts afresh");
+        enter(&mut b, KeyCode::Esc);
         // Another note starts with no search.
         b.follow(&wiki("Plan"));
         assert!(!b.view.search.active());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_number_before_n_or_n_steps_that_many_matches() {
+        // Five matches, all on the first row, so all in view.
+        let (mut b, dir) = browser("count-match", &[("a.md", "ab ab ab ab ab\n")]);
+        let notice = |b: &Browser| b.view.notice.clone().unwrap_or_default();
+        press_all(&mut b, "/ab");
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(notice(&b), "match 1/5");
+        let mut steps = Vec::new();
+        for keys in ["3n", "3n", "3N", "2N", "12n", "1n"] {
+            press_all(&mut b, keys);
+            steps.push(notice(&b));
+        }
+        assert_eq!(
+            steps,
+            [
+                "match 4/5",
+                "match 2/5, wrapped to the top",
+                "match 4/5, wrapped to the bottom",
+                "match 2/5",
+                "match 4/5, wrapped to the top",
+                "match 5/5",
+            ]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -23,6 +23,7 @@ use std::io::{self, IsTerminal, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
@@ -164,11 +165,11 @@ fn source(path: &Path, read: io::Result<String>) -> Result<String, Failure> {
     read.map_err(|err| Failure::new(format!("{}: {err}", path.display())))
 }
 
-/// Whether `fd` is a pipe or a file, as stdin is with `cmd | smd` or
+/// Whether a file of `kind` (see [`file_kind`]) is a pipe or a file, as stdin is with `cmd | smd` or
 /// `smd < a.md`. Not when it is /dev/null or closed, as when a launcher
 /// starts smd: the home note is opened then.
-fn is_piped(fd: libc::c_int) -> bool {
-    matches!(file_kind(fd), Some(libc::S_IFIFO | libc::S_IFREG))
+fn is_piped(kind: Option<libc::mode_t>) -> bool {
+    matches!(kind, Some(libc::S_IFIFO | libc::S_IFREG))
 }
 
 /// The kind of file `fd` is, as its `S_IFMT` bits, or none when it is closed.
@@ -181,16 +182,23 @@ fn file_kind(fd: libc::c_int) -> Option<libc::mode_t> {
     Some(st.st_mode & libc::S_IFMT)
 }
 
-/// Whether to say smd is reading stdin while it waits: only when `fd` is a
-/// pipe, which may be slow to fill, not a file, and stderr is a terminal.
-fn shows_stdin_hint(fd: libc::c_int, stderr_is_terminal: bool) -> bool {
-    stderr_is_terminal && file_kind(fd) == Some(libc::S_IFIFO)
+/// Whether to say smd is reading stdin while it waits: only when it is a
+/// pipe (`kind`, see [`file_kind`]), which may be slow to fill, not a file,
+/// and stderr is a terminal.
+fn shows_stdin_hint(kind: Option<libc::mode_t>, stderr_is_terminal: bool) -> bool {
+    stderr_is_terminal && kind == Some(libc::S_IFIFO)
 }
 
-/// Stdin's text. A hint shows on stderr while smd waits for a pipe, so a
-/// slow command does not look like a hang, and is cleared once it is read.
-fn read_stdin() -> io::Result<String> {
-    let hint = shows_stdin_hint(libc::STDIN_FILENO, io::stderr().is_terminal());
+/// How long a pipe may take to send its first bytes before the hint shows,
+/// so a fast command does not flash it.
+const STDIN_HINT_DELAY: Duration = Duration::from_millis(150);
+
+/// Stdin's text, stdin being a file of `kind`. A hint shows on stderr while
+/// smd waits for a slow pipe, so a slow command does not look like a hang,
+/// and is cleared once it is read.
+fn read_stdin(kind: Option<libc::mode_t>) -> io::Result<String> {
+    let hint = shows_stdin_hint(kind, io::stderr().is_terminal())
+        && !kitty::readable(libc::STDIN_FILENO, STDIN_HINT_DELAY).unwrap_or(false);
     if hint {
         // Set first, so a signal from here on clears whatever was printed.
         app::stdin_hint(true);
@@ -298,7 +306,8 @@ fn smd(args: Args) -> Result<(), Failure> {
     // once; after, they end the loop below, so the terminal is restored.
     app::stop_on_signals();
     let config = loaded(config::Config::load())?;
-    let picked = pick_source(args.file, config.home.clone(), is_piped(libc::STDIN_FILENO));
+    let stdin_kind = file_kind(libc::STDIN_FILENO);
+    let picked = pick_source(args.file, config.home.clone(), is_piped(stdin_kind));
     let picked = picked.unwrap_or_else(|message| {
         Args::command()
             .error(ErrorKind::MissingRequiredArgument, message)
@@ -311,7 +320,7 @@ fn smd(args: Args) -> Result<(), Failure> {
             (path, read)
         }
         // Keys are then read from the terminal itself, /dev/tty.
-        Source::Stdin => (PathBuf::from(STDIN_NAME), read_stdin()),
+        Source::Stdin => (PathBuf::from(STDIN_NAME), read_stdin(stdin_kind)),
     };
     let watcher = watch::Watcher::new(path.clone());
     let source = if from_stdin {
@@ -427,17 +436,17 @@ mod tests {
         let mut fds = [0; 2];
         // SAFETY: pipe writes two descriptors into fds.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        assert!(is_piped(fds[0]));
+        assert!(is_piped(file_kind(fds[0])));
         // SAFETY: both descriptors are ours and closed once.
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
         let file = std::fs::File::open("Cargo.toml").unwrap();
-        assert!(is_piped(file.as_raw_fd()));
+        assert!(is_piped(file_kind(file.as_raw_fd())));
         let null = std::fs::File::open("/dev/null").unwrap();
-        assert!(!is_piped(null.as_raw_fd()));
-        assert!(!is_piped(-1));
+        assert!(!is_piped(file_kind(null.as_raw_fd())));
+        assert!(!is_piped(file_kind(-1)));
     }
 
     #[test]
@@ -446,16 +455,16 @@ mod tests {
         let mut fds = [0; 2];
         // SAFETY: pipe writes two descriptors into fds.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        assert!(shows_stdin_hint(fds[0], true));
-        assert!(!shows_stdin_hint(fds[0], false));
+        assert!(shows_stdin_hint(file_kind(fds[0]), true));
+        assert!(!shows_stdin_hint(file_kind(fds[0]), false));
         // SAFETY: both descriptors are ours and closed once.
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
         let file = std::fs::File::open("Cargo.toml").unwrap();
-        assert!(!shows_stdin_hint(file.as_raw_fd(), true));
-        assert!(!shows_stdin_hint(-1, true));
+        assert!(!shows_stdin_hint(file_kind(file.as_raw_fd()), true));
+        assert!(!shows_stdin_hint(file_kind(-1), true));
     }
 
     #[test]

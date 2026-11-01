@@ -909,9 +909,12 @@ enum FrameKind {
     /// A definition's blocks, under its term.
     Definition,
     /// A `<details>` block, and its `<summary>` and `open` attribute.
+    /// `ended` once its `</details>` was read inside a list it holds,
+    /// which leaves it to close when that list does.
     Details {
         summary: Vec<Inline>,
         open: bool,
+        ended: bool,
     },
 }
 
@@ -1342,6 +1345,9 @@ impl<'a> Builder<'a> {
                     self.close();
                 }
                 self.close();
+                while matches!(self.top().kind, FrameKind::Details { ended: true, .. }) {
+                    self.close();
+                }
             }
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
@@ -1463,7 +1469,7 @@ impl<'a> Builder<'a> {
                 return;
             }
             FrameKind::Code { lang, code } => code_block(lang, code),
-            FrameKind::Details { summary, open } => {
+            FrameKind::Details { summary, open, .. } => {
                 frame.flush_inlines();
                 let end = frame.blocks.last().map_or(span.end, |b| b.span.end);
                 let summary = if summary.is_empty() {
@@ -1498,6 +1504,16 @@ impl<'a> Builder<'a> {
             },
         };
         self.push_block(kind, span);
+    }
+
+    /// The `<details>` just under the lists and items on top of the stack,
+    /// if there are any lists there.
+    fn details_around_list(&mut self) -> Option<&mut Frame> {
+        let i = (self.stack.iter())
+            .rposition(|f| !matches!(f.kind, FrameKind::List { .. } | FrameKind::Item { .. }))?;
+        let lists = i + 1 < self.stack.len();
+        let frame = &mut self.stack[i];
+        (lists && matches!(frame.kind, FrameKind::Details { ended: false, .. })).then_some(frame)
     }
 
     /// Close the innermost `open` like `what`.
@@ -1644,15 +1660,24 @@ impl<'a> Builder<'a> {
                     let kind = FrameKind::Details {
                         summary: Vec::new(),
                         open: tag.attr("open").is_some(),
+                        ended: false,
                     };
                     let from = at(&tag);
                     self.stack.push(Frame::new(kind, from..span.end));
                 }
                 ("details", true) => {
                     self.end_html_part(&mut part);
+                    let end = at(&tag) + tag.raw.len();
                     if matches!(self.top().kind, FrameKind::Details { .. }) {
-                        self.top().span.end = at(&tag) + tag.raw.len();
+                        self.top().span.end = end;
                         self.close();
+                    } else if let Some(frame) = self.details_around_list() {
+                        // An indented `</details>` after a list is read as
+                        // part of its last item.
+                        frame.span.end = end;
+                        if let FrameKind::Details { ended, .. } = &mut frame.kind {
+                            *ended = true;
+                        }
                     }
                 }
                 ("summary", false) if part.is_none() && in_details => {
@@ -1783,8 +1808,9 @@ impl<'a> Builder<'a> {
         top.other_inline = false;
         top.images.clear();
         top.display_math.clear();
-        // A highlight does not go on past the title.
+        // A highlight, or a tag left open, does not go on past the title.
         top.end_highlight();
+        top.open.clear();
         let inlines = std::mem::take(&mut top.inlines);
         self.take_title(inlines, marker);
         true
@@ -4071,6 +4097,36 @@ paragraph @66..72
         "body"
 paragraph @60..66
   "after"
+"#,
+        );
+    }
+
+    #[test]
+    fn details_end_after_a_list_that_holds_their_end_tag() {
+        assert_outline(
+            "<details>\n<summary>S</summary>\n\n- a\n\n  </details>\n\nafter\n",
+            r#"details open=false @0..51
+  summary
+    "S"
+  list None tight=false @32..51
+    item task=None
+      paragraph @34..36
+        "a"
+paragraph @51..57
+  "after"
+"#,
+        );
+    }
+
+    #[test]
+    fn a_tag_left_open_in_a_callout_title_ends_with_the_title() {
+        assert_outline(
+            "> [!note] <b>Heads up\n> body text\n",
+            r#"callout Note fold=None @0..34
+  title
+    "Heads up" strong
+  paragraph @22..34
+    "body text"
 "#,
         );
     }

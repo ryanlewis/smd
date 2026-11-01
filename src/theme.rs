@@ -86,7 +86,7 @@ fn panel((r, g, b): Rgb) -> Color {
     let shade = |c: u8| {
         let c = f64::from(c);
         let target = if light { 0.0 } else { 255.0 };
-        (c + (target - c) * PANEL_SHADE * 2.0).round() as u8
+        (c + (target - c) * PANEL_SHADE).round() as u8
     };
     Color::Rgb(shade(r), shade(g), shade(b))
 }

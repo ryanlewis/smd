@@ -653,6 +653,18 @@ fn inline_style(base: Style, style: &InlineStyle) -> Style {
     if style.math {
         s = s.fg(Color::Cyan);
     }
+    if style.tag {
+        s = s.fg(Color::Magenta);
+        if let Some(bg) = theme::code_panel() {
+            s = s.bg(bg);
+        }
+    }
+    if style.highlight {
+        s = match theme::highlight() {
+            Some(bg) => s.bg(bg),
+            None => s.add_modifier(Modifier::REVERSED),
+        };
+    }
     if style.link.is_some() {
         s = s.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
     }
@@ -1536,6 +1548,14 @@ mod tests {
     fn a_style_change_inside_a_word_does_not_break_it() {
         assert_eq!(plain("xx a**b**c\n", 4), vec!["xx", "abc"]);
         assert_eq!(styled_md("a**b**c\n", 4), vec!["[a|][b|BOLD][c|]"]);
+    }
+
+    #[test]
+    fn highlights_are_reversed_and_tags_coloured_with_no_background_known() {
+        assert_eq!(
+            styled_md("a ==b c== #d %%e%% f\n", 20),
+            vec!["[a |][b c|REVERSED][ |][#d|fg=Magenta][ f|]"]
+        );
     }
 
     #[test]

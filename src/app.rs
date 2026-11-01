@@ -459,18 +459,15 @@ impl View {
             let marked = Style::new().fg(Color::Black).bg(Color::Yellow);
             // Matches are in row order, so only those in view are looked at.
             let matches = &self.search.matches;
-            let first = matches.partition_point(|m| m.row < scroll);
+            let first = matches.partition_point(|m| m.rows().end <= scroll);
             let last = matches.partition_point(|m| m.row < end);
             for (i, m) in matches.iter().enumerate().take(last).skip(first) {
-                let Some(cols) = &m.cols else {
-                    continue;
-                };
                 let style = if self.search.current == Some(i) {
                     marked.add_modifier(Modifier::REVERSED)
                 } else {
                     marked
                 };
-                for rect in cells(&[(m.row, cols.clone())]) {
+                for rect in cells(&m.cells) {
                     buf.set_style(rect, style);
                 }
             }
@@ -745,8 +742,10 @@ impl View {
         let wrapped = found.and_then(|(_, w)| w);
         if let Some((i, _)) = found {
             self.search.current = Some(i);
-            let row = self.search.matches[i].row;
-            if !self.in_view().contains(&row) {
+            let rows = self.search.matches[i].rows();
+            let row = rows.start;
+            let view = self.in_view();
+            if !view.contains(&row) || !view.contains(&(rows.end - 1)) {
                 self.scroll = row
                     .saturating_sub(self.height as usize / 3)
                     .min(self.max_scroll());
@@ -2068,12 +2067,12 @@ mod tests {
         // The image is five lines, not one, so the match moved down.
         assert_eq!(v.search.current, Some(2));
         assert_eq!(v.search.matches[2].row, before.row + 4);
-        assert_eq!(v.search.matches[2].cols, before.cols);
+        assert_eq!(v.search.matches[2].cells[0].1, before.cells[0].1);
         // Narrower, the paragraph wraps and the match starts its second line.
         v.resize(10, 5);
         assert_eq!(v.search.current, Some(2));
         let now = &v.search.matches[2];
-        assert_eq!((now.row, now.cols.clone()), (before.row + 5, Some(0..3)));
+        assert_eq!(now.cells, [(before.row + 5, 0..3)]);
         // A match that is gone leaves none current.
         on_match(&mut v, "two", 0);
         v.reload(parse("pin\n"));
@@ -2088,6 +2087,49 @@ mod tests {
         on_match(&mut v, "pin", 2);
         v.reload(parse("pin pin one pin two\n\nthe end\n"));
         assert_eq!(v.search.current, Some(2));
+    }
+
+    #[test]
+    fn a_match_wrapped_over_two_lines_is_marked_on_both() {
+        // At 40 columns "nine" goes to the second line.
+        let md = format!(
+            "one two three four five six seven eight nine ten\n\n{}",
+            paragraphs(4)
+        );
+        let mut v = new_view(&md);
+        v.resize(40, 4);
+        on_match(&mut v, "eight nine", 0);
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal.draw(|f| v.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let marked = |y: u16| -> String {
+            (0..40)
+                .filter(|&x| buf[(x, y)].bg == Color::Yellow)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        assert_eq!((marked(0), marked(1)), ("eight".into(), "nine".into()));
+        assert!(buf[(0, 1)].modifier.contains(Modifier::REVERSED));
+        // Half of it in view is enough to mark it and to step from it.
+        v.scroll = 1;
+        terminal.draw(|f| v.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(0, 0)].bg, Color::Yellow);
+        assert_eq!(v.search.step(true, v.in_view()), Some((0, true)));
+    }
+
+    #[test]
+    fn going_to_a_wrapped_match_brings_both_its_lines_into_view() {
+        // "eight" is on row 4, the last in view, and "nine" on row 5.
+        let md = format!(
+            "a\n\nb\n\none two three four five six seven eight nine ten\n\n{}",
+            paragraphs(4)
+        );
+        let mut v = new_view(&md);
+        v.resize(40, 5);
+        on_match(&mut v, "eight nine", 0);
+        assert_eq!(v.search.matches[0].rows(), 4..6);
+        assert!(v.in_view().contains(&5), "scroll {}", v.scroll);
     }
 
     fn paragraphs(n: usize) -> String {

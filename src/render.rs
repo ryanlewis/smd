@@ -36,6 +36,20 @@ pub struct Layout {
     pub folds: Vec<FoldSpot>,
     /// Every line of a heading the terminal draws larger, in document order.
     pub sized: Vec<heading::SizedLine>,
+    /// Every line that carries on the text of the one before it, where the
+    /// text wrapped, in order.
+    pub joins: Vec<Join>,
+}
+
+/// A line whose text carries on from the last line with text above it,
+/// where wrapping broke the text in two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Join {
+    pub row: usize,
+    /// The column its text starts at, after any quote or list prefix.
+    pub col: u16,
+    /// Whether a space was dropped at the break, rather than a word broken.
+    pub space: bool,
 }
 
 /// A link and the cells its text takes, which may be on several lines.
@@ -271,7 +285,8 @@ fn contents(
     let out = &mut ctx.layout.lines;
     match &block.kind {
         BlockKind::Paragraph(content) => {
-            let links = wrap(content, Style::default(), width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            let links = wrap(content, Style::default(), width, first, rest, out, joins);
             ctx.layout.links.extend(links);
         }
         BlockKind::Heading { level, content } => {
@@ -280,7 +295,9 @@ fn contents(
             if scale > 1 {
                 sized_heading(content, *level, scale, width, first, rest, &mut ctx.layout);
             } else {
-                let links = wrap(content, heading_style(*level), width, first, rest, out);
+                let joins = &mut ctx.layout.joins;
+                let style = heading_style(*level);
+                let links = wrap(content, style, width, first, rest, out, joins);
                 ctx.layout.links.extend(links);
             }
         }
@@ -314,7 +331,8 @@ fn contents(
             figure(source, error, width, first, rest, out);
         }
         BlockKind::Frontmatter(front) => {
-            let links = frontmatter(front, width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            let links = frontmatter(front, width, first, rest, out, joins);
             ctx.layout.links.extend(links);
         }
         BlockKind::Html(html) => {
@@ -323,7 +341,8 @@ fn contents(
         }
         BlockKind::Image { alt, .. } => {
             let text = note(format!("[image: {alt}]"));
-            wrap(&[text], Style::default(), width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            wrap(&[text], Style::default(), width, first, rest, out, joins);
         }
         BlockKind::Rule => {
             let avail = width.saturating_sub(spans_width(first)).max(1);
@@ -383,8 +402,9 @@ fn sized_heading(
     let s = usize::from(scale);
     let prefix = spans_width(first).max(spans_width(rest));
     let avail = (width.saturating_sub(prefix) / s).max(1);
-    let mut wrapped = Vec::new();
-    let links = wrap(content, heading_style(level), avail, &[], &[], &mut wrapped);
+    let (mut wrapped, mut joins) = (Vec::new(), Vec::new());
+    let style = heading_style(level);
+    let links = wrap(content, style, avail, &[], &[], &mut wrapped, &mut joins);
     let left = |i: usize| spans_width(if i == 0 { first } else { rest });
     let mut rows = Vec::new();
     for (i, line) in wrapped.into_iter().enumerate() {
@@ -422,6 +442,11 @@ fn sized_heading(
         }
         layout.sized.push(heading::SizedLine { row, scale, cells });
     }
+    layout.joins.extend(joins.into_iter().map(|j| Join {
+        row: rows[j.row],
+        col: left(j.row) as u16,
+        ..j
+    }));
     for mut spot in links {
         spot.cells = spot
             .cells
@@ -470,6 +495,7 @@ fn frontmatter(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<Join>,
 ) -> Vec<LinkSpot> {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let mut links = Vec::new();
@@ -501,7 +527,7 @@ fn frontmatter(
             preformatted(value, dim, width, &key_first, &under, out);
         } else {
             let content = doc::value_inlines(value);
-            links.extend(wrap(&content, dim, width, &key_first, &under, out));
+            links.extend(wrap(&content, dim, width, &key_first, &under, out, joins));
         }
     }
     links
@@ -568,7 +594,8 @@ fn fold_title(
     let mut content = vec![note(lead)];
     content.extend_from_slice(title);
     let row = ctx.layout.lines.len();
-    let links = wrap(&content, style, width, first, rest, &mut ctx.layout.lines);
+    let (out, joins) = (&mut ctx.layout.lines, &mut ctx.layout.joins);
+    let links = wrap(&content, style, width, first, rest, out, joins);
     ctx.layout.links.extend(links);
     // A block in an embedded note is not a stop, as its start is in the
     // other note.
@@ -631,7 +658,8 @@ fn embed(
     };
     let top = with(first, Span::styled("╭─ ", dim));
     let under = with(rest, Span::styled("│  ", dim));
-    let links = wrap(&[title], dim, width, &top, &under, &mut ctx.layout.lines);
+    let (out, joins) = (&mut ctx.layout.lines, &mut ctx.layout.joins);
+    let links = wrap(&[title], dim, width, &top, &under, out, joins);
     ctx.layout.links.extend(links);
     let bar = with(rest, Span::styled("│ ", dim));
     let mut inner = Ctx {
@@ -668,7 +696,8 @@ fn definition(
     if term.is_empty() {
         lead = &after_first;
     } else {
-        let links = wrap(term, bold, width, first, rest, &mut ctx.layout.lines);
+        let (out, joins) = (&mut ctx.layout.lines, &mut ctx.layout.joins);
+        let links = wrap(term, bold, width, first, rest, out, joins);
         ctx.layout.links.extend(links);
     }
     for (i, details) in definitions.iter().enumerate() {
@@ -767,6 +796,7 @@ fn figure(
                 first,
                 rest,
                 out,
+                &mut Vec::new(),
             );
             rest
         }
@@ -1053,8 +1083,9 @@ pub(crate) fn breaks_at(c: char) -> bool {
     c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}')
 }
 
-/// Fill lines greedily with inline content, breaking at spaces. Returns
-/// where the links in it landed.
+/// Fill lines greedily with inline content, breaking at spaces, and put
+/// each line that carries on the one before in `joins`. Returns where the
+/// links in it landed.
 fn wrap(
     content: &[Inline],
     base: Style,
@@ -1062,6 +1093,7 @@ fn wrap(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<Join>,
 ) -> Vec<LinkSpot> {
     let (units, links) = units(content, base);
     let mut spots: Vec<LinkSpot> = links
@@ -1086,7 +1118,7 @@ fn wrap(
                     space = Some((style, link));
                 }
             }
-            Unit::Word(segments) => lines.word(&segments, space.take(), &mut spots),
+            Unit::Word(segments) => lines.word(&segments, space.take(), &mut spots, joins),
         }
     }
     lines.finish_last();
@@ -1215,16 +1247,19 @@ impl<'a> Lines<'a> {
 
     /// Push a word, after `space` when it fits on the line after it and on a
     /// new line when not. A word longer than a whole line is broken anywhere.
+    /// Each new line it starts goes in `joins`.
     fn word(
         &mut self,
         segments: &[Segment],
         space: Option<(Style, Option<usize>)>,
         spots: &mut [LinkSpot],
+        joins: &mut Vec<Join>,
     ) {
         let width: usize = segments.iter().map(|(s, ..)| s.width()).sum();
         if let Some((style, link)) = space {
             if self.used + 1 + width > self.avail() {
                 self.finish();
+                joins.push(self.join(true));
             } else {
                 self.push_link(" ", style, link, spots);
             }
@@ -1233,7 +1268,9 @@ impl<'a> Lines<'a> {
         for (s, style, link) in segments {
             if breaking {
                 for piece in clusters(s) {
-                    self.break_before(piece.width());
+                    if self.break_before(piece.width()) {
+                        joins.push(self.join(false));
+                    }
                     self.push_link(piece, *style, *link, spots);
                 }
             } else {
@@ -1242,10 +1279,22 @@ impl<'a> Lines<'a> {
         }
     }
 
-    /// Start a new line when one `w` columns wide would not fit.
-    fn break_before(&mut self, w: usize) {
-        if self.used > 0 && self.used + w > self.avail() {
+    /// Start a new line when one `w` columns wide would not fit. Returns
+    /// whether it did.
+    fn break_before(&mut self, w: usize) -> bool {
+        let full = self.used > 0 && self.used + w > self.avail();
+        if full {
             self.finish();
+        }
+        full
+    }
+
+    /// The line just started, as carrying on the one before.
+    fn join(&self, space: bool) -> Join {
+        Join {
+            row: self.out.len(),
+            col: spans_width(self.prefix()) as u16,
+            space,
         }
     }
 
@@ -1433,6 +1482,18 @@ mod tests {
         assert_eq!(layout.links.len(), 1);
         let cells = &layout.links[0].cells;
         assert_eq!(cells, &[(3, 2..17), (4, 2..17), (5, 2..17)]);
+        // The second line carries on the first, after the bar, so a search
+        // finds a term across the break, past the rows under the first.
+        let join = Join {
+            row: 3,
+            col: 2,
+            space: true,
+        };
+        assert_eq!(layout.joins, [join]);
+        let doc = parse("> # Going [to it](x.md)\n");
+        let found = crate::search::find("going to", &layout, &doc);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].cells, [(0, 2..17), (3, 2..8)]);
     }
 
     fn sized_texts(layout: &Layout) -> Vec<(u16, u8, String)> {

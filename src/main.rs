@@ -41,6 +41,9 @@ struct Args {
     /// Do not fetch images from the web, whatever the config says
     #[arg(long, overrides_with = "remote_images")]
     no_remote_images: bool,
+    /// The widest the text gets, in columns, whatever the config says
+    #[arg(long, value_name = "COLS", value_parser = clap::value_parser!(u16).range(1..))]
+    max_width: Option<u16>,
     /// The markdown file, or `-` for stdin; with none, stdin when markdown
     /// is piped in, else the `home` note from the config
     file: Option<PathBuf>,
@@ -291,14 +294,22 @@ fn set_panic_hook(uploaded: images::Uploaded, mouse: bool) {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    exit_code(smd(args), &mut io::stderr())
+    let result = smd(args);
+    // A run that failed because a stop signal came ends by that signal, as
+    // one that did not fail does, and prints nothing: after SIGHUP the
+    // terminal is gone.
+    if let Some(signal) = app::stop_signal() {
+        app::raise(signal);
+    }
+    exit_code(result, &mut io::stderr())
 }
 
 fn smd(args: Args) -> Result<(), Failure> {
-    // Until the terminal is set up, SIGTERM, SIGHUP and Ctrl-C end smd at
+    // Until the terminal is set up, SIGTERM, SIGHUP and SIGINT end smd at
     // once; after, they end the loop below, so the terminal is restored.
     app::stop_on_signals();
-    let config = loaded(config::Config::load())?;
+    let mut config = loaded(config::Config::load())?;
+    config.max_width = args.max_width.or(config.max_width);
     let stdin_kind = file_kind(libc::STDIN_FILENO);
     let picked = pick_source(args.file, config.home.clone(), is_piped(stdin_kind));
     let picked = picked.unwrap_or_else(|message| {
@@ -323,8 +334,10 @@ fn smd(args: Args) -> Result<(), Failure> {
     };
     let vault = vault::Vault::for_file(&path);
     app::stop_later();
+    let probe_objects = images::Uploaded::default();
+    app::remove_on_stop(probe_objects.clone());
     // Asked before the terminal is set up, while nothing else reads its replies.
-    let probe = (!args.no_graphics).then(kitty::probe);
+    let probe = (!args.no_graphics).then(|| kitty::probe(&probe_objects));
     // A signal during the probe ends smd once the probe has put the terminal
     // back.
     if let Some(signal) = app::stop_signal() {
@@ -486,6 +499,19 @@ mod tests {
             args.no_remote_images,
             false
         ));
+    }
+
+    #[test]
+    fn max_width_is_a_number_of_columns_more_than_0() {
+        let args = Args::parse_from(["smd", "--max-width", "80", "a.md"]);
+        assert_eq!(args.max_width, Some(80));
+        assert_eq!(Args::parse_from(["smd", "a.md"]).max_width, None);
+        for bad in ["0", "wide", "-3"] {
+            assert!(
+                Args::try_parse_from(["smd", "--max-width", bad]).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

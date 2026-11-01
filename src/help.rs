@@ -42,7 +42,7 @@ fn table(config: &Config) -> String {
         };
         out.push_str(&format!(
             "| {keys} | {} | {} |\n",
-            cell(&name(action)),
+            cell(action.name()),
             what(action)
         ));
     }
@@ -62,18 +62,6 @@ fn code(text: &str) -> String {
     } else {
         format!("`{text}`")
     }
-}
-
-/// The action's name as the config's `[keys]` writes it.
-pub fn name(action: Action) -> String {
-    let mut out = String::new();
-    for (i, c) in format!("{action:?}").chars().enumerate() {
-        if c.is_ascii_uppercase() && i > 0 {
-            out.push('_');
-        }
-        out.push(c.to_ascii_lowercase());
-    }
-    out
 }
 
 /// What an action does, in a few words.
@@ -111,7 +99,7 @@ mod tests {
         let page = page(&Config::default());
         assert!(!page.contains("{keys}") && !page.contains("{config}"));
         for action in Action::ALL {
-            let row = format!("| {} | {} |", cell(&name(action)), what(action));
+            let row = format!("| {} | {} |", cell(action.name()), what(action));
             assert!(page.contains(&row), "the help has no row for {action:?}");
         }
         assert!(page.contains("| `?` | `help` | Show this page |"));
@@ -120,9 +108,14 @@ mod tests {
 
     #[test]
     fn names_are_as_the_config_writes_them() {
-        assert_eq!(name(Action::Quit), "quit");
-        assert_eq!(name(Action::HalfDown), "half_down");
-        assert_eq!(name(Action::NextMatch), "next_match");
+        assert_eq!(Action::Quit.name(), "quit");
+        assert_eq!(Action::HalfDown.name(), "half_down");
+        assert_eq!(Action::NextMatch.name(), "next_match");
+        for action in Action::ALL {
+            let text = format!("[keys]\n{} = []\n", action.name());
+            let c = Config::from_str(&text).unwrap();
+            assert!(c.key_names(action).is_empty(), "{text}");
+        }
     }
 
     #[test]

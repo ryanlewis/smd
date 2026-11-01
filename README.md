@@ -8,7 +8,7 @@ A sexy markdown reader for the terminal that draws mermaid diagrams, maths and h
 
 - **Diagrams.** A ` ```mermaid ` code block is drawn as an image, by [merman](https://github.com/Latias94/merman).
 - **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image. Inline maths stays as text.
-- **Headings.** Headings are drawn as images in a real font, larger for higher levels, including colour emoji.
+- **Headings.** Headings are drawn larger for higher levels. In a terminal with kitty's [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/), such as kitty 0.40 or later, they are text the terminal draws larger, so you can select them and follow their links. Elsewhere they are images in a real font, including colour emoji.
 - **Images.** A paragraph that holds only a PNG, GIF (first frame), JPEG or SVG, such as `![diagram](diagram.png)` or an HTML `<img>`, is shown as the image. Local images are read from the markdown file's folder. Images from the web are fetched only when you turn them on (see [Images from the web](#images-from-the-web)).
 - **Code blocks.** Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours, on a panel a little lighter than the background (darker on a light one).
 - **Tables.** A table wider than the pane wraps its cells. A table with too many columns to wrap well is shown as one card per row, with a `Header: value` line for each cell.
@@ -52,7 +52,7 @@ $$
 
 ### Headings
 
-Headings are drawn as images in a larger font, with a colour for each level, and emoji in colour.
+Headings are drawn in a larger font, with a colour for each level, and emoji in colour. This screenshot shows them drawn as images; in kitty they are larger text instead.
 
 ```markdown
 # 🌦️ Weather station
@@ -145,6 +145,10 @@ Images, diagrams, maths and headings need a terminal that supports the [kitty gr
 
 smd asks the terminal what it supports at start-up. In a terminal without kitty graphics, or with `--no-graphics`, images, diagrams and maths are shown as their markdown source, and headings as styled text. Everything else works the same.
 
+smd also asks whether the terminal has the [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/), by drawing a space two columns wide and one twice the size and seeing where the cursor ends up. If it does, headings are drawn as larger text rather than images: three times the size for level 1 and twice for levels 2 and 3, smaller in a narrow pane. kitty has it from version 0.40; Ghostty does not yet. `--no-graphics` turns this off too.
+
+When the terminal runs on the same machine as smd, images are passed to it through shared memory, which is faster for large images than sending them through the terminal. Over ssh, or when the terminal cannot read shared memory, they are sent through the terminal as before.
+
 smd is developed on macOS, and its tests run on Linux.
 
 ## Install
@@ -233,6 +237,7 @@ Keys and the mouse then come from the terminal. A document read from stdin is no
 | `/` | Search the note: type a term, then Enter to go to the first match from the top of the screen |
 | `n`, `N` | Go to the next or previous match, going round at the end |
 | `r` | Reload the file |
+| `?` | Show the help page |
 | `q`, Esc, Ctrl-C | Quit |
 
 Type a number before a key to repeat it: `5j` scrolls five lines and `3` Ctrl-D three half pages. With `g` or `G`, the number is a line to go to: `42G` puts line 42 at the top. A line is a row of the note as smd draws it, counting from 1 at the top, so a long paragraph wrapped over three rows is three lines, and the count changes with the width of the pane. The number shows on the bottom row as you type it, and Esc drops it.
@@ -240,6 +245,8 @@ Type a number before a key to repeat it: `5j` scrolls five lines and `3` Ctrl-D 
 The bottom row shows which page of the note is in view, as `page 3/10`: the page the top line is on, or the last page once the end of the note is in view. When something fails, such as a link to a note that cannot be found or a file that cannot be read, the bottom row says so until the next key.
 
 The keys can be changed in the [config](#config).
+
+`?` opens a help page drawn by smd: a table of every action and the keys bound to it now, including any changed in the config, with short notes on moving around, search, links, tasks and reloading, and where the config file is. It is a note like any other, so it scrolls and can be searched, and Back returns to where you were. It has no file, so it cannot be reloaded.
 
 ### Search
 
@@ -325,6 +332,11 @@ max_width = 100
 # (the default) or "left".
 align = "centre"
 
+# How headings are drawn: "auto" (the default) for larger text when the
+# terminal can draw it and images when not, "image" for images always, or
+# "text" for text always, larger when the terminal can draw it.
+headings = "auto"
+
 # Keys for each action. Naming an action replaces its default keys.
 [keys]
 next_link = ["tab", "n"]
@@ -349,12 +361,13 @@ The actions and their default keys:
 | `search` | `/` |
 | `next_match`, `prev_match` | `n`; `N` |
 | `reload` | `r` |
+| `help` | `?` |
 
 A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. A digit bound to an action is no longer part of a number typed before a key. With `ctrl-`, the letters `a` to `z` ignore case, so `ctrl-o` and `ctrl-O` are the same key. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.
 
 ## Limitations
 
-- Links in headings drawn as images cannot be selected or clicked yet.
+- Links in headings drawn as images cannot be selected or clicked. Headings are drawn as larger text, with links that work, only in terminals with the text sizing protocol. Ghostty does not have it yet, so it shows headings as images; set `headings = "text"` for plain text headings with working links.
 - Only the first frame of a GIF is shown.
 - SVGs are drawn by resvg, which covers most of SVG but not all of CSS. Text in an SVG is set in the diagram fonts (see [Fonts](#fonts)), whatever font it names.
 - Diagrams are drawn by merman, which follows mermaid closely but not exactly: a diagram may be laid out a little differently from mermaid's own, and a few that mermaid rejects are drawn. Set `mermaid = "mmdc"` to use mermaid-cli.

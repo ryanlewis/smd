@@ -10,10 +10,18 @@
 //! not change when the pane is resized. A heading wider than the pane is
 //! shrunk to fit by whole rows (see [`images::fit`](crate::images::fit)); one that cannot shrink to a row
 //! is shown as text instead.
+//!
+//! In a terminal that has kitty's text sizing protocol (OSC 66), headings are
+//! not images: they are text the terminal draws larger (see [`draw_sized`]),
+//! so they can be selected and their links followed.
 
+use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::layout::Rect;
+use serde::Deserialize;
 
 use crate::doc::Inline;
 use crate::images::Job;
@@ -34,6 +42,144 @@ pub fn set_cell(cell: (u16, u16)) {
 
 fn cell() -> (u16, u16) {
     CELL.get().copied().unwrap_or(DEFAULT_CELL)
+}
+
+/// How the config asks for headings to be drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Larger text when the terminal can draw it, images when not.
+    #[default]
+    Auto,
+    /// Always images.
+    Image,
+    /// Always text: larger when the terminal can draw it, plain when not.
+    Text,
+}
+
+/// How headings are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drawn {
+    /// As images, or as plain text without graphics.
+    Image,
+    /// As text the terminal draws larger, with OSC 66.
+    Sized,
+    /// As plain text.
+    Plain,
+}
+
+/// How headings are drawn, set once at start-up.
+static DRAWN: OnceLock<Drawn> = OnceLock::new();
+
+/// How headings are drawn for `mode` in a terminal that can or cannot
+/// (`text_sizing`) draw larger text.
+pub fn choose(mode: Mode, text_sizing: bool) -> Drawn {
+    match (mode, text_sizing) {
+        (Mode::Image, _) => Drawn::Image,
+        (Mode::Auto | Mode::Text, true) => Drawn::Sized,
+        (Mode::Auto, false) => Drawn::Image,
+        (Mode::Text, false) => Drawn::Plain,
+    }
+}
+
+/// Draw headings as `drawn` says. Call once, before any are laid out.
+pub fn set_drawn(drawn: Drawn) {
+    let _ = DRAWN.set(drawn);
+}
+
+fn drawn() -> Drawn {
+    DRAWN.get().copied().unwrap_or(Drawn::Image)
+}
+
+/// How many times larger than text each level is drawn with OSC 66, for
+/// levels 1 to 6. They take as many rows as the images do.
+const SCALES: [u8; 6] = [3, 2, 2, 1, 1, 1];
+
+/// The fewest columns of text a larger heading keeps on a line. Where that
+/// many would not fit, it is drawn smaller.
+const MIN_COLUMNS: usize = 20;
+
+/// How many times larger a heading of `level` is drawn in `avail` columns:
+/// 1, the size of text, unless headings are drawn with OSC 66.
+pub fn scale(level: u8, avail: usize) -> u8 {
+    scale_for(drawn(), level, avail)
+}
+
+fn scale_for(drawn: Drawn, level: u8, avail: usize) -> u8 {
+    if drawn != Drawn::Sized {
+        return 1;
+    }
+    let mut scale = SCALES[usize::from(level.clamp(1, 6)) - 1];
+    while scale > 1 && avail / usize::from(scale) < MIN_COLUMNS {
+        scale -= 1;
+    }
+    scale
+}
+
+/// One line of a heading drawn larger. Each character is `scale` times its
+/// columns wide and `scale` rows tall, from row `row` of the layout down.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SizedLine {
+    pub row: usize,
+    pub scale: u8,
+    pub cells: Vec<SizedCell>,
+}
+
+/// A character of a heading drawn larger: its column in the layout, the
+/// columns it takes at the size of text, and the character.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SizedCell {
+    pub col: u16,
+    pub width: u8,
+    pub text: String,
+}
+
+/// The OSC 66 sequence that draws `text`, `width` columns wide at the size
+/// of text, `scale` times larger. Control characters would end it early.
+fn osc66(scale: u8, width: u8, text: &str) -> String {
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]66;s={scale}:w={width};{text}\x1b\\")
+}
+
+/// Draw the heading lines in view as larger text: the first cell of each
+/// character holds its OSC 66 sequence, and the other cells it covers are
+/// left alone, as the terminal draws over them. `scroll` is the layout row
+/// at the top of `area`. The terminal cannot draw part of a character, so a
+/// line cut off by the bottom of `area` is drawn at the size of text, and
+/// one cut off by the top leaves only its blank rows in view.
+pub fn draw_sized(buf: &mut Buffer, area: Rect, scroll: usize, lines: &[SizedLine]) {
+    for line in lines {
+        let s = u16::from(line.scale);
+        let Some(top) = line.row.checked_sub(scroll) else {
+            continue;
+        };
+        if top >= usize::from(area.height) {
+            continue;
+        }
+        let y = area.y + top as u16;
+        if top + usize::from(s) > usize::from(area.height) {
+            text_size(buf, area.x, y, line);
+            continue;
+        }
+        for cell in &line.cells {
+            let cols = s * u16::from(cell.width);
+            let Some(width) = NonZeroU16::new(cols) else {
+                continue;
+            };
+            if cell.col + cols > area.width {
+                continue;
+            }
+            let x = area.x + cell.col;
+            for dy in 0..s {
+                for dx in 0..cols {
+                    buf[(x + dx, y + dy)].set_diff_option(CellDiffOption::Skip);
+                }
+            }
+            buf[(x, y)]
+                .set_symbol(&osc66(line.scale, cell.width, &cell.text))
+                .set_diff_option(CellDiffOption::ForcedWidth(width));
+        }
+    }
 }
 
 /// Rows of the image and font height, in cell heights, for levels 1 to 6.
@@ -180,11 +326,40 @@ fn fonts() -> Option<(&'static FontVec, &'static FontVec)> {
     Some((sans, mono))
 }
 
+/// Draw `line`'s characters on row `y` side by side at the size of text,
+/// where the layout spaced them out, in the styles they were given.
+fn text_size(buf: &mut Buffer, x: u16, y: u16, line: &SizedLine) {
+    let (Some(first), Some(last)) = (line.cells.first(), line.cells.last()) else {
+        return;
+    };
+    let s = u16::from(line.scale);
+    let end = (last.col + s * u16::from(last.width)).min(buf.area.right() - x);
+    let chars: Vec<_> = line
+        .cells
+        .iter()
+        .map(|c| (c, buf[(x + c.col, y)].style()))
+        .collect();
+    for col in first.col..end {
+        buf[(x + col, y)].reset();
+    }
+    let mut col = x + first.col;
+    for (cell, style) in chars {
+        if col + u16::from(cell.width) > buf.area.right() {
+            break;
+        }
+        buf[(col, y)].set_symbol(&cell.text).set_style(style);
+        col += u16::from(cell.width);
+    }
+}
+
 /// What a heading image is made from, or `None` for a heading that stays
 /// text: an empty one, or one the fonts cannot draw. Checking here rather
 /// than in the job keeps a heading that cannot be drawn from being tried
-/// again on every reload.
+/// again on every reload. Headings drawn as text have no image.
 pub fn name(level: u8, content: &[Inline], theme: Theme) -> Option<String> {
+    if drawn() != Drawn::Image {
+        return None;
+    }
     let runs = runs(content);
     let (sans, mono) = fonts()?;
     let emoji = raster::emoji();
@@ -573,6 +748,115 @@ mod tests {
                 "light level {level}"
             );
         }
+    }
+
+    #[test]
+    fn headings_are_sized_only_when_the_terminal_can_draw_it() {
+        assert_eq!(choose(Mode::Auto, true), Drawn::Sized);
+        assert_eq!(choose(Mode::Auto, false), Drawn::Image);
+        assert_eq!(choose(Mode::Image, true), Drawn::Image);
+        assert_eq!(choose(Mode::Image, false), Drawn::Image);
+        assert_eq!(choose(Mode::Text, true), Drawn::Sized);
+        assert_eq!(choose(Mode::Text, false), Drawn::Plain);
+    }
+
+    #[test]
+    fn sizes_go_down_by_level_and_in_narrow_panes() {
+        let scales: Vec<u8> = (1..=6).map(|l| scale_for(Drawn::Sized, l, 80)).collect();
+        assert_eq!(scales, [3, 2, 2, 1, 1, 1]);
+        // 50 columns hold 16 at three times the size, 25 at twice.
+        assert_eq!(scale_for(Drawn::Sized, 1, 50), 2);
+        assert_eq!(scale_for(Drawn::Sized, 1, 30), 1);
+        assert_eq!(scale_for(Drawn::Sized, 0, 80), 3);
+        assert_eq!(scale_for(Drawn::Sized, 9, 80), 1);
+        // Images and plain text are never sized.
+        for drawn in [Drawn::Image, Drawn::Plain] {
+            assert_eq!(scale_for(drawn, 1, 200), 1);
+        }
+        // Nothing is set in tests, so headings are images, as before.
+        assert_eq!(scale(1, 200), 1);
+    }
+
+    #[test]
+    fn osc66_names_the_scale_and_width() {
+        assert_eq!(osc66(2, 1, "H"), "\x1b]66;s=2:w=1;H\x1b\\");
+        assert_eq!(osc66(3, 2, "日"), "\x1b]66;s=3:w=2;日\x1b\\");
+        assert_eq!(osc66(2, 2, "❤\u{FE0F}"), "\x1b]66;s=2:w=2;❤\u{FE0F}\x1b\\");
+        assert_eq!(osc66(2, 1, "a\x1b\x07"), "\x1b]66;s=2:w=1;a\x1b\\");
+    }
+
+    fn sized(row: usize, scale: u8, cells: &[(u16, u8, &str)]) -> SizedLine {
+        SizedLine {
+            row,
+            scale,
+            cells: cells
+                .iter()
+                .map(|&(col, width, text)| SizedCell {
+                    col,
+                    width,
+                    text: text.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn sized_characters_take_their_whole_block() {
+        // A narrow letter, a wide one and an emoji, twice the size.
+        let line = sized(1, 2, &[(1, 1, "A"), (3, 2, "日"), (7, 2, "🏠")]);
+        let area = Rect::new(0, 0, 12, 4);
+        let mut buf = Buffer::empty(area);
+        draw_sized(&mut buf, area, 0, &[line]);
+        let forced = |n| CellDiffOption::ForcedWidth(NonZeroU16::new(n).unwrap());
+        assert_eq!(buf[(1, 1)].symbol(), "\x1b]66;s=2:w=1;A\x1b\\");
+        assert_eq!(buf[(1, 1)].diff_option, forced(2));
+        assert_eq!(buf[(3, 1)].symbol(), "\x1b]66;s=2:w=2;日\x1b\\");
+        assert_eq!(buf[(3, 1)].diff_option, forced(4));
+        assert_eq!(buf[(7, 1)].diff_option, forced(4));
+        // Every other cell of the blocks is left to the terminal.
+        let skip = |x, y| buf[(x, y)].diff_option == CellDiffOption::Skip;
+        for (x, y) in [(2, 1), (1, 2), (2, 2), (4, 1), (6, 1), (6, 2), (10, 2)] {
+            assert!(skip(x, y), "({x}, {y})");
+        }
+        for (x, y) in [(0, 1), (0, 2), (11, 1), (1, 0), (1, 3)] {
+            assert_eq!(buf[(x, y)].diff_option, CellDiffOption::None, "({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn sized_lines_partly_out_of_view_stay_as_laid_out() {
+        let lines = [sized(0, 2, &[(0, 1, "A")]), sized(3, 3, &[(0, 1, "B")])];
+        let area = Rect::new(0, 0, 10, 4);
+        // Scrolled one row down, the first is cut at the top: nothing is
+        // drawn on its blank row.
+        let mut buf = Buffer::empty(area);
+        draw_sized(&mut buf, area, 1, &lines[..1]);
+        assert_eq!(buf, Buffer::empty(area));
+        // In view inside an area lower down the screen.
+        let area = Rect::new(2, 1, 10, 6);
+        let mut buf = Buffer::empty(area);
+        draw_sized(&mut buf, area, 0, &lines);
+        assert_eq!(buf[(2, 1)].symbol(), "\x1b]66;s=2:w=1;A\x1b\\");
+        assert_eq!(buf[(2, 4)].symbol(), "\x1b]66;s=3:w=1;B\x1b\\");
+        // A character past the right edge is left out.
+        let mut buf = Buffer::empty(area);
+        draw_sized(&mut buf, area, 0, &[sized(0, 2, &[(9, 1, "C")])]);
+        assert_eq!(buf, Buffer::empty(area));
+    }
+
+    #[test]
+    fn sized_lines_cut_at_the_bottom_are_drawn_at_the_size_of_text() {
+        use ratatui::style::{Color, Style};
+        // As laid out: "A", a space and "日" spaced out three times.
+        let line = sized(1, 3, &[(1, 1, "A"), (4, 1, " "), (7, 2, "日")]);
+        let area = Rect::new(0, 0, 14, 3);
+        let mut buf = Buffer::empty(area);
+        let red = Style::new().fg(Color::Red);
+        buf.set_string(1, 1, "A     日    ", red);
+        draw_sized(&mut buf, area, 0, &[line]);
+        let mut want = Buffer::empty(area);
+        want.set_string(1, 1, "A 日", red);
+        assert_eq!(buf, want);
     }
 
     #[test]

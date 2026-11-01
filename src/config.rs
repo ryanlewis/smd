@@ -19,6 +19,8 @@
 //! # window is wider: "centre" or "left".
 //! max_width = 100
 //! align = "centre"
+//! # How headings are drawn: "auto", "image" or "text".
+//! headings = "auto"
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -33,6 +35,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::heading;
 use crate::mermaid::Renderer;
 use crate::theme::Rgb;
 
@@ -59,6 +62,7 @@ pub enum Action {
     NextMatch,
     PrevMatch,
     Reload,
+    Help,
 }
 
 impl Action {
@@ -84,6 +88,7 @@ impl Action {
             Action::NextMatch => &["n"],
             Action::PrevMatch => &["N"],
             Action::Reload => &["r"],
+            Action::Help => &["?"],
         }
     }
 
@@ -96,7 +101,8 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 19] = [
+    /// Every action, in the order the help lists them.
+    pub(crate) const ALL: [Action; 20] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -116,6 +122,7 @@ impl Action {
         Action::NextMatch,
         Action::PrevMatch,
         Action::Reload,
+        Action::Help,
     ];
 }
 
@@ -270,6 +277,8 @@ struct File {
     #[serde(default)]
     align: Align,
     #[serde(default)]
+    headings: heading::Mode,
+    #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
 
@@ -293,7 +302,11 @@ pub struct Config {
     pub max_width: Option<u16>,
     /// Where the text sits when the window is wider than `max_width`.
     pub align: Align,
+    /// How headings are drawn.
+    pub headings: heading::Mode,
     keys: HashMap<Key, Action>,
+    /// Each action's keys, named as the config or the defaults write them.
+    names: HashMap<Action, Vec<String>>,
 }
 
 impl Default for Config {
@@ -327,7 +340,8 @@ impl Config {
     pub(crate) fn from_str(text: &str) -> Result<Config, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_string())?;
         let mut keys = HashMap::new();
-        // The search keys came after configs were written that may use
+        let mut key_names: HashMap<Action, Vec<String>> = HashMap::new();
+        // The search and help keys came after configs were written that may use
         // them, so they give way to a key the config names.
         let named: Vec<Key> = file
             .keys
@@ -345,17 +359,20 @@ impl Config {
                 let key = Key::parse(name)?;
                 let newer = matches!(
                     action,
-                    Action::Search | Action::NextMatch | Action::PrevMatch
+                    Action::Search | Action::NextMatch | Action::PrevMatch | Action::Help
                 );
                 if given.is_none() && newer && named.contains(&key) {
                     continue;
                 }
-                if let Some(other) = keys.insert(key, action)
-                    && other != action
-                {
-                    return Err(format!(
-                        "key \"{name}\" is set for both {other:?} and {action:?}"
-                    ));
+                match keys.insert(key, action) {
+                    Some(other) if other != action => {
+                        return Err(format!(
+                            "key \"{name}\" is set for both {other:?} and {action:?}"
+                        ));
+                    }
+                    // The same key again, perhaps spelt another way.
+                    Some(_) => {}
+                    None => key_names.entry(action).or_default().push(name.to_string()),
                 }
             }
         }
@@ -378,7 +395,9 @@ impl Config {
             tasks: file.tasks,
             max_width: file.max_width,
             align: file.align,
+            headings: file.headings,
             keys,
+            names: key_names,
         })
     }
 
@@ -386,10 +405,16 @@ impl Config {
     pub fn action(&self, event: KeyEvent) -> Option<Action> {
         self.keys.get(&Key::of(event)).copied()
     }
+
+    /// The keys bound to `action`, by name; none when the config gives it
+    /// none.
+    pub fn key_names(&self, action: Action) -> &[String] {
+        self.names.get(&action).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Where the config file is.
-fn path() -> Option<PathBuf> {
+pub fn path() -> Option<PathBuf> {
     path_in(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
@@ -473,6 +498,26 @@ mod tests {
         assert_eq!(c.align, Align::Centre);
         assert!(Config::from_str("max_width = 0").is_err());
         assert!(Config::from_str("align = \"right\"").is_err());
+    }
+
+    #[test]
+    fn the_help_key_gives_way_to_a_config_that_names_it() {
+        let c = Config::from_str("[keys]\nquit = [\"?\"]").unwrap();
+        let none = KeyModifiers::NONE;
+        assert_eq!(
+            c.action(press(KeyCode::Char('?'), none)),
+            Some(Action::Quit)
+        );
+        assert!(c.key_names(Action::Help).is_empty());
+        assert_eq!(Config::default().key_names(Action::Help), ["?"]);
+    }
+
+    #[test]
+    fn a_key_named_twice_is_listed_once() {
+        let c = Config::from_str("[keys]\ndown = [\"j\", \"j\"]\nback = [\"ctrl-o\", \"ctrl-O\"]")
+            .unwrap();
+        assert_eq!(c.key_names(Action::Down), ["j"]);
+        assert_eq!(c.key_names(Action::Back), ["ctrl-o"]);
     }
 
     #[test]
@@ -568,6 +613,17 @@ mod tests {
             let err = Config::from_str(text).unwrap_err();
             assert!(err.contains(wanted), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn headings_are_auto_unless_set() {
+        assert_eq!(Config::default().headings, heading::Mode::Auto);
+        let c = Config::from_str("headings = \"image\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Image);
+        let c = Config::from_str("headings = \"text\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Text);
+        let err = Config::from_str("headings = \"big\"\n").unwrap_err();
+        assert!(err.contains("big"), "{err}");
     }
 
     fn key(code: KeyCode, ctrl: bool, alt: bool) -> Result<Key, String> {

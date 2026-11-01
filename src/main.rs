@@ -3,6 +3,7 @@ mod config;
 mod doc;
 mod embed;
 mod heading;
+mod help;
 mod highlight;
 mod html;
 mod images;
@@ -60,6 +61,7 @@ Keys:
   L, alt-right            go forward
   /, n, N                 search, go to the next or previous match
   r                       reload the file
+  ?                       show the help page, with the keys as bound
   5j, 42G                 a number first repeats a key; with g or G, goes to
                           that line
   q, esc, ctrl-c          quit
@@ -283,13 +285,16 @@ fn smd(args: Args) -> Result<(), Failure> {
     let probe = (!args.no_graphics).then(kitty::probe);
     let look = Look::new(probe, config.code_background);
     apply(&look);
+    let text_sizing = probe.is_some_and(|p| p.text_sizing);
+    heading::set_drawn(heading::choose(config.headings, text_sizing));
     mermaid::set_renderer(config.mermaid);
     remote::set_enabled(remote_images(
         args.remote_images,
         args.no_remote_images,
         config.remote_images,
     ));
-    let images = images_for(look.cell);
+    let mut images = images_for(look.cell);
+    images.use_shared_memory(probe.is_some_and(|p| p.shared_memory));
 
     let mut terminal = opened(ratatui::try_init())?;
     let mouse = config.mouse;
@@ -421,6 +426,8 @@ mod tests {
             theme,
             background,
             graphics,
+            shared_memory: false,
+            text_sizing: false,
         }
     }
 

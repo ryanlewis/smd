@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame, Terminal};
 
-use crate::config::{Action, Config, Tasks, WebLinks};
+use crate::config::{Action, Align, Config, Tasks, WebLinks};
 use crate::doc::{self, BlockKind, Document, Inline, Link};
 use crate::embed;
 use crate::highlight;
@@ -46,6 +46,11 @@ pub struct View {
     layout: Layout,
     /// Width the lines were laid out for; zero before the first layout.
     width: u16,
+    /// The widest the text gets, and where it sits in a wider window.
+    max_width: Option<u16>,
+    align: Align,
+    /// How far right of the view's left edge the text was last drawn.
+    left: u16,
     /// Whether the lines were laid out with the syntaxes for code.
     highlighted: bool,
     height: u16,
@@ -145,6 +150,9 @@ impl View {
             images,
             layout: Layout::default(),
             width: 0,
+            max_width: None,
+            align: Align::Centre,
+            left: 0,
             highlighted: false,
             height: 0,
             scroll: 0,
@@ -351,6 +359,13 @@ impl View {
             let style = Style::new().add_modifier(Modifier::REVERSED);
             frame.render_widget(Paragraph::new(notice.as_str()).style(style), row);
         }
+        // The text keeps to `max_width`, at the left or in the middle.
+        let width = self.max_width.map_or(area.width, |m| m.min(area.width));
+        self.left = match self.align {
+            Align::Centre => (area.width - width) / 2,
+            Align::Left => 0,
+        };
+        let area = Rect::new(area.x + self.left, area.y, width, area.height);
         self.resize(area.width, area.height);
         let lines = &self.layout.lines;
         let end = (self.scroll + area.height as usize).min(lines.len());
@@ -416,6 +431,7 @@ impl View {
         if y >= self.height {
             return None;
         }
+        let x = x.checked_sub(self.left)?;
         let line = self.scroll + y as usize;
         let hit = |stop: &Stop| {
             self.cells(*stop)
@@ -866,6 +882,8 @@ impl Browser {
             clipboard: Box::new(io::stdout()),
             opener: open_with_system,
         };
+        browser.view.max_width = browser.config.max_width;
+        browser.view.align = browser.config.align;
         browser.check_tasks();
         browser
     }
@@ -1778,6 +1796,64 @@ mod tests {
         assert_eq!(b.path, dir.join("HOME.md"));
         assert_eq!(b.view.selected, Some(Stop::Link(0)));
         b.mouse(click(BACK_BUTTON.width() as u16 + 2, 0));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_width_keeps_the_text_narrow_at_the_left_or_in_the_middle() {
+        let md = format!("{}\n\n```\n{}\n```\n", "word ".repeat(40), "x".repeat(50));
+        for (align, left) in [(Align::Centre, 20), (Align::Left, 0)] {
+            let mut v = new_view(&md);
+            v.max_width = Some(20);
+            v.align = align;
+            let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+            terminal.draw(|f| v.draw(f)).unwrap();
+            assert_eq!((v.width, v.left), (20, left));
+            assert!(v.layout.lines.iter().all(|l| l.width() <= 20));
+            let buf = terminal.backend().buffer();
+            for y in 0..12 {
+                let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                let (before, rest) = row.split_at(left as usize);
+                let (_, after) = rest.split_at(20);
+                assert!(
+                    before.trim().is_empty() && after.trim().is_empty(),
+                    "{row:?}"
+                );
+            }
+            let first: String = (left..left + 20)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect();
+            assert!(first.starts_with("word word"), "{first:?}");
+        }
+        // A narrower window than the limit uses all of it.
+        let mut v = new_view(&md);
+        v.max_width = Some(20);
+        let mut terminal = Terminal::new(TestBackend::new(15, 5)).unwrap();
+        terminal.draw(|f| v.draw(f)).unwrap();
+        assert_eq!((v.width, v.left), (15, 0));
+    }
+
+    #[test]
+    fn a_click_finds_a_link_moved_by_max_width() {
+        let (mut b, dir) = browser(
+            "narrow",
+            &[("HOME.md", "go [[Plan]] now\n"), ("Plan.md", "# Plan\n")],
+        );
+        b.view.max_width = Some(20);
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        assert_eq!(b.view.left, 20);
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Where the link would be without the limit, nothing happens.
+        b.mouse(click(4));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        b.mouse(click(24));
         assert_eq!(b.path, dir.join("Plan.md"));
         let _ = std::fs::remove_dir_all(&dir);
     }

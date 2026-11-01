@@ -303,6 +303,15 @@ remote_images = false
 # mermaid-cli, which starts a headless browser for each one.
 mermaid = "builtin"
 
+# The widest the text gets, in columns, so lines stay easy to read in a
+# wide window. Without it (the default), the text fills the window.
+# Code blocks, tables, images and headings keep to it too.
+max_width = 100
+
+# Where the text sits when the window is wider than max_width: "centre"
+# (the default) or "left".
+align = "centre"
+
 # Keys for each action. Naming an action replaces its default keys.
 [keys]
 next_link = ["tab", "n"]

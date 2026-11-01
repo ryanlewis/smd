@@ -19,7 +19,7 @@ mod theme;
 mod vault;
 mod watch;
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -168,13 +168,37 @@ fn source(path: &Path, read: io::Result<String>) -> Result<String, Failure> {
 /// `smd < a.md`. Not when it is /dev/null or closed, as when a launcher
 /// starts smd: the home note is opened then.
 fn is_piped(fd: libc::c_int) -> bool {
+    matches!(file_kind(fd), Some(libc::S_IFIFO | libc::S_IFREG))
+}
+
+/// The kind of file `fd` is, as its `S_IFMT` bits, or none when it is closed.
+fn file_kind(fd: libc::c_int) -> Option<libc::mode_t> {
     // SAFETY: a stat is plain data, and fstat only writes the one it is given.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return false;
+        return None;
     }
-    let kind = st.st_mode & libc::S_IFMT;
-    kind == libc::S_IFIFO || kind == libc::S_IFREG
+    Some(st.st_mode & libc::S_IFMT)
+}
+
+/// Whether to say smd is reading stdin while it waits: only when `fd` is a
+/// pipe, which may be slow to fill, not a file, and stderr is a terminal.
+fn shows_stdin_hint(fd: libc::c_int, stderr_is_terminal: bool) -> bool {
+    stderr_is_terminal && file_kind(fd) == Some(libc::S_IFIFO)
+}
+
+/// Stdin's text. A hint shows on stderr while smd waits for a pipe, so a
+/// slow command does not look like a hang, and is cleared once it is read.
+fn read_stdin() -> io::Result<String> {
+    let hint = shows_stdin_hint(libc::STDIN_FILENO, io::stderr().is_terminal());
+    if hint {
+        eprint!("reading stdin…");
+    }
+    let read = io::read_to_string(io::stdin());
+    if hint {
+        eprint!("\r\x1b[K");
+    }
+    read
 }
 
 /// The markdown read from stdin, or a failure saying it cannot be read.
@@ -272,7 +296,7 @@ fn smd(args: Args) -> Result<(), Failure> {
             (path, read)
         }
         // Keys are then read from the terminal itself, /dev/tty.
-        Source::Stdin => (PathBuf::from(STDIN_NAME), io::read_to_string(io::stdin())),
+        Source::Stdin => (PathBuf::from(STDIN_NAME), read_stdin()),
     };
     let watcher = watch::Watcher::new(path.clone());
     let source = if from_stdin {
@@ -382,6 +406,24 @@ mod tests {
         let null = std::fs::File::open("/dev/null").unwrap();
         assert!(!is_piped(null.as_raw_fd()));
         assert!(!is_piped(-1));
+    }
+
+    #[test]
+    fn the_stdin_hint_shows_only_for_a_pipe_when_stderr_is_a_terminal() {
+        use std::os::fd::AsRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: pipe writes two descriptors into fds.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(shows_stdin_hint(fds[0], true));
+        assert!(!shows_stdin_hint(fds[0], false));
+        // SAFETY: both descriptors are ours and closed once.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        let file = std::fs::File::open("Cargo.toml").unwrap();
+        assert!(!shows_stdin_hint(file.as_raw_fd(), true));
+        assert!(!shows_stdin_hint(-1, true));
     }
 
     #[test]

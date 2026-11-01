@@ -33,4 +33,7 @@ syntect = { version = "=5.3.0", default-features = false, features = ["parsing",
 toml = { version = "=1.1.8", default-features = false, features = ["std", "serde", "parse"] }
 two-face = { version = "=0.5.2", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "=0.2.2"
+# Fetches web images when `remote_images` is on. rustls with ring and the
+# webpki roots: no OpenSSL, no async runtime.
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }

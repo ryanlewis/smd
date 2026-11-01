@@ -12,6 +12,9 @@
 //! # Whether smd takes the mouse, to follow clicked links and scroll with
 //! # the wheel. Without it, links are hyperlinks the terminal opens.
 //! mouse = true
+//! # Whether images on the web (http and https) are fetched and shown.
+//! # `--remote-images` and `--no-remote-images` override it.
+//! remote_images = false
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -230,6 +233,8 @@ struct File {
     code_background: Option<String>,
     mouse: Option<bool>,
     #[serde(default)]
+    remote_images: bool,
+    #[serde(default)]
     mermaid: Renderer,
     #[serde(default)]
     tasks: Tasks,
@@ -247,6 +252,8 @@ pub struct Config {
     pub code_background: Option<Rgb>,
     /// Whether smd takes the mouse, to follow clicked links and scroll.
     pub mouse: bool,
+    /// Whether images on the web are fetched and shown.
+    pub remote_images: bool,
     /// What draws mermaid diagrams.
     pub mermaid: Renderer,
     /// Whether task checkboxes can be ticked.
@@ -312,6 +319,7 @@ impl Config {
             web_links: file.web_links,
             code_background,
             mouse: file.mouse.unwrap_or(true),
+            remote_images: file.remote_images,
             mermaid: file.mermaid,
             tasks: file.tasks,
             keys,
@@ -395,6 +403,7 @@ mod tests {
         assert_eq!(c.home, None);
         assert_eq!(c.code_background, None);
         assert!(c.mouse);
+        assert!(!c.remote_images);
     }
 
     #[test]
@@ -438,7 +447,7 @@ mod tests {
     #[test]
     fn naming_an_action_replaces_its_keys() {
         let c = Config::from_str(
-            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\nmermaid = \"mmdc\"\ntasks = \"read_only\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
+            "home = \"/n/HOME.md\"\nweb_links = \"copy\"\ncode_background = \"#20242A\"\nmouse = false\nremote_images = true\nmermaid = \"mmdc\"\ntasks = \"read_only\"\n[keys]\nback = [\"h\", \"ctrl-o\"]\n",
         )
         .unwrap();
         let none = KeyModifiers::NONE;
@@ -455,6 +464,7 @@ mod tests {
         assert_eq!(c.home, Some(PathBuf::from("/n/HOME.md")));
         assert_eq!(c.code_background, Some((0x20, 0x24, 0x2a)));
         assert!(!c.mouse);
+        assert!(c.remote_images);
         assert_eq!(c.mermaid, Renderer::Mmdc);
         assert_eq!(c.tasks, Tasks::ReadOnly);
     }

@@ -26,7 +26,7 @@ use resvg::usvg::fontdb::Database;
 
 use crate::doc::{Block, BlockKind, FigureKind};
 use crate::theme;
-use crate::{heading, kitty, maths, mermaid, raster};
+use crate::{heading, kitty, maths, mermaid, raster, remote};
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -365,7 +365,7 @@ impl Images {
 /// the note on screen.
 pub fn key(block: &Block) -> Option<Key> {
     match &block.kind {
-        BlockKind::Image { src, .. } if is_local(src) => Some(Key(format!("file:{src}"))),
+        BlockKind::Image { src, .. } => image_key(src, remote::enabled()),
         BlockKind::Figure {
             kind: FigureKind::Math,
             source,
@@ -384,11 +384,24 @@ pub fn key(block: &Block) -> Option<Key> {
     }
 }
 
+/// The key of the image at `src`: a local file, or a web image when `remote`
+/// is on. Other images are left as text.
+fn image_key(src: &str, remote: bool) -> Option<Key> {
+    if is_local(src) {
+        Some(Key(format!("file:{src}")))
+    } else if remote && remote::is_remote(src) {
+        Some(Key(format!("url:{src}")))
+    } else {
+        None
+    }
+}
+
 /// The image a block is drawn as and how to make it. Relative paths are taken
 /// from `base`, the directory of the markdown file.
 pub fn wanted(block: &Block, base: &Path) -> Option<(Key, Job)> {
     let mut key = key(block)?;
     let job: Job = match &block.kind {
+        BlockKind::Image { src, .. } if key.0.starts_with("url:") => remote::job(src.clone()),
         BlockKind::Image { src, .. } => {
             key = path_key(base, src);
             let paths: Vec<_> = candidates(src).map(|src| base.join(src)).collect();
@@ -462,7 +475,7 @@ fn candidates(src: &str) -> impl Iterator<Item = String> {
     })
 }
 
-/// Images on the web are left as text.
+/// Images on the web are not files.
 pub(crate) fn is_local(src: &str) -> bool {
     !src.is_empty() && !src.contains("://") && !src.starts_with("data:")
 }
@@ -503,14 +516,47 @@ fn load(path: &Path) -> Result<Png, String> {
             .is_some_and(|e| e.eq_ignore_ascii_case(ext))
     };
     if named("svg") || named("svgz") {
-        svg(&data, path.parent())
-    } else if data.starts_with(b"GIF8") {
+        svg(&data, Hrefs::Beside(path.parent()))
+    } else {
+        raster_image(data)
+    }
+}
+
+/// A GIF, JPEG or PNG, told apart by their first bytes.
+fn raster_image(data: Vec<u8>) -> Result<Png, String> {
+    if data.starts_with(b"GIF8") {
         gif(&data)
     } else if data.starts_with(b"\xff\xd8\xff") {
         jpeg(&data)
     } else {
         Png::new(data)
     }
+}
+
+/// An image from the web, told apart by its bytes, as servers often give
+/// the wrong type and URLs often have no extension. An SVG may only use
+/// images inside itself, never files or other URLs.
+pub fn decode_remote(data: Vec<u8>) -> Result<Png, String> {
+    if looks_like_svg(&data) {
+        svg(&data, Hrefs::Embedded)
+    } else {
+        raster_image(data)
+    }
+}
+
+/// Whether `data` is an SVG, or a gzipped one: an `<svg` tag near the start,
+/// past any XML declaration, comments or doctype.
+fn looks_like_svg(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(4096)];
+    head.starts_with(b"\x1f\x8b") || head.windows(4).any(|w| w == b"<svg")
+}
+
+/// The images an SVG may draw.
+enum Hrefs<'a> {
+    /// Files beside it, in this directory, and `data:` URLs.
+    Beside(Option<&'a Path>),
+    /// Only `data:` URLs.
+    Embedded,
 }
 
 /// The most pixels a GIF's screen may have.
@@ -551,14 +597,18 @@ fn gif(data: &[u8]) -> Result<Png, String> {
 const SVG_SCALE: f32 = 2.0;
 
 /// An SVG, drawn at [`SVG_SCALE`], or smaller to keep within
-/// [`GIF_MAX_PIXELS`]. Images it names are read from `dir`; text is set in
-/// the fonts mermaid labels use.
-fn svg(data: &[u8], dir: Option<&Path>) -> Result<Png, String> {
-    let options = resvg::usvg::Options {
-        resources_dir: dir.map(Path::to_path_buf),
+/// [`GIF_MAX_PIXELS`]. Images it names are found as `hrefs` says; text is
+/// set in the fonts mermaid labels use.
+fn svg(data: &[u8], hrefs: Hrefs) -> Result<Png, String> {
+    let mut options = resvg::usvg::Options {
         fontdb: svg_fonts().clone(),
         ..Default::default()
     };
+    match hrefs {
+        Hrefs::Beside(dir) => options.resources_dir = dir.map(Path::to_path_buf),
+        // usvg reads any other href as a file path; refuse them all.
+        Hrefs::Embedded => options.image_href_resolver.resolve_string = Box::new(|_, _| None),
+    }
     let fallbacks = std::str::from_utf8(data).ok().map(css_fallbacks);
     let data = fallbacks.as_deref().map_or(data, str::as_bytes);
     let tree = resvg::usvg::Tree::from_data(data, &options).map_err(|e| format!("SVG: {e}"))?;
@@ -828,6 +878,59 @@ pub mod tests {
         let doc = parse("![a](pics/a.png)\n\n![b](https://x.org/b.png)\n\ntext\n");
         let keys: Vec<Option<Key>> = doc.blocks.iter().map(key).collect();
         assert_eq!(keys, vec![Some(file_key("pics/a.png")), None, None]);
+    }
+
+    #[test]
+    fn web_images_have_a_key_only_when_turned_on() {
+        let url = "https://x.org/b.png";
+        assert_eq!(image_key(url, false), None);
+        assert_eq!(image_key(url, true), Some(Key(format!("url:{url}"))));
+        assert_eq!(
+            image_key("HTTP://x.org/b", true),
+            Some(Key("url:HTTP://x.org/b".into()))
+        );
+        // Only http and https are fetched.
+        assert_eq!(image_key("ftp://x.org/b.png", true), None);
+        assert_eq!(image_key("data:image/png;base64,AA", true), None);
+        assert_eq!(image_key("a.png", true), Some(file_key("a.png")));
+    }
+
+    #[test]
+    fn a_web_image_is_told_by_its_bytes() {
+        let red = svg_bytes(5, 3, "<rect width='5' height='3' fill='red'/>");
+        let xml = [
+            b"<?xml version='1.0'?>\n<!-- made by hand -->\n".to_vec(),
+            red.clone(),
+        ]
+        .concat();
+        for data in [red, xml] {
+            let png = decode_remote(data).unwrap();
+            assert_eq!((png.width, png.height), (10, 6));
+        }
+        let jpeg = include_bytes!("../tests/fixtures/red-5x3.jpg").to_vec();
+        assert_eq!(decode_remote(jpeg).unwrap().width, 5);
+        assert_eq!(decode_remote(png(7, 8)).unwrap().width, 7);
+        assert!(decode_remote(b"<html>not found</html>".to_vec()).is_err());
+    }
+
+    #[test]
+    fn a_web_svg_reads_no_files() {
+        let dir = std::env::temp_dir().join(format!("smd-images-web-svg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpeg = dir.join("red.jpg");
+        std::fs::write(&jpeg, include_bytes!("../tests/fixtures/red-5x3.jpg")).unwrap();
+        let body = format!(
+            "<image xlink:href='{}' width='5' height='3'/>",
+            jpeg.display()
+        );
+        let data = svg_bytes(5, 3, &body);
+        // The same SVG as a file beside the image draws it.
+        std::fs::write(dir.join("a.svg"), &data).unwrap();
+        let local = load(&dir.join("a.svg")).unwrap();
+        let web = decode_remote(data).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pixels_rgba(&local)[0][3], 255);
+        assert!(pixels_rgba(&web).iter().all(|p| p[3] == 0));
     }
 
     #[test]

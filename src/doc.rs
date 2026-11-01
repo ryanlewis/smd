@@ -244,9 +244,8 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
     // find anywhere, not only at the start.
     let start = match frontmatter(source) {
         Some((block, span)) => {
-            let end = span.end;
-            builder.push_block(BlockKind::Frontmatter(block), span);
-            end
+            builder.push_block(BlockKind::Frontmatter(block), span.clone());
+            span.end
         }
         None => 0,
     };
@@ -256,20 +255,24 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
     builder.finish()
 }
 
-/// The frontmatter block at the very start of `source`, and its span.
+/// The frontmatter block at the very start of `source`, after any byte
+/// order mark, and its span.
 fn frontmatter(source: &str) -> Option<(Frontmatter, Range<usize>)> {
-    if !source.starts_with("---") && !source.starts_with("+++") {
+    let bom = if source.starts_with('\u{feff}') { 3 } else { 0 };
+    let text = &source[bom..];
+    if !text.starts_with("---") && !text.starts_with("+++") {
         return None;
     }
     let options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
-    let mut events = Parser::new_ext(source, options).into_offset_iter();
+    let mut events = Parser::new_ext(text, options).into_offset_iter();
     let (Event::Start(Tag::MetadataBlock(kind)), span) = events.next()? else {
         return None;
     };
     if span.start != 0 {
         return None;
     }
+    let span = 0..span.end + bom;
     let mut raw = String::new();
     for (event, _) in events {
         match event {
@@ -292,10 +295,11 @@ fn properties(yaml: &str) -> Option<Vec<(String, String)>> {
     let mut props: Vec<(String, String, Vec<&str>)> = Vec::new();
     for line in yaml.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        let indented = line.starts_with([' ', '\t']);
+        // An indented `#` line may be the text of a block scalar.
+        if trimmed.is_empty() || (!indented && trimmed.starts_with('#')) {
             continue;
         }
-        let indented = line.starts_with([' ', '\t']);
         if indented || is_item(trimmed) {
             let (_, after, under) = props.last_mut()?;
             // A list may start at the key's column, but not after a value.
@@ -315,12 +319,10 @@ fn properties(yaml: &str) -> Option<Vec<(String, String)>> {
             Vec::new(),
         ));
     }
-    let props = props.into_iter();
-    Some(
-        props
-            .map(|(k, after, under)| (k, value(&after, &under)))
-            .collect(),
-    )
+    let props = props
+        .into_iter()
+        .map(|(k, after, under)| (k, value(&after, &under)));
+    Some(props.collect())
 }
 
 fn is_item(line: &str) -> bool {
@@ -330,9 +332,10 @@ fn is_item(line: &str) -> bool {
 /// A property's value from the text after its key and the lines under it.
 fn value(after: &str, under: &[&str]) -> String {
     if under.is_empty() {
-        return match after.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-            Some(flow) if !flow.contains(['[', '{']) => list(flow.split(',')),
-            _ => unquote(after).to_string(),
+        let flow = after.strip_prefix('[').and_then(|v| v.strip_suffix(']'));
+        return match flow.and_then(flow_items) {
+            Some(items) => list(items.into_iter()),
+            None => unquote(after).to_string(),
         };
     }
     if after.is_empty() && under.iter().all(|l| is_item(l.trim())) {
@@ -354,9 +357,32 @@ fn list<'a>(items: impl Iterator<Item = &'a str>) -> String {
         .join(", ")
 }
 
-/// Lines with the indent they share taken off.
+/// The items of a flow list's inside, split at commas outside quotes, or
+/// `None` when it nests a list or map.
+fn flow_items(flow: &str) -> Option<Vec<&str>> {
+    let mut items = Vec::new();
+    let mut quote = None;
+    let mut start = 0;
+    for (i, c) in flow.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '[' | '{') => return None,
+            (None, ',') => {
+                items.push(&flow[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&flow[start..]);
+    Some(items)
+}
+
+/// Lines with the indent of spaces and tabs they share taken off.
 fn dedent<'a>(lines: &[&'a str]) -> Vec<&'a str> {
-    let indent = |l: &str| l.len() - l.trim_start().len();
+    let indent = |l: &str| l.len() - l.trim_start_matches([' ', '\t']).len();
     let common = lines.iter().map(|l| indent(l)).min().unwrap_or(0);
     lines.iter().map(|l| l[common..].trim_end()).collect()
 }
@@ -1835,5 +1861,36 @@ heading 2 @17..26
     #[test]
     fn an_unclosed_block_is_not_frontmatter() {
         assert_outline("---\na: b\n", "rule @0..4\nparagraph @4..9\n  \"a: b\"\n");
+    }
+
+    #[test]
+    fn frontmatter_review_cases() {
+        let props = |md: &str| match &parse(md).blocks[0].kind {
+            BlockKind::Frontmatter(f) => f.properties.clone(),
+            other => panic!("expected frontmatter, got {other:?}"),
+        };
+        let one = |k: &str, v: &str| Some(vec![(k.to_string(), v.to_string())]);
+        // A no-break space in an indent does not split a character.
+        assert_eq!(
+            props("---\nauthor:\n  name: Ann\n \u{a0}url: x\n---\n"),
+            one("author", " name: Ann\n\u{a0}url: x")
+        );
+        // A `#` line under a key is its text, not a comment.
+        assert_eq!(
+            props("---\nnotes: |\n  # Heading\n  body\n---\n"),
+            one("notes", "|\n# Heading\nbody")
+        );
+        // Quoted flow list items keep their brackets and commas.
+        assert_eq!(
+            props("---\nrelated: [\"[[Note A]]\", \"[[Note B]]\"]\n---\n"),
+            one("related", "[[Note A]], [[Note B]]")
+        );
+        assert_eq!(
+            props("---\nauthors: [\"Doe, Jane\", Smith]\n---\n"),
+            one("authors", "Doe, Jane, Smith")
+        );
+        assert_eq!(props("---\nx: [a, [b]]\n---\n"), one("x", "[a, [b]]"));
+        // A byte order mark before the block.
+        assert_eq!(props("\u{feff}---\nk: v\n---\n"), one("k", "v"));
     }
 }

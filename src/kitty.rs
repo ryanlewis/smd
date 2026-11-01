@@ -244,7 +244,7 @@ fn query(shm: Option<&str>) -> Option<Vec<u8>> {
     if !was_raw {
         terminal::enable_raw_mode().ok()?;
     }
-    let reply = exchange(&mut io::stdout(), fd, REPLY_TIMEOUT, shm);
+    let reply = exchange(&mut io::stdout(), fd, REPLY_TIMEOUT, GRAPHICS_GRACE, shm);
     if !was_raw {
         let _ = terminal::disable_raw_mode();
     }
@@ -252,12 +252,14 @@ fn query(shm: Option<&str>) -> Option<Vec<u8>> {
 }
 
 /// Send the queries to `out` and read the replies from `fd` until the DA1
-/// reply or until `timeout` has passed since they were sent.
+/// reply or until `timeout` has passed since they were sent. Graphics replies
+/// that come after the DA1 reply are waited for up to `grace` longer.
 #[cfg(unix)]
 fn exchange(
     out: &mut impl Write,
     fd: libc::c_int,
     timeout: Duration,
+    grace: Duration,
     shm: Option<&str>,
 ) -> Vec<u8> {
     // On the alternate screen, so a terminal that prints the graphics query
@@ -286,7 +288,7 @@ fn exchange(
         parse_graphics_reply(buf) && (shm.is_none() || graphics_reply(buf, SHM_QUERY_ID).is_some())
     };
     if has_da1_reply(&reply) && !graphics_done(&reply) {
-        reply = read_replies(reply, Instant::now() + GRAPHICS_GRACE, graphics_done, read);
+        reply = read_replies(reply, Instant::now() + grace, graphics_done, read);
     }
     let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
     reply
@@ -809,7 +811,10 @@ mod tests {
         let mut out = Vec::new();
         let timeout = Duration::from_secs(10);
         let start = Instant::now();
-        assert_eq!(exchange(&mut out, pipe.read, timeout, None), reply);
+        assert_eq!(
+            exchange(&mut out, pipe.read, timeout, GRAPHICS_GRACE, None),
+            reply
+        );
         assert!(start.elapsed() < timeout);
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -830,11 +835,17 @@ mod tests {
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
         });
-        let reply = exchange(&mut Vec::new(), pipe.read, timeout, None);
+        let reply = exchange(&mut Vec::new(), pipe.read, timeout, GRAPHICS_GRACE, None);
         terminal.join().unwrap();
         assert_eq!(reply, b"\x1b[6;16;8t\x1b[?62c");
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
     }
+
+    /// A grace far longer than the late replies below take, so a busy test
+    /// machine that wakes the writer late does not fail them. The wait ends
+    /// as soon as the replies are in.
+    #[cfg(unix)]
+    const LONG_GRACE: Duration = Duration::from_secs(10);
 
     #[cfg(unix)]
     #[test]
@@ -844,12 +855,12 @@ mod tests {
         let pipe = Pipe::new(b"\x1b[6;16;8t\x1b[?62;22c", false);
         let write = pipe.write.unwrap();
         let terminal = std::thread::spawn(move || {
-            std::thread::sleep(GRAPHICS_GRACE / 4);
+            std::thread::sleep(Duration::from_millis(25));
             let reply = b"\x1b_Gi=31;OK\x1b\\";
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, reply.as_ptr().cast(), reply.len()) };
         });
-        let reply = exchange(&mut Vec::new(), pipe.read, REPLY_TIMEOUT, None);
+        let reply = exchange(&mut Vec::new(), pipe.read, REPLY_TIMEOUT, LONG_GRACE, None);
         terminal.join().unwrap();
         assert!(parse_graphics_reply(&reply));
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
@@ -863,13 +874,19 @@ mod tests {
         let pipe = Pipe::new(b"\x1b[?62;22c\x1b_Gi=31;OK\x1b\\", false);
         let write = pipe.write.unwrap();
         let terminal = std::thread::spawn(move || {
-            std::thread::sleep(GRAPHICS_GRACE / 4);
+            std::thread::sleep(Duration::from_millis(25));
             let reply = b"\x1b_Gi=32;OK\x1b\\";
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, reply.as_ptr().cast(), reply.len()) };
         });
         let mut out = Vec::new();
-        let reply = exchange(&mut out, pipe.read, REPLY_TIMEOUT, Some("/smd-1-0"));
+        let reply = exchange(
+            &mut out,
+            pipe.read,
+            REPLY_TIMEOUT,
+            LONG_GRACE,
+            Some("/smd-1-0"),
+        );
         terminal.join().unwrap();
         assert!(parse_shm_reply(&reply));
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
@@ -884,7 +901,13 @@ mod tests {
     fn da1_without_graphics_waits_only_the_grace() {
         let pipe = Pipe::new(b"\x1b[?62c", false);
         let start = Instant::now();
-        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10), None);
+        let reply = exchange(
+            &mut Vec::new(),
+            pipe.read,
+            Duration::from_secs(10),
+            GRAPHICS_GRACE,
+            None,
+        );
         assert_eq!(reply, b"\x1b[?62c");
         assert!(start.elapsed() < Duration::from_secs(1));
     }
@@ -896,7 +919,16 @@ mod tests {
         // before the timeout: only the outcome is checked, not the time.
         let pipe = Pipe::new(b"", false);
         let mut out = Vec::new();
-        assert!(exchange(&mut out, pipe.read, Duration::from_millis(20), None).is_empty());
+        assert!(
+            exchange(
+                &mut out,
+                pipe.read,
+                Duration::from_millis(20),
+                GRAPHICS_GRACE,
+                None
+            )
+            .is_empty()
+        );
         assert!(out.ends_with(b"\x1b[?1049l"));
     }
 
@@ -931,7 +963,13 @@ mod tests {
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
         });
-        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10), None);
+        let reply = exchange(
+            &mut Vec::new(),
+            pipe.read,
+            Duration::from_secs(10),
+            GRAPHICS_GRACE,
+            None,
+        );
         terminal.join().unwrap();
         // SAFETY: puts back the handler saved above.
         unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) };
@@ -958,7 +996,7 @@ mod tests {
     fn exchange_reads_nothing_when_the_queries_cannot_be_sent() {
         // The replies would be there, but no query went out to ask for them.
         let pipe = Pipe::new(b"\x1b[?62c", true);
-        assert!(exchange(&mut Broken, pipe.read, REPLY_TIMEOUT, None).is_empty());
+        assert!(exchange(&mut Broken, pipe.read, REPLY_TIMEOUT, GRAPHICS_GRACE, None).is_empty());
         assert_eq!(
             read_chunk(pipe.read, REPLY_TIMEOUT).as_deref(),
             Some(&b"\x1b[?62c"[..])

@@ -16,6 +16,8 @@ exclude = ["/docs", "/.github", "/renovate.json", "/.editorconfig", "/.gorelease
 [dependencies]
 ab_glyph = { version = "=0.2.32", default-features = false, features = ["std"] }
 clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+# GitHub's emoji shortcodes, such as :tada:.
+emojis = { version = "=0.9.0", default-features = false }
 gif = { version = "=0.14.2", default-features = false, features = ["std"] }
 latex-rust = { version = "=3.0.1", default-features = false, features = ["png"] }
 libc = "=0.2.191"

@@ -23,6 +23,7 @@ use ratatui::{DefaultTerminal, Frame, Terminal};
 use crate::config::{Action, Config, Tasks, WebLinks};
 use crate::doc::{self, BlockKind, Document, Inline, Link};
 use crate::embed;
+use crate::help;
 use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
@@ -99,6 +100,8 @@ pub enum Go {
     Say(String),
     /// Read the file again.
     Reload,
+    /// Show the help page.
+    Help,
 }
 
 /// The block at the top of the view, found again after the document is laid
@@ -568,6 +571,7 @@ impl View {
             Action::NextMatch => return Some(self.next_match(true)),
             Action::PrevMatch => return Some(self.next_match(false)),
             Action::Reload => return Some(Go::Reload),
+            Action::Help => return Some(Go::Help),
         }
         None
     }
@@ -913,8 +917,8 @@ pub struct Browser {
     view: View,
     path: PathBuf,
     watcher: Watcher,
-    /// The note on screen was read from stdin: it has no file to reload or
-    /// tick tasks in.
+    /// The note on screen was read from stdin, or is the help page: it has
+    /// no file to reload or tick tasks in.
     piped: bool,
     vault: Vault,
     config: Config,
@@ -1080,6 +1084,21 @@ impl Browser {
         true
     }
 
+    /// Show the help page as a note of its own, so Back returns from it.
+    /// Like a note read from stdin, it has no file to reload or tick tasks
+    /// in.
+    fn help(&mut self) {
+        let path = self.vault.root.join(HELP_NAME);
+        if self.piped && self.path == path {
+            return;
+        }
+        let here = self.here();
+        self.ahead.clear();
+        let page = help::page(&self.config);
+        self.show(path, &page, true);
+        self.remember(here);
+    }
+
     /// Read the file again by hand, as the watcher does when it changes.
     fn reload(&mut self) {
         // The path of a note read from stdin is made up.
@@ -1109,6 +1128,7 @@ impl Browser {
             Go::Fold(at) => self.view.fold(at),
             Go::Say(notice) => self.say(notice),
             Go::Reload => self.reload(),
+            Go::Help => self.help(),
         }
     }
 
@@ -1445,6 +1465,9 @@ fn open_with_system(target: &str) -> io::Result<()> {
 /// The toolbar's buttons, as drawn from its left edge.
 const BACK_BUTTON: &str = " ← Back ";
 const FORWARD_BUTTON: &str = " Forward → ";
+
+/// The name the help page goes by on the toolbar.
+const HELP_NAME: &str = "help";
 
 /// How many notes each way along Back and Forward keep their images.
 const KEEP_IMAGES_OF: usize = 8;
@@ -2133,6 +2156,40 @@ mod tests {
         assert_eq!(b.path, path);
         assert!(b.piped && !b.view.tasks);
         assert_eq!(b.view.doc.source, source);
+    }
+
+    #[test]
+    fn question_mark_opens_the_help_with_the_keys_as_bound_and_back_returns() {
+        let (mut b, dir) = browser("help", &[("a.md", &paragraphs(30))]);
+        b.config = Config::from_str("[keys]\ndown = [\"J\", \"j\"]").unwrap();
+        press_all(&mut b, "5j");
+        assert_eq!(b.view.scroll, 5);
+        press_all(&mut b, "?");
+        let source = b.view.doc.source.clone();
+        assert!(source.contains("| `J`, `j` | `down` |"), "{source}");
+        assert!(b.toolbar().to_string().trim_end().ends_with(" help"));
+        assert_eq!(b.view.scroll, 0);
+        // It is a note like any other: it scrolls and can be searched.
+        press_all(&mut b, "J");
+        assert_eq!(b.view.scroll, 1);
+        press_all(&mut b, "/reload");
+        enter(&mut b, KeyCode::Enter);
+        assert!(status_row(&mut b).starts_with("match 1/"));
+        // But it has no file: nothing to reload, and no tasks.
+        press_all(&mut b, "r");
+        assert!(status_row(&mut b).starts_with("nothing to reload"));
+        assert!(!b.view.tasks);
+        // Asking again does not stack another page to go back through.
+        press_all(&mut b, "?");
+        assert_eq!(b.history.len(), 1);
+        enter(&mut b, KeyCode::Backspace);
+        assert_eq!(b.path, dir.join("a.md"));
+        assert_eq!(b.view.scroll, 5);
+        assert!(!b.piped);
+        // Forward shows it again, from where it was left.
+        enter(&mut b, KeyCode::Char('L'));
+        assert_eq!(b.view.doc.source, source);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub enum Action {
     NextMatch,
     PrevMatch,
     Reload,
+    Help,
 }
 
 impl Action {
@@ -80,6 +81,7 @@ impl Action {
             Action::NextMatch => &["n"],
             Action::PrevMatch => &["N"],
             Action::Reload => &["r"],
+            Action::Help => &["?"],
         }
     }
 
@@ -92,7 +94,8 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 19] = [
+    /// Every action, in the order the help lists them.
+    pub(crate) const ALL: [Action; 20] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -112,6 +115,7 @@ impl Action {
         Action::NextMatch,
         Action::PrevMatch,
         Action::Reload,
+        Action::Help,
     ];
 }
 
@@ -271,6 +275,8 @@ pub struct Config {
     /// Whether task checkboxes can be ticked.
     pub tasks: Tasks,
     keys: HashMap<Key, Action>,
+    /// Each action's keys, named as the config or the defaults write them.
+    names: HashMap<Action, Vec<String>>,
 }
 
 impl Default for Config {
@@ -304,7 +310,8 @@ impl Config {
     pub(crate) fn from_str(text: &str) -> Result<Config, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_string())?;
         let mut keys = HashMap::new();
-        // The search keys came after configs were written that may use
+        let mut key_names: HashMap<Action, Vec<String>> = HashMap::new();
+        // The search and help keys came after configs were written that may use
         // them, so they give way to a key the config names.
         let named: Vec<Key> = file
             .keys
@@ -322,7 +329,7 @@ impl Config {
                 let key = Key::parse(name)?;
                 let newer = matches!(
                     action,
-                    Action::Search | Action::NextMatch | Action::PrevMatch
+                    Action::Search | Action::NextMatch | Action::PrevMatch | Action::Help
                 );
                 if given.is_none() && newer && named.contains(&key) {
                     continue;
@@ -334,6 +341,7 @@ impl Config {
                         "key \"{name}\" is set for both {other:?} and {action:?}"
                     ));
                 }
+                key_names.entry(action).or_default().push(name.to_string());
             }
         }
         let code_background = match file.code_background.as_deref() {
@@ -351,6 +359,7 @@ impl Config {
             mermaid: file.mermaid,
             tasks: file.tasks,
             keys,
+            names: key_names,
         })
     }
 
@@ -358,10 +367,16 @@ impl Config {
     pub fn action(&self, event: KeyEvent) -> Option<Action> {
         self.keys.get(&Key::of(event)).copied()
     }
+
+    /// The keys bound to `action`, by name; none when the config gives it
+    /// none.
+    pub fn key_names(&self, action: Action) -> &[String] {
+        self.names.get(&action).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Where the config file is.
-fn path() -> Option<PathBuf> {
+pub fn path() -> Option<PathBuf> {
     path_in(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
@@ -432,6 +447,18 @@ mod tests {
         assert_eq!(c.code_background, None);
         assert!(c.mouse);
         assert!(!c.remote_images);
+    }
+
+    #[test]
+    fn the_help_key_gives_way_to_a_config_that_names_it() {
+        let c = Config::from_str("[keys]\nquit = [\"?\"]").unwrap();
+        let none = KeyModifiers::NONE;
+        assert_eq!(
+            c.action(press(KeyCode::Char('?'), none)),
+            Some(Action::Quit)
+        );
+        assert!(c.key_names(Action::Help).is_empty());
+        assert_eq!(Config::default().key_names(Action::Help), ["?"]);
     }
 
     #[test]

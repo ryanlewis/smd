@@ -166,7 +166,8 @@ impl View {
     /// false when there is neither.
     pub fn jump_to_heading(&mut self, wanted: &str) -> bool {
         let anchor = self.doc.anchor(wanted);
-        let Some(at) = anchor.or_else(|| heading_start(&self.doc.blocks, wanted)) else {
+        let Some(at) = anchor.or_else(|| heading_start(&self.doc.source, &self.doc.blocks, wanted))
+        else {
             return false;
         };
         self.open_folds_around(at);
@@ -559,8 +560,9 @@ impl View {
 }
 
 /// Where the first heading matching `wanted` starts in the source, looking
-/// inside quotes and lists too.
-fn heading_start(blocks: &[doc::Block], wanted: &str) -> Option<usize> {
+/// inside quotes and lists too. A heading matches by its text or, as one
+/// with `:tada:` in it is shown with an emoji, by its source.
+fn heading_start(source: &str, blocks: &[doc::Block], wanted: &str) -> Option<usize> {
     blocks.iter().find_map(|b| match &b.kind {
         BlockKind::Heading { content, .. } => {
             let text: String = content
@@ -570,17 +572,19 @@ fn heading_start(blocks: &[doc::Block], wanted: &str) -> Option<usize> {
                     Inline::Break => " ",
                 })
                 .collect();
-            vault::heading_matches(&text, wanted).then_some(b.span.start)
+            let typed = source.get(b.span.clone()).unwrap_or("");
+            (vault::heading_matches(&text, wanted) || vault::heading_matches(typed, wanted))
+                .then_some(b.span.start)
         }
         BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
-            heading_start(inner, wanted)
+            heading_start(source, inner, wanted)
         }
         BlockKind::List { items, .. } => items
             .iter()
-            .find_map(|item| heading_start(&item.blocks, wanted)),
+            .find_map(|item| heading_start(source, &item.blocks, wanted)),
         BlockKind::Definition { definitions, .. } => definitions
             .iter()
-            .find_map(|details| heading_start(details, wanted)),
+            .find_map(|details| heading_start(source, details, wanted)),
         _ => None,
     })
 }
@@ -1929,6 +1933,12 @@ mod tests {
         assert!(v.jump_to_heading("next-steps"));
         assert_eq!(top(&v), "Next steps");
         assert!(!v.jump_to_heading("nowhere"));
+        // A heading shown with an emoji for its shortcode.
+        let md = format!("# Top\n\n{0}## :tada: Release\n\n{0}", paragraphs(10));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        assert!(v.jump_to_heading("tada-release"));
+        assert_eq!(top(&v), "🎉 Release");
     }
 
     #[test]

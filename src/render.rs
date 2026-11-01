@@ -545,11 +545,26 @@ fn definition(
     ctx: &mut Ctx,
 ) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
-    let links = wrap(term, bold, width, first, rest, &mut ctx.layout.lines);
-    ctx.layout.links.extend(links);
     let indent = with(rest, Span::raw(" ".repeat(DEFINITION_INDENT)));
-    for details in definitions {
-        blocks(details, width, &indent, &indent, false, ctx);
+    // With no term, as when it was only an image left out for the theme, the
+    // first definition takes its line.
+    let mut lead = &indent;
+    let after_first = with(first, Span::raw(" ".repeat(DEFINITION_INDENT)));
+    if term.is_empty() {
+        lead = &after_first;
+    } else {
+        let links = wrap(term, bold, width, first, rest, &mut ctx.layout.lines);
+        ctx.layout.links.extend(links);
+    }
+    for (i, details) in definitions.iter().enumerate() {
+        blocks(
+            details,
+            width,
+            if i == 0 { lead } else { &indent },
+            &indent,
+            false,
+            ctx,
+        );
     }
 }
 
@@ -1134,7 +1149,7 @@ impl<'a> Lines<'a> {
 /// `s` in the pieces a line may break between: each character with those
 /// after it that draw nothing, such as the U+FE0F that makes ❤ an emoji two
 /// columns wide, and those joined to it by U+200D.
-fn clusters(s: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn clusters(s: &str) -> impl Iterator<Item = &str> {
     let mut rest = s;
     std::iter::from_fn(move || {
         let mut chars = rest.char_indices();
@@ -1409,6 +1424,16 @@ mod tests {
             span.style.add_modifier.contains(Modifier::BOLD)
         };
         assert!(bold(0) && bold(5) && !bold(1));
+        // A term that was only a logo for the other background leaves no
+        // blank line.
+        let md = "![](logo.png#gh-dark-mode-only)\n: def\n";
+        let layout = render(
+            &crate::doc::parse_for(md, Some(crate::theme::Theme::Light)),
+            16,
+            &no_images(),
+        );
+        let lines: Vec<String> = layout.lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(lines, ["    def"]);
     }
 
     #[test]

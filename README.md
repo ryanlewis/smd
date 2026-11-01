@@ -219,7 +219,7 @@ smd also reads markdown piped into it, or from stdin when the file is `-`:
 gh pr view --json body -q .body | smd
 ```
 
-Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
+While smd waits for the command feeding it to finish, it shows `reading stdin…`. Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
 
 ### Keys
 
@@ -250,7 +250,7 @@ The keys can be changed in the [config](#config).
 
 ### Search
 
-Press `/` and type a term. Matches are marked as you type, and the bottom row says how many there are. Enter goes to the first match from the top of the screen; `n` and `N` go to the next and previous match, going round at the end and saying so. Esc while typing gives the search up, and Esc after it clears the marks (the next Esc quits). The search ignores case unless the term has a capital letter in it. It looks at the text as drawn, code blocks and table cells included, not the markdown source, and a heading drawn as an image is found by its text.
+Press `/` and type a term. Matches are marked as you type, and the bottom row says how many there are. Enter goes to the first match from the top of the screen; `n` and `N` go to the next and previous match, going round at the end and saying so. A number before them steps that many matches, so `3n` goes three on. The match you are on stays the one you are on when the note is laid out again, such as when images load or the window is resized. Esc while typing gives the search up, and Esc after it clears the marks (the next Esc quits). The search ignores case unless the term has a capital letter in it. It looks at the text as drawn, code blocks and table cells included, not the markdown source, and a heading drawn as an image is found by its text.
 
 ### Mouse
 

@@ -7,6 +7,7 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -1530,12 +1531,42 @@ pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<(
     result.and(deleted)
 }
 
+/// Set by SIGTERM or SIGHUP. The run loop sees it and ends as if the reader
+/// had quit, so the terminal is restored and the images removed.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Make SIGTERM and SIGHUP end the run loop rather than the process at once.
+/// Ctrl-C is a key while the terminal is raw, so it is left alone.
+#[cfg(unix)]
+pub fn stop_on_signals() {
+    // Only stores to an atomic, which is safe in a signal handler.
+    extern "C" fn on_signal(_: libc::c_int) {
+        STOP.store(true, Ordering::Relaxed);
+    }
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: a zeroed sigaction is valid; the handler is async-signal
+        // safe. SA_RESTART keeps other system calls from failing with EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn stop_on_signals() {}
+
 /// Where the run loop gets the terminal's events and the time, so a test
 /// can stand in for both.
 trait Input {
     fn now(&self) -> Instant;
     fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
     fn read(&mut self) -> io::Result<Event>;
+    /// Whether smd was asked to stop by a signal.
+    fn stopped(&self) -> bool;
 }
 
 /// The real terminal and clock.
@@ -1553,6 +1584,10 @@ impl Input for Live {
     fn read(&mut self) -> io::Result<Event> {
         event::read()
     }
+
+    fn stopped(&self) -> bool {
+        STOP.load(Ordering::Relaxed)
+    }
 }
 
 fn run_browser<W: Write>(
@@ -1565,6 +1600,10 @@ fn run_browser<W: Write>(
     // Until when to ask the terminal to repaint (see `REPAINT_FOR`).
     let mut repaint_until = None;
     loop {
+        // Polls wait at most CHECK_EVERY, so this is seen soon after.
+        if input.stopped() {
+            return Ok(());
+        }
         if redraw {
             // Images go before the cells that show them, and a layout made
             // while drawing, as on a resize, sends its images just after.
@@ -3170,11 +3209,13 @@ mod tests {
 
     /// One step of a scripted run: an event that arrives a while into a
     /// poll, a poll that times out with nothing, or polls that time out
-    /// until something new is drawn, for work on other threads.
+    /// until something new is drawn, for work on other threads, or a
+    /// signal asking smd to stop.
     enum Step {
         After(Duration, Event),
         Wait,
         Drawn,
+        Stop,
     }
 
     /// Input from a script, with a clock that moves only when it says.
@@ -3227,8 +3268,13 @@ mod tests {
                     self.now += timeout;
                     Ok(false)
                 }
+                Some(Step::Stop) => panic!("polled after a signal to stop"),
                 None => Err(io::Error::other("the script ran out")),
             }
+        }
+
+        fn stopped(&self) -> bool {
+            matches!(self.steps.front(), Some(Step::Stop))
         }
 
         fn read(&mut self) -> io::Result<Event> {
@@ -3274,6 +3320,16 @@ mod tests {
     fn the_loop_draws_once_and_quits_on_a_quit_key() {
         let (mut b, dir) = loaded("loop-quit", &[("a.md", "one\n")]);
         let (result, frames, timeouts) = run_script(&mut b, vec![quit()]);
+        assert!(result.is_ok());
+        assert_eq!(frames, 1);
+        assert_eq!(timeouts, [CHECK_EVERY]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_signal_to_stop_ends_the_loop_like_a_quit_key() {
+        let (mut b, dir) = loaded("loop-stop", &[("a.md", "one\n")]);
+        let (result, frames, timeouts) = run_script(&mut b, vec![Step::Wait, Step::Stop]);
         assert!(result.is_ok());
         assert_eq!(frames, 1);
         assert_eq!(timeouts, [CHECK_EVERY]);

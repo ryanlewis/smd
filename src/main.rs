@@ -301,6 +301,8 @@ fn smd(args: Args) -> Result<(), Failure> {
     set_mouse(&mut io::stdout(), mouse, true);
     // After ratatui's hook, so it runs first.
     set_panic_hook(images.uploaded(), mouse);
+    // SIGTERM and SIGHUP now end the loop below, so the terminal is restored.
+    app::stop_on_signals();
     // Started once the hook is set, like the jobs below.
     highlight::load_in_background();
     // Made once the hook is set, as this starts the jobs.

@@ -194,7 +194,9 @@ impl Vault {
                         *wiki = false;
                     }
                 }
-                BlockKind::Quote(inner) => self.resolve_embeds(inner, from),
+                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
+                    self.resolve_embeds(inner, from)
+                }
                 BlockKind::List { items, .. } => {
                     for item in items {
                         self.resolve_embeds(&mut item.blocks, from);
@@ -898,7 +900,9 @@ mod tests {
         for block in blocks {
             match &block.kind {
                 BlockKind::Image { src, wiki, .. } => out.push((src.clone(), *wiki)),
-                BlockKind::Quote(inner) => out.extend(srcs(inner)),
+                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
+                    out.extend(srcs(inner))
+                }
                 BlockKind::List { items, .. } => {
                     for item in items {
                         out.extend(srcs(&item.blocks));

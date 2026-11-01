@@ -1,6 +1,6 @@
 //! Lays a document out as styled lines for a given width.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use ratatui::style::{Color, Modifier, Style};
@@ -9,7 +9,8 @@ use syntect::parsing::SyntaxSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{
-    self, Block, BlockKind, Document, FigureKind, Frontmatter, Inline, InlineStyle, Link, ListItem,
+    self, Block, BlockKind, Callout, CalloutKind, Document, FigureKind, Frontmatter, Inline,
+    InlineStyle, Link, ListItem,
 };
 use crate::highlight::{self, Segments};
 use crate::images::{self, Images, Placement};
@@ -30,6 +31,8 @@ pub struct Layout {
     pub links: Vec<LinkSpot>,
     /// Every task's checkbox, in document order.
     pub tasks: Vec<TaskSpot>,
+    /// Every title that folds a block open or shut, in document order.
+    pub folds: Vec<FoldSpot>,
 }
 
 /// A link and the cells its text takes, which may be on several lines.
@@ -47,6 +50,17 @@ pub struct TaskSpot {
     pub mark: usize,
     pub done: bool,
     /// The line and the columns of `[ ]` on it.
+    pub cell: (usize, Range<u16>),
+}
+
+/// The title line of a block that folds, such as a callout with `+` or `-`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldSpot {
+    /// Where the block starts in the source, which names it across layouts.
+    pub at: usize,
+    /// Whether the block is drawn open.
+    pub open: bool,
+    /// The line and the columns of the title's first line.
     pub cell: (usize, Range<u16>),
 }
 
@@ -101,20 +115,48 @@ struct Ctx<'a> {
     panel: Option<Color>,
     /// The syntaxes code is coloured with, once they have loaded.
     syntaxes: Option<&'a SyntaxSet>,
+    /// The starts of the blocks that fold, drawn the other way from how
+    /// they start.
+    flipped: &'a HashSet<usize>,
 }
 
 /// Lay out the whole document for a view `width` columns wide. Blocks whose
 /// image is ready in `images` are drawn as placeholder cells.
+#[cfg(test)]
 pub fn render(doc: &Document, width: u16, images: &Images) -> Layout {
-    layout(doc, width, images, theme::code_panel(), highlight::ready())
+    render_folds(doc, width, images, &HashSet::new())
 }
 
+/// [`render`] with the blocks that start at `flipped` folded the other way
+/// from how they start.
+pub fn render_folds(
+    doc: &Document,
+    width: u16,
+    images: &Images,
+    flipped: &HashSet<usize>,
+) -> Layout {
+    let panel = theme::code_panel();
+    layout_folds(doc, width, images, panel, highlight::ready(), flipped)
+}
+
+#[cfg(test)]
 fn layout(
     doc: &Document,
     width: u16,
     images: &Images,
     panel: Option<Color>,
     syntaxes: Option<&SyntaxSet>,
+) -> Layout {
+    layout_folds(doc, width, images, panel, syntaxes, &HashSet::new())
+}
+
+fn layout_folds(
+    doc: &Document,
+    width: u16,
+    images: &Images,
+    panel: Option<Color>,
+    syntaxes: Option<&SyntaxSet>,
+    flipped: &HashSet<usize>,
 ) -> Layout {
     let mut ctx = Ctx {
         source: &doc.source,
@@ -123,6 +165,7 @@ fn layout(
         sizes: HashMap::new(),
         panel,
         syntaxes,
+        flipped,
     };
     blocks(&doc.blocks, width as usize, &[], &[], false, &mut ctx);
     ctx.layout
@@ -280,6 +323,9 @@ fn contents(
             let rest = with(rest, bar);
             blocks(inner, width, &first, &rest, false, ctx);
         }
+        BlockKind::Callout { callout, blocks } => {
+            self::callout(block.span.start, callout, blocks, width, first, rest, ctx);
+        }
         BlockKind::List {
             start,
             tight,
@@ -333,6 +379,105 @@ fn frontmatter(
         }
     }
     links
+}
+
+/// A callout: a bar in its type's colour, a title line with the type's
+/// mark, then the body unless it is folded shut.
+fn callout(
+    at: usize,
+    callout: &Callout,
+    inner: &[Block],
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) {
+    let (colour, mark) = callout_look(callout.kind);
+    let bar = Span::styled("│ ", Style::new().fg(colour));
+    let first = with(first, bar.clone());
+    let rest = with(rest, bar);
+    let style = Style::new().fg(colour).add_modifier(Modifier::BOLD);
+    let open = fold_title(
+        at,
+        callout.fold,
+        mark,
+        &callout.title,
+        style,
+        width,
+        &first,
+        &rest,
+        ctx,
+    );
+    if open {
+        blocks(inner, width, &rest, &rest, false, ctx);
+    }
+}
+
+/// Draw the title of a block that may fold: `fold` is `Some(open)` for one
+/// that does, saying how it starts, and `None` for one that cannot. A
+/// folding title has a ▾ or ▸ in front and is a stop that folds the block
+/// starting at `at`; `mark` goes between that and the title. Returns
+/// whether to draw the block's body.
+#[allow(clippy::too_many_arguments)]
+fn fold_title(
+    at: usize,
+    fold: Option<bool>,
+    mark: &str,
+    title: &[Inline],
+    style: Style,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) -> bool {
+    let open = fold.is_none_or(|open| open != ctx.flipped.contains(&at));
+    let mut lead = String::new();
+    if fold.is_some() {
+        lead.push_str(if open { "▾ " } else { "▸ " });
+    }
+    if !mark.is_empty() {
+        lead.push_str(mark);
+        lead.push(' ');
+    }
+    let mut content = vec![note(lead)];
+    content.extend_from_slice(title);
+    let row = ctx.layout.lines.len();
+    let links = wrap(&content, style, width, first, rest, &mut ctx.layout.lines);
+    ctx.layout.links.extend(links);
+    if fold.is_some()
+        && let Some(line) = ctx.layout.lines.get(row)
+    {
+        let from = spans_width(first) as u16;
+        let to = line.width() as u16;
+        ctx.layout.folds.push(FoldSpot {
+            at,
+            open,
+            cell: (row, from..to.max(from + 1)),
+        });
+    }
+    open
+}
+
+/// The colour and mark a callout of `kind` is drawn with.
+fn callout_look(kind: CalloutKind) -> (Color, &'static str) {
+    use CalloutKind::*;
+    match kind {
+        Note => (Color::Blue, "✎"),
+        Abstract => (Color::Cyan, "≡"),
+        Info => (Color::Blue, "ℹ"),
+        Todo => (Color::Blue, "☐"),
+        Tip => (Color::Cyan, "✦"),
+        Important => (Color::Magenta, "‼"),
+        Success => (Color::Green, "✓"),
+        Question => (Color::Yellow, "?"),
+        Warning => (Color::Yellow, "⚠"),
+        Caution => (Color::Red, "⚠"),
+        Failure => (Color::Red, "✗"),
+        Danger => (Color::Red, "↯"),
+        Bug => (Color::Red, "¤"),
+        Example => (Color::Magenta, "»"),
+        Quote => (Color::DarkGray, "❝"),
+    }
 }
 
 /// Plain text as inline content.
@@ -1043,6 +1188,86 @@ mod tests {
             plain("> one two\n>\n> three\n", 9),
             vec!["│ one two", "│", "│ three"]
         );
+    }
+
+    #[test]
+    fn nested_quotes_get_a_bar_for_each_level() {
+        assert_eq!(plain("> > > x\n", 20), vec!["│ │ │ x"]);
+        assert_eq!(
+            plain("- item\n\n  > quoted\n  > > deeper\n", 20),
+            vec!["• item", "", "  │ quoted", "  │", "  │ │ deeper"]
+        );
+    }
+
+    #[test]
+    fn a_callout_has_a_title_line_then_its_body() {
+        assert_eq!(
+            plain("> [!WARNING]\n> Mind the step.\n", 20),
+            vec!["│ ⚠ Warning", "│ Mind the step."]
+        );
+        assert_eq!(
+            plain("> [!tip] Short\n> > [!bug]\n> > x\n", 20),
+            vec!["│ ✦ Short", "│ │ ¤ Bug", "│ │ x"]
+        );
+        assert_eq!(
+            plain("- > [!todo] Buy\n  > - milk\n", 20),
+            vec!["• │ ☐ Buy", "  │ • milk"]
+        );
+    }
+
+    #[test]
+    fn a_callouts_bar_and_title_take_its_colour() {
+        let lines = render(&parse("> [!danger] Hot\n> x\n"), 20, &no_images()).lines;
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Red));
+        assert!(
+            lines[0].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn a_folding_callout_starts_as_marked_and_flips() {
+        let doc = parse("> [!note]- Shut\n> hidden\n\n> [!note]+ Open\n> shown\n");
+        let text = |layout: &Layout| -> Vec<String> {
+            let line = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect();
+            layout.lines.iter().map(line).collect()
+        };
+        let layout = render(&doc, 20, &no_images());
+        assert_eq!(
+            text(&layout),
+            vec!["│ ▸ ✎ Shut", "", "│ ▾ ✎ Open", "│ shown"]
+        );
+        let folds: Vec<_> = layout
+            .folds
+            .iter()
+            .map(|f| (f.at, f.open, f.cell.clone()))
+            .collect();
+        assert_eq!(folds, vec![(0, false, (0, 2..10)), (26, true, (2, 2..10))]);
+        let flipped = HashSet::from([0, 26]);
+        let layout = render_folds(&doc, 20, &no_images(), &flipped);
+        assert_eq!(
+            text(&layout),
+            vec!["│ ▾ ✎ Shut", "│ hidden", "", "│ ▸ ✎ Open"]
+        );
+        // One that cannot fold is not flipped.
+        let doc = parse("> [!note] Fixed\n> body\n");
+        let layout = render_folds(&doc, 20, &no_images(), &HashSet::from([0]));
+        assert_eq!(text(&layout), vec!["│ ✎ Fixed", "│ body"]);
+        assert!(layout.folds.is_empty());
+    }
+
+    #[test]
+    fn every_callout_mark_is_one_column_wide() {
+        use CalloutKind::*;
+        for kind in [
+            Note, Abstract, Info, Todo, Tip, Important, Success, Question, Warning, Caution,
+            Failure, Danger, Bug, Example, Quote,
+        ] {
+            assert_eq!(callout_look(kind).1.width(), 1, "{kind:?}");
+        }
     }
 
     const BG: Color = Color::Rgb(48, 48, 63);

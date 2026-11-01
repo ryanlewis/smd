@@ -207,7 +207,15 @@ Diagram labels and text in SVG images use Trebuchet MS or Verdana on macOS, and 
 smd [--no-graphics] [--remote-images | --no-remote-images] [FILE]
 ```
 
-With no file, smd opens the `home` note from the config. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
+With no file, smd opens the `home` note from the config, unless markdown is piped in. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
+
+smd also reads markdown piped into it, or from stdin when the file is `-`:
+
+```sh
+gh pr view --json body -q .body | smd
+```
+
+Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
 
 ### Keys
 

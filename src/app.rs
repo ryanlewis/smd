@@ -818,6 +818,8 @@ type Stack = fn(&mut Browser) -> &mut Vec<Visited>;
 /// A note left by following a link, to come back to.
 struct Visited {
     path: PathBuf,
+    /// It was read from stdin, so it cannot be read again.
+    piped: bool,
     doc: Rc<Document>,
     scroll: usize,
     selected: Option<Stop>,
@@ -830,6 +832,9 @@ pub struct Browser {
     view: View,
     path: PathBuf,
     watcher: Watcher,
+    /// The note on screen was read from stdin: it has no file to reload or
+    /// tick tasks in.
+    piped: bool,
     vault: Vault,
     config: Config,
     /// Where Back goes, the last place last.
@@ -856,6 +861,7 @@ impl Browser {
             view,
             path,
             watcher,
+            piped: false,
             vault,
             config,
             history: Vec::new(),
@@ -868,6 +874,14 @@ impl Browser {
         };
         browser.check_tasks();
         browser
+    }
+
+    /// The same browser, its note read from stdin: it is not reloaded and
+    /// its tasks cannot be ticked.
+    pub fn piped(mut self) -> Self {
+        self.piped = true;
+        self.check_tasks();
+        self
     }
 
     /// Show a short message until the next key.
@@ -969,7 +983,7 @@ impl Browser {
     /// Let checkboxes be ticked when the config allows it and the note can
     /// be written.
     fn check_tasks(&mut self) {
-        self.view.tasks = self.config.tasks == Tasks::Toggle && writable(&self.path);
+        self.view.tasks = self.config.tasks == Tasks::Toggle && !self.piped && writable(&self.path);
         if let Some(Stop::Task(_)) = self.view.selected
             && !self.view.tasks
         {
@@ -1012,7 +1026,7 @@ impl Browser {
 
     fn follow(&mut self, link: &Link) {
         match self.vault.follow(link, &self.path) {
-            Target::Note { path, heading } if path == self.path => {
+            Target::Note { path, heading } if path == self.path && !self.piped => {
                 if let Some(h) = heading {
                     self.jump_here(&h);
                 }
@@ -1101,6 +1115,7 @@ impl Browser {
     fn here(&self) -> Visited {
         Visited {
             path: self.path.clone(),
+            piped: self.piped,
             doc: Rc::clone(&self.view.doc),
             scroll: self.view.scroll,
             selected: self.view.selected,
@@ -1113,8 +1128,14 @@ impl Browser {
     fn revisit(&mut self, visited: &Visited) -> bool {
         // A place in the note on screen, unchanged since, needs no reading.
         let showing = visited.path == self.path && Rc::ptr_eq(&visited.doc, &self.view.doc);
-        if !showing && !self.open(visited.path.clone()) {
-            return false;
+        if !showing {
+            if visited.piped {
+                // Stdin cannot be read twice: its text is shown again.
+                let source = visited.doc.source.clone();
+                self.show(visited.path.clone(), &source, true);
+            } else if !self.open(visited.path.clone()) {
+                return false;
+            }
         }
         // Folds are kept by where they start, so only in the same text.
         if self.view.doc.source == visited.doc.source {
@@ -1189,10 +1210,17 @@ impl Browser {
                 return false;
             }
         };
+        self.show(path, &source, false);
+        self.watcher = watcher;
+        true
+    }
+
+    /// Show `source` as the note at `path`, read from stdin when `piped`.
+    fn show(&mut self, path: PathBuf, source: &str, piped: bool) {
         if !self.vault.holds(&path) {
             self.vault = Vault::for_file(&path);
         }
-        let doc = parse(&self.vault, &source, &path);
+        let doc = parse(&self.vault, source, &path);
         // Keep the images of the nearest notes Back and Forward lead to, and
         // of the one being left, which is about to join them.
         let back = self.history.iter().rev().take(KEEP_IMAGES_OF);
@@ -1203,10 +1231,12 @@ impl Browser {
         self.view.show(doc, folder(&path));
         self.view.set_notice(None);
         self.missed = None;
-        self.watcher = watcher;
+        if piped {
+            self.watcher = Watcher::new(path.clone());
+        }
         self.path = path;
+        self.piped = piped;
         self.check_tasks();
-        true
     }
 
     /// Hand a web link, or a file smd does not show, to whatever the config
@@ -1342,7 +1372,9 @@ fn run_browser<W: Write>(
         }
         if input.now().saturating_duration_since(last_check) >= CHECK_EVERY {
             last_check = input.now();
-            if let Some(change) = browser.watcher.check() {
+            if !browser.piped
+                && let Some(change) = browser.watcher.check()
+            {
                 apply(&mut browser.view, &browser.path, &browser.vault, change);
                 // Its permissions may have changed too.
                 browser.check_tasks();
@@ -1893,6 +1925,37 @@ mod tests {
         });
         assert_eq!(b.path, dir.join("Plan.md"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_note_read_from_stdin_is_shown_with_its_tasks_locked() {
+        // As smd makes it: named stdin, its links read from here.
+        let path = PathBuf::from("stdin");
+        let vault = Vault::for_file(&path);
+        let source = "- [ ] one [[README]]\n";
+        let doc = super::parse(&vault, source, &path);
+        let mut view = View::new(doc, folder(&path), Images::new((8, 16)));
+        view.resize(40, 6);
+        let watcher = Watcher::new(path.clone());
+        let mut b = Browser::new(view, path.clone(), watcher, vault, Config::default()).piped();
+        assert!(!b.view.tasks);
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let bar: String = (0..40).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(bar.trim_end().ends_with(" stdin"), "{bar}");
+        // Tab passes over the checkbox to the link, which leads to a file
+        // here, where tasks can be ticked again.
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, PathBuf::from("./README.md"));
+        assert!(!b.piped);
+        // Back shows the text read from stdin again, still locked.
+        b.back();
+        assert_eq!(b.path, path);
+        assert!(b.piped && !b.view.tasks);
+        assert_eq!(b.view.doc.source, source);
     }
 
     #[test]
@@ -2733,6 +2796,20 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 2);
         assert_eq!(top(&b.view), "something else");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_does_not_reload_a_note_read_from_stdin() {
+        let (b, dir) = loaded("loop-piped", &[("a.md", "one\n")]);
+        let mut b = b.piped();
+        // A file at the same path is not the note shown.
+        std::fs::write(dir.join("a.md"), "something else\n").unwrap();
+        let steps = vec![Step::Wait, Step::Wait, Step::Wait, quit()];
+        let (result, frames, _) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 1);
+        assert_eq!(top(&b.view), "one");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

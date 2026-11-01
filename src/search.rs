@@ -450,6 +450,10 @@ mod tests {
         // Only its first line matches: the lines under it are the image.
         let md = "# Big Title\n\nbig title\n";
         assert_eq!(found_in_image(md, "#", 2, "big title"), on(0));
+        // The text is that of the heading drawn, not of another one.
+        let md = "# Other\n\n# Big Title\n";
+        assert_eq!(found_in_image(md, "# Big", 0, "big title"), on(2));
+        assert_eq!(found_in_image(md, "# Big", 0, "other"), [at(0, 0..5)]);
         // A hard break in the heading reads as a space.
         assert_eq!(
             found_in_image("Big\\\nTitle\n===\n", "Big", 0, "big title"),

@@ -219,7 +219,7 @@ smd also reads markdown piped into it, or from stdin when the file is `-`:
 gh pr view --json body -q .body | smd
 ```
 
-While smd waits for a pipe to fill, it shows `reading stdin…`. Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
+While smd waits for the command feeding it to finish, it shows `reading stdin…`. Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
 
 ### Keys
 

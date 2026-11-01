@@ -18,7 +18,7 @@
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
-//! next_link = ["tab", "o"]
+//! next_link = ["tab", "n"]
 //! back = ["backspace", "h"]
 //! ```
 
@@ -301,13 +301,29 @@ impl Config {
     fn from_str(text: &str) -> Result<Config, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_string())?;
         let mut keys = HashMap::new();
+        // The search keys came after configs were written that may use
+        // them, so they give way to a key the config names.
+        let named: Vec<Key> = file
+            .keys
+            .values()
+            .flatten()
+            .flat_map(|n| Key::parse(n))
+            .collect();
         for action in Action::ALL {
-            let names: Vec<&str> = match file.keys.get(&action) {
+            let given = file.keys.get(&action);
+            let names: Vec<&str> = match given {
                 Some(names) => names.iter().map(String::as_str).collect(),
                 None => action.defaults().to_vec(),
             };
             for name in names {
                 let key = Key::parse(name)?;
+                let newer = matches!(
+                    action,
+                    Action::Search | Action::NextMatch | Action::PrevMatch
+                );
+                if given.is_none() && newer && named.contains(&key) {
+                    continue;
+                }
                 if let Some(other) = keys.insert(key, action)
                     && other != action
                 {
@@ -476,6 +492,20 @@ mod tests {
         assert!(c.remote_images);
         assert_eq!(c.mermaid, Renderer::Mmdc);
         assert_eq!(c.tasks, Tasks::ReadOnly);
+    }
+
+    #[test]
+    fn a_config_that_took_a_search_key_keeps_it() {
+        let c = Config::from_str("[keys]\nnext_link = [\"tab\", \"n\"]\n").unwrap();
+        let none = KeyModifiers::NONE;
+        assert_eq!(
+            c.action(press(KeyCode::Char('n'), none)),
+            Some(Action::NextLink)
+        );
+        assert_eq!(
+            c.action(press(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            Some(Action::PrevMatch)
+        );
     }
 
     #[test]

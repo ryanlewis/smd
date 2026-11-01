@@ -305,7 +305,7 @@ mermaid = "builtin"
 
 # Keys for each action. Naming an action replaces its default keys.
 [keys]
-next_link = ["tab", "o"]
+next_link = ["tab", "n"]
 back = ["backspace", "h"]
 ```
 

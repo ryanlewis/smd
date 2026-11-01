@@ -166,7 +166,7 @@ impl View {
         self.base = base;
         self.scroll = 0;
         self.selected = None;
-        self.search.current = None;
+        self.clear_search();
         self.flipped.clear();
         self.want_images();
         self.relayout(None);
@@ -232,7 +232,7 @@ impl View {
             if let Some(row) = anchor.and_then(|a| self.find(&a)) {
                 self.scroll = row;
             }
-            self.search.refresh(&self.layout, &self.doc);
+            self.refresh_search();
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.selected = self.selected.filter(|&s| self.has(s));
@@ -312,7 +312,7 @@ impl View {
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
             self.selected = self.selected.filter(|&s| self.has(s));
-            self.search.refresh(&self.layout, &self.doc);
+            self.refresh_search();
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
@@ -538,11 +538,23 @@ impl View {
                 self.clear_search();
                 return None;
             }
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                self.clear_search();
+                return None;
+            }
             _ => return None,
         }
-        self.search.refresh(&self.layout, &self.doc);
-        self.prompt = Some(self.search.prompt());
+        self.refresh_search();
         None
+    }
+
+    /// Find the search term in the layout again, keeping the prompt's count
+    /// up to date while it is typed.
+    fn refresh_search(&mut self) {
+        self.search.refresh(&self.layout, &self.doc);
+        if self.search.typing {
+            self.prompt = Some(self.search.prompt());
+        }
     }
 
     /// Give up the search and stop marking its matches.
@@ -867,6 +879,10 @@ impl Browser {
     /// Handle a mouse event: a click on a link follows it, and the wheel
     /// scrolls.
     fn mouse(&mut self, event: MouseEvent) {
+        // Clicks wait until the search term is typed.
+        if self.view.search.typing {
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if event.modifiers.is_empty() => {
                 if std::mem::take(&mut self.passing) {
@@ -2234,6 +2250,64 @@ mod tests {
         assert!(!b.view.search.active());
         assert!(b.view.search.matches.is_empty());
         assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_search_prompt_keeps_up_and_lets_go() {
+        let md = format!(
+            "> [!note]- Shut\n> needle\n\nneedle a\n\nneedle b\n\n{}",
+            paragraphs(6)
+        );
+        let (mut b, dir) = browser("prompt", &[("note.md", &md), ("Plan.md", "# Plan\n")]);
+        let search = |b: &mut Browser, term: &str| {
+            enter(b, KeyCode::Char('/'));
+            for c in term.chars() {
+                enter(b, KeyCode::Char(c));
+            }
+        };
+        // Ctrl-C gives the prompt up.
+        search(&mut b, "needle");
+        b.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            (b.view.prompt.clone(), b.view.search.active()),
+            (None, false)
+        );
+        // Opening the callout while typing updates the count on the prompt.
+        search(&mut b, "needle");
+        assert_eq!(b.view.prompt.as_deref(), Some("/needle  2 matches"));
+        let at = b.view.layout.folds[0].at;
+        b.view.fold(at);
+        assert_eq!(b.view.prompt.as_deref(), Some("/needle  3 matches"));
+        b.view.fold(at);
+        enter(&mut b, KeyCode::Enter);
+        enter(&mut b, KeyCode::Char('n'));
+        assert_eq!(b.view.notice.as_deref(), Some("match 2/2"));
+        // A new layout numbers the matches anew, so none is current: "needle
+        // b" would be the third match now, not the second.
+        b.view.fold(at);
+        assert_eq!(b.view.search.current, None);
+        // Another note starts with no search.
+        b.follow(&wiki("Plan"));
+        assert!(!b.view.search.active());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_click_while_typing_a_search_is_passed_over() {
+        let (mut b, dir) = browser(
+            "click-search",
+            &[("HOME.md", "go [[Plan]] now\n"), ("Plan.md", "# Plan\n")],
+        );
+        enter(&mut b, KeyCode::Char('/'));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        b.mouse(click);
+        assert_eq!(b.path, dir.join("HOME.md"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

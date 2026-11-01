@@ -389,7 +389,8 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS
         | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_DEFINITION_LIST;
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_SMART_PUNCTUATION;
     let mut builder = Builder::new(source);
     builder.hide = theme.map(other_theme);
     // The body is parsed without metadata blocks, which pulldown-cmark would
@@ -3192,6 +3193,18 @@ definition @20..43
       "more"
 paragraph @43..49
   "after"
+"#,
+        );
+    }
+
+    #[test]
+    fn smart_punctuation_leaves_code_alone() {
+        assert_outline(
+            "\"Hi\" -- it's --- 'ok'... `\"x\" --`\n\n```\n\"y\" -- ...\n```\n",
+            r#"paragraph @0..34
+  "“Hi” – it’s — ‘ok’… "
+  "\"x\" --" code
+code None "\"y\" -- ...\n" @35..53
 "#,
         );
     }

@@ -361,8 +361,9 @@ impl Images {
                 let object = self.shared_memory.then(|| kitty::shm::create(&data).ok());
                 match object.flatten() {
                     Some(name) => {
+                        // Tracked first, so it is removed even if the write fails.
+                        self.objects.push((name.clone(), Instant::now()));
                         kitty::upload_shared(out, entry.id, &name, data.len())?;
-                        self.objects.push((name, Instant::now()));
                     }
                     None => kitty::upload(out, entry.id, &data)?,
                 }
@@ -377,15 +378,15 @@ impl Images {
         if sent {
             out.flush()?;
         }
-        self.unlink_objects(Instant::now().checked_sub(SHARED_MEMORY_KEEP));
+        self.unlink_objects(Instant::now(), SHARED_MEMORY_KEEP);
         Ok(())
     }
 
-    /// Remove the shared memory objects sent before `before`, or all of them
-    /// without it. Most are gone already: the terminal removes each it reads.
-    fn unlink_objects(&mut self, before: Option<Instant>) {
+    /// Remove the shared memory objects sent `keep` or longer before `now`.
+    /// Most are gone already: the terminal removes each it reads.
+    fn unlink_objects(&mut self, now: Instant, keep: Duration) {
         self.objects.retain(|(name, sent)| {
-            let keep = before.is_some_and(|before| *sent > before);
+            let keep = now.saturating_duration_since(*sent) < keep;
             if !keep {
                 kitty::shm::unlink(name);
             }
@@ -397,7 +398,7 @@ impl Images {
     pub fn delete_all(&mut self, out: &mut impl Write) -> io::Result<()> {
         self.want(Vec::new());
         let flushed = self.flush(out, &[]);
-        self.unlink_objects(None);
+        self.unlink_objects(Instant::now(), Duration::ZERO);
         flushed
     }
 }
@@ -1585,20 +1586,54 @@ pub mod tests {
         assert!(!open());
     }
 
+    /// A writer that fails every write, as when the terminal has gone.
+    struct Gone;
+
+    impl Write for Gone {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_object_whose_upload_failed_is_still_removed() {
+        let mut images = Images::new((10, 20));
+        images.use_shared_memory(true);
+        images.request(file_key("a.png"), job(png(10, 20)));
+        settle(&mut images);
+        let id = images.ready(&file_key("a.png")).unwrap().id;
+        let at = [Placement {
+            id,
+            cols: 1,
+            rows: 1,
+        }];
+        assert!(images.flush(&mut Gone, &at).is_err());
+        assert_eq!(images.objects.len(), 1, "the object is not tracked");
+        images.delete_all(&mut Vec::new()).unwrap();
+        assert!(images.objects.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn unread_objects_are_removed_after_a_while() {
         let mut images = Images::new((10, 20));
         let old = kitty::shm::create(b"old").unwrap();
         let new = kitty::shm::create(b"new").unwrap();
-        let now = Instant::now();
-        images.objects = vec![
-            (old.clone(), now - SHARED_MEMORY_KEEP * 2),
-            (new.clone(), now),
-        ];
-        images.unlink_objects(now.checked_sub(SHARED_MEMORY_KEEP));
-        assert_eq!(images.objects, vec![(new.clone(), now)]);
-        images.unlink_objects(None);
+        // No Instant is made by subtracting: soon after boot that fails.
+        let sent = Instant::now();
+        let later = sent + SHARED_MEMORY_KEEP / 2;
+        images.objects = vec![(old.clone(), sent), (new.clone(), later)];
+        images.unlink_objects(sent + SHARED_MEMORY_KEEP, SHARED_MEMORY_KEEP);
+        assert_eq!(images.objects, vec![(new.clone(), later)]);
+        // Nothing sent just now is removed.
+        images.unlink_objects(later, SHARED_MEMORY_KEEP);
+        assert_eq!(images.objects.len(), 1);
+        images.unlink_objects(later, Duration::ZERO);
         assert!(images.objects.is_empty());
         // Both are gone.
         for name in [old, new] {

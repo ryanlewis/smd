@@ -197,7 +197,8 @@ fn cell_size(size: ratatui::crossterm::terminal::WindowSize) -> Option<(u16, u16
 fn queries(shm: Option<&str>) -> String {
     let shm = shm.map_or(String::new(), |name| {
         let name = base64(name.as_bytes());
-        format!("\x1b_Gi={SHM_QUERY_ID},s=1,v=1,a=q,t=s,f=24;{name}\x1b\\")
+        let size = SHM_PIXEL.len();
+        format!("\x1b_Gi={SHM_QUERY_ID},s=1,v=1,a=q,t=s,f=24,S={size};{name}\x1b\\")
     });
     format!("\x1b]11;?\x1b\\\x1b[16t\x1b_Gi={QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\{shm}\x1b[c")
 }
@@ -494,7 +495,7 @@ mod tests {
         assert_eq!(
             queries(Some("/smd-1-0")),
             "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
-             \x1b_Gi=32,s=1,v=1,a=q,t=s,f=24;L3NtZC0xLTA=\x1b\\\x1b[c"
+             \x1b_Gi=32,s=1,v=1,a=q,t=s,f=24,S=3;L3NtZC0xLTA=\x1b\\\x1b[c"
         );
     }
 

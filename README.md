@@ -145,6 +145,8 @@ Images, diagrams, maths and headings need a terminal that supports the [kitty gr
 
 smd asks the terminal what it supports at start-up. In a terminal without kitty graphics, or with `--no-graphics`, images, diagrams and maths are shown as their markdown source, and headings as styled text. Everything else works the same.
 
+When the terminal runs on the same machine as smd, images are passed to it through shared memory, which is faster for large images than sending them through the terminal. Over ssh, or when the terminal cannot read shared memory, they are sent through the terminal as before.
+
 smd is developed on macOS, and its tests run on Linux.
 
 ## Install

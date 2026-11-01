@@ -7,6 +7,7 @@
 //! and answered before the key reader starts.
 
 mod diacritics;
+pub mod shm;
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -65,6 +66,14 @@ pub fn upload(out: &mut impl Write, id: u32, png: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Send a PNG of `len` bytes held in the shared memory object `name` to the
+/// terminal under `id`, as [`upload`] does. The terminal reads the object and
+/// removes it.
+pub fn upload_shared(out: &mut impl Write, id: u32, name: &str, len: usize) -> io::Result<()> {
+    let name = base64(name.as_bytes());
+    write!(out, "\x1b_Ga=t,f=100,t=s,S={len},i={id},q=2;{name}\x1b\\")
+}
+
 /// Place image `id` as a virtual placement `cols` by `rows` cells. Placing it
 /// again replaces the old placement, so the data is never sent twice.
 pub fn place(out: &mut impl Write, id: u32, cols: u16, rows: u16) -> io::Result<()> {
@@ -115,6 +124,12 @@ const FALLBACK_CELL: (u16, u16) = (8, 16);
 /// The image id the graphics query asks about. A query stores nothing.
 const QUERY_ID: u32 = 31;
 
+/// The image id the shared memory query asks about.
+const SHM_QUERY_ID: u32 = 32;
+
+/// The one RGB pixel the shared memory query sends.
+const SHM_PIXEL: [u8; 3] = [0, 0, 0];
+
 /// What the terminal said about itself at start-up.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Probe {
@@ -126,10 +141,14 @@ pub struct Probe {
     pub background: Option<theme::Rgb>,
     /// The terminal answered the kitty graphics query.
     pub graphics: bool,
+    /// The terminal read an image from shared memory, so it runs on this
+    /// machine and images can go that way.
+    pub shared_memory: bool,
 }
 
 /// Ask the terminal for its background colour with `OSC 11`, its cell size
-/// with `CSI 16 t` and whether it knows the kitty graphics protocol.
+/// with `CSI 16 t`, whether it knows the kitty graphics protocol and whether
+/// it can read images from shared memory.
 ///
 /// The queries end with `CSI c` (DA1). Terminals answer in order, and nearly
 /// all answer DA1, so the DA1 reply ends the wait: a terminal that sends it
@@ -139,8 +158,16 @@ pub struct Probe {
 /// tty reports. The queries are sent on the alternate screen, which is left
 /// again before this returns. Call it before the key reader starts: it reads
 /// the replies from the terminal itself.
+///
+/// The shared memory query names a one-pixel object made here. The terminal
+/// removes it once read; it is removed here too, for a terminal that did not
+/// read it, such as one on the other end of ssh.
 pub fn probe() -> Probe {
-    let reply = query().unwrap_or_default();
+    let object = shm::create(&SHM_PIXEL).ok();
+    let reply = query(object.as_deref()).unwrap_or_default();
+    if let Some(name) = &object {
+        shm::unlink(name);
+    }
     Probe {
         cell: parse_cell_reply(&reply)
             .or_else(window_cell_size)
@@ -148,6 +175,7 @@ pub fn probe() -> Probe {
         theme: theme::parse_background_reply(&reply),
         background: theme::parse_background_colour(&reply),
         graphics: parse_graphics_reply(&reply),
+        shared_memory: object.is_some() && parse_shm_reply(&reply),
     }
 }
 
@@ -164,14 +192,19 @@ fn cell_size(size: ratatui::crossterm::terminal::WindowSize) -> Option<(u16, u16
     (cell.0 > 0 && cell.1 > 0).then_some(cell)
 }
 
-/// The queries, in the order the replies are read.
-fn queries() -> String {
-    format!("\x1b]11;?\x1b\\\x1b[16t\x1b_Gi={QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c")
+/// The queries, in the order the replies are read. With `shm`, the name of
+/// an object holding [`SHM_PIXEL`], they ask whether the terminal can read it.
+fn queries(shm: Option<&str>) -> String {
+    let shm = shm.map_or(String::new(), |name| {
+        let name = base64(name.as_bytes());
+        format!("\x1b_Gi={SHM_QUERY_ID},s=1,v=1,a=q,t=s,f=24;{name}\x1b\\")
+    });
+    format!("\x1b]11;?\x1b\\\x1b[16t\x1b_Gi={QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\{shm}\x1b[c")
 }
 
 /// The terminal's replies to the start-up queries, read until the DA1 reply.
 #[cfg(unix)]
-fn query() -> Option<Vec<u8>> {
+fn query(shm: Option<&str>) -> Option<Vec<u8>> {
     use ratatui::crossterm::terminal;
 
     // SAFETY: isatty only looks at the descriptor.
@@ -182,7 +215,7 @@ fn query() -> Option<Vec<u8>> {
     if !was_raw {
         terminal::enable_raw_mode().ok()?;
     }
-    let reply = exchange(&mut io::stdout(), libc::STDIN_FILENO, REPLY_TIMEOUT);
+    let reply = exchange(&mut io::stdout(), libc::STDIN_FILENO, REPLY_TIMEOUT, shm);
     if !was_raw {
         let _ = terminal::disable_raw_mode();
     }
@@ -192,10 +225,15 @@ fn query() -> Option<Vec<u8>> {
 /// Send the queries to `out` and read the replies from `fd` until the DA1
 /// reply or until `timeout` has passed since they were sent.
 #[cfg(unix)]
-fn exchange(out: &mut impl Write, fd: libc::c_int, timeout: Duration) -> Vec<u8> {
+fn exchange(
+    out: &mut impl Write,
+    fd: libc::c_int,
+    timeout: Duration,
+    shm: Option<&str>,
+) -> Vec<u8> {
     // On the alternate screen, so a terminal that prints the graphics query
     // as text (Terminal.app does) leaves nothing behind once it is left.
-    let sent = write!(out, "\x1b[?1049h{}", queries())
+    let sent = write!(out, "\x1b[?1049h{}", queries(shm))
         .and_then(|()| out.flush())
         .is_ok();
     let read = move |left| read_chunk(fd, left);
@@ -214,14 +252,12 @@ fn exchange(out: &mut impl Write, fd: libc::c_int, timeout: Duration) -> Vec<u8>
             read,
         );
     }
-    // A graphics reply may still follow DA1, as in herdr.
-    if has_da1_reply(&reply) && !parse_graphics_reply(&reply) {
-        reply = read_replies(
-            reply,
-            Instant::now() + GRAPHICS_GRACE,
-            parse_graphics_reply,
-            read,
-        );
+    // Graphics replies may still follow DA1, as in herdr.
+    let graphics_done = |buf: &[u8]| {
+        parse_graphics_reply(buf) && (shm.is_none() || graphics_reply(buf, SHM_QUERY_ID).is_some())
+    };
+    if has_da1_reply(&reply) && !graphics_done(&reply) {
+        reply = read_replies(reply, Instant::now() + GRAPHICS_GRACE, graphics_done, read);
     }
     let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
     reply
@@ -290,7 +326,7 @@ fn interrupted() -> bool {
 }
 
 #[cfg(not(unix))]
-fn query() -> Option<Vec<u8>> {
+fn query(_: Option<&str>) -> Option<Vec<u8>> {
     None
 }
 
@@ -307,11 +343,27 @@ fn has_da1_reply(buf: &[u8]) -> bool {
 /// Whether `buf` holds a reply to the graphics query, `APC G i=31;... ST`.
 /// An error reply counts too: the terminal still knows the protocol.
 fn parse_graphics_reply(buf: &[u8]) -> bool {
+    graphics_reply(buf, QUERY_ID).is_some()
+}
+
+/// Whether `buf` holds an `OK` reply to the shared memory query. An error
+/// reply, such as from a terminal on another machine that has no such
+/// object, means no.
+fn parse_shm_reply(buf: &[u8]) -> bool {
+    graphics_reply(buf, SHM_QUERY_ID).as_deref() == Some("OK")
+}
+
+/// The message of the first graphics reply in `buf` about image `id`,
+/// `APC G i=id;message ST`.
+fn graphics_reply(buf: &[u8], id: u32) -> Option<String> {
     let text = String::from_utf8_lossy(buf);
-    let id = format!("i={QUERY_ID}");
-    text.split("\x1b_G").skip(1).any(|reply| {
-        let keys = reply.split(';').next().unwrap_or("");
-        keys.split(',').any(|key| key == id)
+    let id = format!("i={id}");
+    text.split("\x1b_G").skip(1).find_map(|reply| {
+        let (keys, rest) = reply.split_once(';').unwrap_or((reply, ""));
+        if !keys.split(',').any(|key| key == id) {
+            return None;
+        }
+        Some(rest.split('\x1b').next().unwrap_or("").to_string())
     })
 }
 
@@ -432,8 +484,45 @@ mod tests {
     #[test]
     fn queries_end_with_da1() {
         assert_eq!(
-            queries(),
+            queries(None),
             "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c"
+        );
+    }
+
+    #[test]
+    fn the_shared_memory_query_names_the_object_before_da1() {
+        assert_eq!(
+            queries(Some("/smd-1-0")),
+            "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
+             \x1b_Gi=32,s=1,v=1,a=q,t=s,f=24;L3NtZC0xLTA=\x1b\\\x1b[c"
+        );
+    }
+
+    #[test]
+    fn shared_memory_needs_an_ok_reply() {
+        let kitty = b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;OK\x1b\\\x1b[?62;22c";
+        assert!(parse_shm_reply(kitty));
+        assert!(parse_graphics_reply(kitty));
+        // A terminal on another machine has no such object.
+        let ssh = b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;ENOENT:Failed to open shm\x1b\\\x1b[?62c";
+        assert!(!parse_shm_reply(ssh));
+        assert!(parse_graphics_reply(ssh));
+        assert!(!parse_shm_reply(b"\x1b_Gi=31;OK\x1b\\\x1b[?62c"));
+        assert!(!parse_shm_reply(b"\x1b_Gi=320;OK\x1b\\"));
+        assert!(!parse_shm_reply(b"\x1b_Gi=32;OKAY\x1b\\"));
+        // Cut off before the reply ends: the message so far is all of it.
+        assert!(parse_shm_reply(b"\x1b_Gi=32;OK"));
+        assert!(!parse_shm_reply(b"\x1b_Gi=32"));
+        assert!(!parse_shm_reply(b""));
+    }
+
+    #[test]
+    fn upload_shared_names_the_object() {
+        let mut out = Vec::new();
+        upload_shared(&mut out, 42, "/smd-1-0", 1234).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b_Ga=t,f=100,t=s,S=1234,i=42,q=2;L3NtZC0xLTA=\x1b\\"
         );
     }
 
@@ -631,11 +720,11 @@ mod tests {
         let mut out = Vec::new();
         let timeout = Duration::from_secs(10);
         let start = Instant::now();
-        assert_eq!(exchange(&mut out, pipe.read, timeout), reply);
+        assert_eq!(exchange(&mut out, pipe.read, timeout, None), reply);
         assert!(start.elapsed() < timeout);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!("\x1b[?1049h{}\x1b[?1049l", queries())
+            format!("\x1b[?1049h{}\x1b[?1049l", queries(None))
         );
     }
 
@@ -652,7 +741,7 @@ mod tests {
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
         });
-        let reply = exchange(&mut Vec::new(), pipe.read, timeout);
+        let reply = exchange(&mut Vec::new(), pipe.read, timeout, None);
         terminal.join().unwrap();
         assert_eq!(reply, b"\x1b[6;16;8t\x1b[?62c");
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
@@ -671,7 +760,7 @@ mod tests {
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, reply.as_ptr().cast(), reply.len()) };
         });
-        let reply = exchange(&mut Vec::new(), pipe.read, REPLY_TIMEOUT);
+        let reply = exchange(&mut Vec::new(), pipe.read, REPLY_TIMEOUT, None);
         terminal.join().unwrap();
         assert!(parse_graphics_reply(&reply));
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
@@ -679,10 +768,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_shared_memory_reply_after_da1_is_read() {
+        // As in herdr: both graphics replies come after DA1, the shared
+        // memory one last. The wait goes on until it is read.
+        let pipe = Pipe::new(b"\x1b[?62;22c\x1b_Gi=31;OK\x1b\\", false);
+        let write = pipe.write.unwrap();
+        let terminal = std::thread::spawn(move || {
+            std::thread::sleep(GRAPHICS_GRACE / 4);
+            let reply = b"\x1b_Gi=32;OK\x1b\\";
+            // SAFETY: writes the reply from a live buffer to an open pipe.
+            unsafe { libc::write(write, reply.as_ptr().cast(), reply.len()) };
+        });
+        let mut out = Vec::new();
+        let reply = exchange(&mut out, pipe.read, REPLY_TIMEOUT, Some("/smd-1-0"));
+        terminal.join().unwrap();
+        assert!(parse_shm_reply(&reply));
+        assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\x1b[?1049h{}\x1b[?1049l", queries(Some("/smd-1-0")))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn da1_without_graphics_waits_only_the_grace() {
         let pipe = Pipe::new(b"\x1b[?62c", false);
         let start = Instant::now();
-        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10));
+        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10), None);
         assert_eq!(reply, b"\x1b[?62c");
         assert!(start.elapsed() < Duration::from_secs(1));
     }
@@ -694,7 +807,7 @@ mod tests {
         // before the timeout: only the outcome is checked, not the time.
         let pipe = Pipe::new(b"", false);
         let mut out = Vec::new();
-        assert!(exchange(&mut out, pipe.read, Duration::from_millis(20)).is_empty());
+        assert!(exchange(&mut out, pipe.read, Duration::from_millis(20), None).is_empty());
         assert!(out.ends_with(b"\x1b[?1049l"));
     }
 
@@ -729,7 +842,7 @@ mod tests {
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, b"\x1b[?62c".as_ptr().cast(), 6) };
         });
-        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10));
+        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10), None);
         terminal.join().unwrap();
         // SAFETY: puts back the handler saved above.
         unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) };
@@ -756,7 +869,7 @@ mod tests {
     fn exchange_reads_nothing_when_the_queries_cannot_be_sent() {
         // The replies would be there, but no query went out to ask for them.
         let pipe = Pipe::new(b"\x1b[?62c", true);
-        assert!(exchange(&mut Broken, pipe.read, REPLY_TIMEOUT).is_empty());
+        assert!(exchange(&mut Broken, pipe.read, REPLY_TIMEOUT, None).is_empty());
         assert_eq!(
             read_chunk(pipe.read, REPLY_TIMEOUT).as_deref(),
             Some(&b"\x1b[?62c"[..])

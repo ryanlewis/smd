@@ -229,7 +229,8 @@ fn smd(args: Args) -> Result<(), Failure> {
         args.no_remote_images,
         config.remote_images,
     ));
-    let images = images_for(look.cell);
+    let mut images = images_for(look.cell);
+    images.use_shared_memory(probe.is_some_and(|p| p.shared_memory));
 
     let mut terminal = opened(ratatui::try_init())?;
     let mouse = config.mouse;
@@ -316,6 +317,7 @@ mod tests {
             theme,
             background,
             graphics,
+            shared_memory: false,
         }
     }
 

@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{Embed, InlineStyle, Link, embed, is_wiki, link_dest};
+use crate::doc::{Embed, InlineStyle, Link, embed, is_wiki, link_dest, with_emoji};
 use crate::render::{LinkSpot, breaks_at};
 
 /// The longest word a column is widened to hold whole. A longer one, such as
@@ -597,9 +597,11 @@ impl Builder {
     /// The text an event adds to a cell, and its style.
     fn run(&self, event: Event) -> Option<(String, InlineStyle)> {
         let run = match event {
-            Event::Text(t) | Event::InlineHtml(t) | Event::Html(t) => {
-                (t.to_string(), self.style.clone())
-            }
+            Event::Text(t) => (
+                with_emoji(&t, self.style.link.as_ref()).into_owned(),
+                self.style.clone(),
+            ),
+            Event::InlineHtml(t) | Event::Html(t) => (t.to_string(), self.style.clone()),
             Event::Code(t) => (
                 t.to_string(),
                 InlineStyle {
@@ -796,6 +798,15 @@ mod tests {
                 "│ “a” – b │ \"c\" │",
                 "└─────────┴─────┘"
             ]
+        );
+    }
+
+    #[test]
+    fn cells_show_emoji_for_shortcodes_outside_code() {
+        let table = Table::parse("| :white_check_mark: | `:x:` |\n|---|---|");
+        assert_eq!(
+            plain(&table, 80),
+            vec!["┌────┬─────┐", "│ ✅ │ :x: │", "└────┴─────┘"]
         );
     }
 

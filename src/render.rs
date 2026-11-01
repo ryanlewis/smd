@@ -1057,10 +1057,9 @@ impl<'a> Lines<'a> {
         let breaking = width > self.avail();
         for (s, style, link) in segments {
             if breaking {
-                let mut buf = [0; 4];
-                for c in s.chars() {
-                    self.break_before(c.width().unwrap_or(0));
-                    self.push_link(c.encode_utf8(&mut buf), *style, *link, spots);
+                for piece in clusters(s) {
+                    self.break_before(piece.width());
+                    self.push_link(piece, *style, *link, spots);
                 }
             } else {
                 self.push_link(s, *style, *link, spots);
@@ -1076,10 +1075,9 @@ impl<'a> Lines<'a> {
     }
 
     fn push_breaking(&mut self, s: &str, style: Style) {
-        let mut buf = [0; 4];
-        for c in s.chars() {
-            self.break_before(c.width().unwrap_or(0));
-            self.push(c.encode_utf8(&mut buf), style);
+        for piece in clusters(s) {
+            self.break_before(piece.width());
+            self.push(piece, style);
         }
     }
 
@@ -1131,6 +1129,29 @@ impl<'a> Lines<'a> {
             self.finish();
         }
     }
+}
+
+/// `s` in the pieces a line may break between: each character with those
+/// after it that draw nothing, such as the U+FE0F that makes ❤ an emoji two
+/// columns wide, and those joined to it by U+200D.
+fn clusters(s: &str) -> impl Iterator<Item = &str> {
+    let mut rest = s;
+    std::iter::from_fn(move || {
+        let mut chars = rest.char_indices();
+        let (_, first) = chars.next()?;
+        let mut end = first.len_utf8();
+        let mut joined = false;
+        for (i, c) in chars {
+            if !joined && c.width() != Some(0) {
+                break;
+            }
+            joined = c == '\u{200d}';
+            end = i + c.len_utf8();
+        }
+        let (piece, tail) = rest.split_at(end);
+        rest = tail;
+        Some(piece)
+    })
 }
 
 fn emit(prefix: &[Span<'static>], content: Vec<Span<'static>>, out: &mut Vec<Line<'static>>) {
@@ -1333,6 +1354,17 @@ mod tests {
     #[test]
     fn wide_characters_count_two_columns() {
         assert_eq!(plain("日本語 日本\n", 6), vec!["日本語", "日本"]);
+    }
+
+    #[test]
+    fn emoji_from_shortcodes_count_two_columns() {
+        // ❤️ is a heart and U+FE0F, two characters drawn two columns wide.
+        assert_eq!(
+            plain(":tada: :heart: :+1: :tada:\n", 8),
+            vec!["🎉 ❤️ 👍", "🎉"]
+        );
+        // A word broken anywhere keeps each emoji whole.
+        assert_eq!(plain(":heart:,abcdef\n", 4), vec!["❤️,a", "bcde", "f"]);
     }
 
     #[test]

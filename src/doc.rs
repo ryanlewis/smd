@@ -1552,7 +1552,7 @@ impl<'a> Builder<'a> {
                     false => after(i + 2).is_some_and(|c| !c.is_whitespace()),
                 };
                 if touches {
-                    self.text(&text[start..i], self.style(), piece(start, i));
+                    self.plain(&text[start..i], piece(start, i));
                     let style = self.style();
                     let top = self.top();
                     top.highlight = match open {
@@ -1570,7 +1570,7 @@ impl<'a> Builder<'a> {
             };
             let boundary = prev.is_none_or(|c| c.is_whitespace() || "([*_~=\"'".contains(c));
             if len > 0 && self.links.is_empty() && boundary && !escaped(i) {
-                self.text(&text[start..i], self.style(), piece(start, i));
+                self.plain(&text[start..i], piece(start, i));
                 let end = i + 1 + len;
                 let style = InlineStyle {
                     tag: true,
@@ -1583,7 +1583,13 @@ impl<'a> Builder<'a> {
             }
             i += c.len_utf8();
         }
-        self.text(&text[start..], self.style(), piece(start, text.len()));
+        self.plain(&text[start..], piece(start, text.len()));
+    }
+
+    /// Text in the current style, with emoji for its shortcodes.
+    fn plain(&mut self, text: &str, range: Range<usize>) {
+        let text = with_emoji(text, self.links.last()).into_owned();
+        self.text(&text, self.style(), range);
     }
 
     /// Add inline text without counting it as prose.
@@ -1716,6 +1722,57 @@ fn table_source(source: &str, range: Range<usize>) -> String {
         out.push_str(rest);
     }
     out
+}
+
+/// Text from the parser in a link to `link`, if any, with [`shortcodes`]
+/// swapped for emoji, unless it is an autolink's, whose text is its address.
+pub fn with_emoji<'a>(text: &'a str, link: Option<&Link>) -> Cow<'a, str> {
+    if link.is_some_and(|l| l.dest == text) {
+        Cow::Borrowed(text)
+    } else {
+        shortcodes(text)
+    }
+}
+
+/// `text` with GitHub's emoji shortcodes, such as `:tada:`, swapped for their
+/// emoji. A code needs no letter or digit right next to it, and one that is
+/// not known, or is in a word with `://` in it, is left as it is.
+fn shortcodes(text: &str) -> Cow<'_, str> {
+    if !text.contains(':') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_inclusive(char::is_whitespace) {
+        if word.contains("://") {
+            out.push_str(word);
+            continue;
+        }
+        // The bytes of `word` copied out, and where to look for a code.
+        let mut done = 0;
+        let mut at = 0;
+        while let Some(start) = word[at..].find(':').map(|i| at + i) {
+            at = start + 1;
+            let Some(end) = word[at..].find(':').map(|i| at + i) else {
+                break;
+            };
+            let glued = word[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                || word[end + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric);
+            if let Some(emoji) = emojis::get_by_shortcode(&word[at..end]).filter(|_| !glued) {
+                out.push_str(&word[done..start]);
+                out.push_str(emoji.as_str());
+                done = end + 1;
+                at = end + 1;
+            }
+        }
+        out.push_str(&word[done..]);
+    }
+    Cow::Owned(out)
 }
 
 fn extend_span(span: &mut Option<Range<usize>>, range: Range<usize>) {
@@ -3205,6 +3262,40 @@ paragraph @43..49
   "“Hi” – it’s — ‘ok’… "
   "\"x\" --" code
 code None "\"y\" -- ...\n" @35..53
+"#,
+        );
+    }
+
+    #[test]
+    fn shortcodes_become_emoji() {
+        assert_eq!(shortcodes(":tada: :+1:, (:heart:)"), "🎉 👍, (❤️)");
+        assert_eq!(shortcodes(":tada::rocket:"), "🎉🚀");
+        assert_eq!(
+            shortcodes("no:tada: :tada:s :nope: : 10:30:00"),
+            "no:tada: :tada:s :nope: : 10:30:00"
+        );
+        assert_eq!(
+            shortcodes("::tada: see https://x.org/:tada: :x:"),
+            ":🎉 see https://x.org/:tada: ❌"
+        );
+    }
+
+    #[test]
+    fn shortcodes_are_left_in_code_and_addresses() {
+        assert_outline(
+            "# :tada: *:x:* `:x:` <https://x.org/:x:> [:x:](https://x.org/:x:) $:x:$\n\n```\n:x:\n```\n",
+            r#"heading 1 @0..72
+  "🎉 "
+  "❌" em
+  " "
+  ":x:" code
+  " "
+  "https://x.org/:x:" link="https://x.org/:x:" wiki=false
+  " "
+  "❌" link="https://x.org/:x:" wiki=false
+  " "
+  "$:x:$" math
+code None ":x:\n" @73..84
 "#,
         );
     }

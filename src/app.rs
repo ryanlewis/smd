@@ -230,9 +230,18 @@ impl View {
     fn replace(&mut self, doc: Document) {
         let anchor = self.anchor();
         let kept = self.current_match();
+        let span = kept
+            .as_ref()
+            .and_then(|(a, _)| Some(self.block(a)?.span.clone()));
         let old = std::mem::replace(&mut self.doc, Rc::new(doc));
         let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
-        let kept = kept.and_then(|(a, nth)| Some((a.moved(&old.source, &self.doc.source)?, nth)));
+        // The match is only the same one while its block's text is.
+        let kept = kept.zip(span).and_then(|((a, nth), span)| {
+            let a = a.moved(&old.source, &self.doc.source)?;
+            let text = &old.source[span.clone()];
+            let new = self.doc.source.get(a.start..a.start + span.len());
+            (new == Some(text)).then_some((a, nth))
+        });
         let flipped = std::mem::take(&mut self.flipped);
         let flipped = flipped.into_iter();
         self.flipped = flipped
@@ -590,8 +599,8 @@ impl View {
 
     /// Do what an action says, with the number typed before its key: a
     /// scroll goes that many times as far, top and bottom go to that line,
-    /// and link selection moves that many times. Back, forward and the rest
-    /// ignore it here.
+    /// and link selection and `n` and `N` move that many times. Back,
+    /// forward and the rest ignore it here.
     fn act_counted(&mut self, action: Action, count: Option<usize>) -> Option<Go> {
         let times = count.unwrap_or(1);
         let page = (self.height as isize).max(1);
@@ -2002,6 +2011,16 @@ mod tests {
         on_match(&mut v, "two", 0);
         v.reload(parse("pin\n"));
         assert_eq!(v.search.current, None);
+        // So does an edit to its block: the second "pin" is not the one the
+        // reader was on any more.
+        v.reload(parse("pin one pin two\n\nend\n"));
+        on_match(&mut v, "pin", 1);
+        v.reload(parse("pin pin one pin two\n\nend\n"));
+        assert_eq!(v.search.current, None);
+        // An edit to another block keeps it.
+        on_match(&mut v, "pin", 2);
+        v.reload(parse("pin pin one pin two\n\nthe end\n"));
+        assert_eq!(v.search.current, Some(2));
     }
 
     fn paragraphs(n: usize) -> String {

@@ -1215,6 +1215,48 @@ mod tests {
     }
 
     #[test]
+    fn footnotes_with_smart_punctuation_emoji_and_a_definition_list() {
+        let md = "\"Hi\" -- :tada: one[^a]... two[^b].\n\n[^a]: :tada: \"Quoted\"...\n\n\
+                  [^b]: Term\n    : Details :tada:\n";
+        let doc = parse(md);
+        let at = |name| &doc.source[doc.anchor(name).unwrap()..][..4];
+        assert_eq!(at("fnref:1"), "[^a]");
+        assert_eq!(at("fnref:2"), "[^b]");
+        assert_eq!(at("fn:1"), ":tad");
+        assert_eq!(at("fn:2"), "Term");
+        assert_eq!(
+            plain(md, 40),
+            vec![
+                "“Hi” – 🎉 one[1]… two[2].",
+                "",
+                "────────────────────────────────────────",
+                "",
+                "1. 🎉 “Quoted”… ↩",
+                "",
+                "2. Term",
+                "       Details 🎉",
+                "",
+                "   ↩",
+            ]
+        );
+        let layout = render(&doc, 40, &no_images());
+        let links: Vec<_> = layout
+            .links
+            .iter()
+            .map(|l| (l.link.dest.as_str(), l.cells.clone()))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("#fn:1", vec![(0, 13..16)]),
+                ("#fn:2", vec![(0, 21..24)]),
+                ("#fnref:1", vec![(4, 16..17)]),
+                ("#fnref:2", vec![(9, 3..4)]),
+            ]
+        );
+    }
+
+    #[test]
     fn footnotes_are_numbered_and_listed_at_the_end() {
         let md = "One[^b] two[^a] three[^b] none[^x].\n\n[^a]: First.\n\n\
                   [^b]: Second.\n\n    More.\n\n    ```\n    code\n    ```\n\nAfter.\n";

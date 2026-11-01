@@ -52,6 +52,11 @@ impl Embedder<'_> {
                         self.embed_in(&mut item.blocks, source, from);
                     }
                 }
+                BlockKind::Definition { definitions, .. } => {
+                    for details in definitions {
+                        self.embed_in(details, source, from);
+                    }
+                }
                 _ => {}
             }
         }
@@ -93,13 +98,7 @@ impl Embedder<'_> {
         for block in blocks {
             match &mut block.kind {
                 BlockKind::Paragraph(content) | BlockKind::Heading { content, .. } => {
-                    for inline in content {
-                        if let Inline::Text { style, .. } = inline
-                            && let Some(link) = &mut style.link
-                        {
-                            *link = self.rebased(link, from);
-                        }
-                    }
+                    self.rebase_links(content, from);
                 }
                 BlockKind::Image { src, wiki, .. } => {
                     let found = if *wiki {
@@ -120,9 +119,27 @@ impl Embedder<'_> {
                         self.rebase(&mut item.blocks, from);
                     }
                 }
+                BlockKind::Definition { term, definitions } => {
+                    self.rebase_links(term, from);
+                    for details in definitions {
+                        self.rebase(details, from);
+                    }
+                }
                 // Its own blocks were rebased on its own note.
                 BlockKind::Embed { link, .. } => *link = self.rebased(link, from),
                 _ => {}
+            }
+        }
+    }
+
+    /// Point the links in `content` from the note at `from` at what they
+    /// lead to there.
+    fn rebase_links(&self, content: &mut [Inline], from: &Path) {
+        for inline in content {
+            if let Inline::Text { style, .. } = inline
+                && let Some(link) = &mut style.link
+            {
+                *link = self.rebased(link, from);
             }
         }
     }
@@ -499,6 +516,46 @@ mod tests {
         // The folded callout inside the embed is not a stop.
         let layout = render(&doc, 40, &Images::new((8, 16)));
         assert_eq!(layout.folds.len(), 0);
+    }
+
+    #[test]
+    fn an_embed_in_a_definition_is_framed_there_and_its_links_rebased() {
+        let v = TempVault::new(
+            "definition",
+            &[
+                (
+                    "a.md",
+                    "Term
+: ![[sub/b]]",
+                ),
+                (
+                    "sub/b.md",
+                    "[[c]] term
+: [[c]] details",
+                ),
+                ("sub/c.md", ""),
+            ],
+        );
+        let doc = v.open("a.md");
+        let BlockKind::Definition { definitions, .. } = &doc.blocks[0].kind else {
+            panic!("no definition: {:?}", doc.blocks);
+        };
+        let BlockKind::Embed { doc: inner, .. } = &definitions[0][0].kind else {
+            panic!("not embedded: {definitions:?}");
+        };
+        let BlockKind::Definition { term, definitions } = &inner.blocks[0].kind else {
+            panic!("no inner definition: {:?}", inner.blocks);
+        };
+        let BlockKind::Paragraph(details) = &definitions[0][0].kind else {
+            panic!("no paragraph");
+        };
+        let c = format!("{}/c.md", absolute(v.0.join("sub")).display());
+        for content in [term, details] {
+            let Inline::Text { style, .. } = &content[0] else {
+                panic!("no text");
+            };
+            assert_eq!(style.link.as_ref().unwrap().dest, c);
+        }
     }
 
     #[test]

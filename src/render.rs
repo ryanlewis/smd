@@ -339,6 +339,9 @@ fn contents(
             let span = block.span.clone();
             embed(title, link, doc, span, width, first, rest, ctx);
         }
+        BlockKind::Definition { term, definitions } => {
+            definition(term, definitions, width, first, rest, ctx);
+        }
     }
 }
 
@@ -531,6 +534,26 @@ fn embed(
     ctx.sizes = inner.sizes;
     emit(rest, vec![Span::styled("╰─", dim)], &mut ctx.layout.lines);
 }
+
+/// A term in bold on its own line, and under it each definition indented.
+fn definition(
+    term: &[Inline],
+    definitions: &[Vec<Block>],
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let links = wrap(term, bold, width, first, rest, &mut ctx.layout.lines);
+    ctx.layout.links.extend(links);
+    let indent = with(rest, Span::raw(" ".repeat(DEFINITION_INDENT)));
+    for details in definitions {
+        blocks(details, width, &indent, &indent, false, ctx);
+    }
+}
+
+const DEFINITION_INDENT: usize = 4;
 
 /// Plain text as inline content.
 fn note(text: String) -> Inline {
@@ -1286,6 +1309,29 @@ mod tests {
     #[test]
     fn nested_tight_list_has_no_blank_lines() {
         assert_eq!(plain("- a\n  - b\n- c\n", 20), vec!["• a", "  • b", "• c"]);
+    }
+
+    #[test]
+    fn definitions_are_indented_under_a_bold_term() {
+        let md = "Term\n: the first definition\n: second\n\n> Quoted\n> : inside\n";
+        assert_eq!(
+            plain(md, 16),
+            vec![
+                "Term",
+                "    the first",
+                "    definition",
+                "    second",
+                "",
+                "│ Quoted",
+                "│     inside",
+            ]
+        );
+        let layout = render(&parse(md), 16, &no_images());
+        let bold = |row: usize| {
+            let span = layout.lines[row].spans.last().unwrap();
+            span.style.add_modifier.contains(Modifier::BOLD)
+        };
+        assert!(bold(0) && bold(5) && !bold(1));
     }
 
     #[test]

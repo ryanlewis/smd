@@ -69,6 +69,12 @@ pub enum BlockKind {
     /// a TOML one between `+++` lines.
     Frontmatter(Frontmatter),
     Html(String),
+    /// A term from a definition list, with its definitions.
+    Definition {
+        term: Vec<Inline>,
+        /// Each definition's blocks.
+        definitions: Vec<Vec<Block>>,
+    },
     /// A paragraph holding nothing but one image. Until the image is ready,
     /// the block is shown as its alt text.
     Image {
@@ -382,7 +388,8 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS
-        | Options::ENABLE_FOOTNOTES;
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_DEFINITION_LIST;
     let mut builder = Builder::new(source);
     builder.hide = theme.map(other_theme);
     // The body is parsed without metadata blocks, which pulldown-cmark would
@@ -790,6 +797,10 @@ enum FrameKind {
     Html(String),
     /// A footnote's definition, by its label in lower case.
     Footnote(String),
+    /// A definition list, whose terms become blocks in its parent.
+    Definitions,
+    Term,
+    Details,
 }
 
 impl Frame {
@@ -1133,6 +1144,9 @@ impl<'a> Builder<'a> {
                 mark: None,
             },
             Tag::FootnoteDefinition(label) => FrameKind::Footnote(fold(&label)),
+            Tag::DefinitionList => FrameKind::Definitions,
+            Tag::DefinitionListTitle => FrameKind::Term,
+            Tag::DefinitionListDefinition => FrameKind::Details,
             _ => return None,
         })
     }
@@ -1184,7 +1198,10 @@ impl<'a> Builder<'a> {
             | TagEnd::HtmlBlock
             | TagEnd::List(_)
             | TagEnd::Item
-            | TagEnd::FootnoteDefinition => self.close(),
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition => self.close(),
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
             TagEnd::Strikethrough => self.strikethrough = self.strikethrough.saturating_sub(1),
@@ -1289,6 +1306,20 @@ impl<'a> Builder<'a> {
                 }
                 BlockKind::Quote(frame.blocks)
             }
+            FrameKind::Definitions => {
+                frame.flush_inlines();
+                self.top().blocks.extend(frame.blocks);
+                return;
+            }
+            FrameKind::Term => BlockKind::Definition {
+                term: frame.inlines,
+                definitions: Vec::new(),
+            },
+            FrameKind::Details => {
+                frame.flush_inlines();
+                self.add_definition(frame.blocks, span);
+                return;
+            }
             FrameKind::Code { lang, code } => code_block(lang, code),
             FrameKind::Html(html) => BlockKind::Html(html),
             FrameKind::List { items, .. } if frame.left_out && items.is_empty() => return,
@@ -1371,6 +1402,28 @@ impl<'a> Builder<'a> {
         {
             head.title = Some(trimmed_title(inlines, marker));
         }
+    }
+
+    /// Add a definition to the term before it, taking the term's span to its
+    /// end. One with no term before it gets an empty term.
+    fn add_definition(&mut self, blocks: Vec<Block>, span: Range<usize>) {
+        let top = self.top();
+        if let Some(Block {
+            kind: BlockKind::Definition { definitions, .. },
+            span: term_span,
+        }) = top.blocks.last_mut()
+        {
+            definitions.push(blocks);
+            term_span.end = term_span.end.max(span.end);
+            return;
+        }
+        top.blocks.push(Block {
+            kind: BlockKind::Definition {
+                term: Vec::new(),
+                definitions: vec![blocks],
+            },
+            span,
+        });
     }
 
     /// Mark the open list item as a task. In a loose list the marker comes
@@ -2259,6 +2312,7 @@ paragraph @23..37
                 }
                 BlockKind::Figure { kind, source } => format!("figure {kind:?} {source:?}"),
                 BlockKind::Embed { title, .. } => format!("embed {title:?}"),
+                BlockKind::Definition { .. } => "definition".to_string(),
             };
             out.push_str(&format!("{pad}{head} @{span:?}\n"));
             match kind {
@@ -2270,6 +2324,13 @@ paragraph @23..37
                     out.push_str(&format!("{pad}  title\n"));
                     outline_inlines(&callout.title, depth + 2, out);
                     outline_blocks(blocks, depth + 1, out);
+                }
+                BlockKind::Definition { term, definitions } => {
+                    outline_inlines(term, depth + 1, out);
+                    for blocks in definitions {
+                        out.push_str(&format!("{pad}  details\n"));
+                        outline_blocks(blocks, depth + 2, out);
+                    }
                 }
                 BlockKind::List { items, .. } => {
                     for ListItem { task, blocks, .. } in items {
@@ -3107,6 +3168,31 @@ callout Tip fold=None @0..26
   paragraph @15..26
     \" body\"
 ",
+        );
+    }
+
+    #[test]
+    fn pin_definition_lists() {
+        assert_outline(
+            "Term\n: one\n: *two*\n\nNext\n\n: loose\n\n  more\n\nafter\n",
+            r#"definition @0..20
+  "Term"
+  details
+    paragraph @7..11
+      "one"
+  details
+    paragraph @13..19
+      "two" em
+definition @20..43
+  "Next"
+  details
+    paragraph @28..34
+      "loose"
+    paragraph @37..42
+      "more"
+paragraph @43..49
+  "after"
+"#,
         );
     }
 }

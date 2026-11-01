@@ -202,6 +202,11 @@ impl Vault {
                         self.resolve_embeds(&mut item.blocks, from);
                     }
                 }
+                BlockKind::Definition { definitions, .. } => {
+                    for details in definitions {
+                        self.resolve_embeds(details, from);
+                    }
+                }
                 _ => {}
             }
         }

@@ -578,6 +578,9 @@ fn heading_start(blocks: &[doc::Block], wanted: &str) -> Option<usize> {
         BlockKind::List { items, .. } => items
             .iter()
             .find_map(|item| heading_start(&item.blocks, wanted)),
+        BlockKind::Definition { definitions, .. } => definitions
+            .iter()
+            .find_map(|details| heading_start(details, wanted)),
         _ => None,
     })
 }

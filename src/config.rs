@@ -15,6 +15,10 @@
 //! # Whether images on the web (http and https) are fetched and shown.
 //! # `--remote-images` and `--no-remote-images` override it.
 //! remote_images = false
+//! # The widest the text gets, in columns, and where it sits when the
+//! # window is wider: "centre" or "left".
+//! max_width = 100
+//! align = "centre"
 //! # How headings are drawn: "auto", "image" or "text".
 //! headings = "auto"
 //!
@@ -57,6 +61,7 @@ pub enum Action {
     Search,
     NextMatch,
     PrevMatch,
+    Reload,
 }
 
 impl Action {
@@ -81,6 +86,7 @@ impl Action {
             Action::Search => &["/"],
             Action::NextMatch => &["n"],
             Action::PrevMatch => &["N"],
+            Action::Reload => &["r"],
         }
     }
 
@@ -93,7 +99,7 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 18] = [
+    const ALL: [Action; 19] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -112,6 +118,7 @@ impl Action {
         Action::Search,
         Action::NextMatch,
         Action::PrevMatch,
+        Action::Reload,
     ];
 }
 
@@ -138,6 +145,18 @@ pub enum Tasks {
     Toggle,
     /// They are only shown.
     ReadOnly,
+}
+
+/// Where the text sits when the window is wider than `max_width`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Align {
+    /// In the middle of the window.
+    #[default]
+    #[serde(alias = "center")]
+    Centre,
+    /// At the left edge.
+    Left,
 }
 
 /// The named keys, as the config spells them in lower case.
@@ -250,6 +269,9 @@ struct File {
     mermaid: Renderer,
     #[serde(default)]
     tasks: Tasks,
+    max_width: Option<u16>,
+    #[serde(default)]
+    align: Align,
     #[serde(default)]
     headings: heading::Mode,
     #[serde(default)]
@@ -272,6 +294,10 @@ pub struct Config {
     pub mermaid: Renderer,
     /// Whether task checkboxes can be ticked.
     pub tasks: Tasks,
+    /// The widest the text gets, in columns; none for the whole window.
+    pub max_width: Option<u16>,
+    /// Where the text sits when the window is wider than `max_width`.
+    pub align: Align,
     /// How headings are drawn.
     pub headings: heading::Mode,
     keys: HashMap<Key, Action>,
@@ -305,7 +331,7 @@ impl Config {
         }
     }
 
-    fn from_str(text: &str) -> Result<Config, String> {
+    pub(crate) fn from_str(text: &str) -> Result<Config, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_string())?;
         let mut keys = HashMap::new();
         // The search keys came after configs were written that may use
@@ -346,6 +372,9 @@ impl Config {
             })?),
             None => None,
         };
+        if file.max_width == Some(0) {
+            return Err("max_width must be more than 0".to_string());
+        }
         Ok(Config {
             home: file.home.as_deref().map(expand_home),
             web_links: file.web_links,
@@ -354,6 +383,8 @@ impl Config {
             remote_images: file.remote_images,
             mermaid: file.mermaid,
             tasks: file.tasks,
+            max_width: file.max_width,
+            align: file.align,
             headings: file.headings,
             keys,
         })
@@ -437,6 +468,19 @@ mod tests {
         assert_eq!(c.code_background, None);
         assert!(c.mouse);
         assert!(!c.remote_images);
+        assert_eq!(c.max_width, None);
+        assert_eq!(c.align, Align::Centre);
+    }
+
+    #[test]
+    fn max_width_and_align_are_read() {
+        let c = Config::from_str("max_width = 80\nalign = \"left\"").unwrap();
+        assert_eq!(c.max_width, Some(80));
+        assert_eq!(c.align, Align::Left);
+        let c = Config::from_str("align = \"center\"").unwrap();
+        assert_eq!(c.align, Align::Centre);
+        assert!(Config::from_str("max_width = 0").is_err());
+        assert!(Config::from_str("align = \"right\"").is_err());
     }
 
     #[test]

@@ -209,7 +209,15 @@ Diagram labels and text in SVG images use Trebuchet MS or Verdana on macOS, and 
 smd [--no-graphics] [--remote-images | --no-remote-images] [FILE]
 ```
 
-With no file, smd opens the `home` note from the config. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
+With no file, smd opens the `home` note from the config, unless markdown is piped in. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
+
+smd also reads markdown piped into it, or from stdin when the file is `-`:
+
+```sh
+gh pr view --json body -q .body | smd
+```
+
+Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
 
 ### Keys
 
@@ -226,7 +234,12 @@ With no file, smd opens the `home` note from the config. `--remote-images` and `
 | `L`, Alt-Right | Go forward |
 | `/` | Search the note: type a term, then Enter to go to the first match from the top of the screen |
 | `n`, `N` | Go to the next or previous match, going round at the end |
+| `r` | Reload the file |
 | `q`, Esc, Ctrl-C | Quit |
+
+Type a number before a key to repeat it: `5j` scrolls five lines and `3` Ctrl-D three half pages. With `g` or `G`, the number is a line to go to: `42G` puts line 42 at the top. A line is a row of the note as smd draws it, counting from 1 at the top, so a long paragraph wrapped over three rows is three lines, and the count changes with the width of the pane. The number shows on the bottom row as you type it, and Esc drops it.
+
+The bottom row shows which page of the note is in view, as `page 3/10`: the page the top line is on, or the last page once the end of the note is in view. When something fails, such as a link to a note that cannot be found or a file that cannot be read, the bottom row says so until the next key.
 
 The keys can be changed in the [config](#config).
 
@@ -270,7 +283,7 @@ smd shows images from the web (http and https) only when `remote_images = true` 
 
 ### Reloading
 
-smd reloads the file when it changes on disk, including when an editor saves by renaming a new file over it. If the file is deleted, smd keeps showing the last version and says so on the bottom row.
+smd reloads the file when it changes on disk, including when an editor saves by renaming a new file over it. Press `r` to reload it by hand. If the file is deleted, smd keeps showing the last version and says so on the bottom row.
 
 ## Config
 
@@ -305,6 +318,15 @@ remote_images = false
 # mermaid-cli, which starts a headless browser for each one.
 mermaid = "builtin"
 
+# The widest the text gets, in columns, so lines stay easy to read in a
+# wide window. Without it (the default), the text fills the window.
+# Code blocks, tables, images and headings keep to it too.
+max_width = 100
+
+# Where the text sits when the window is wider than max_width: "centre"
+# (the default) or "left".
+align = "centre"
+
 # How headings are drawn: "auto" (the default) for larger text when the
 # terminal can draw it and images when not, "image" for images always, or
 # "text" for text always, larger when the terminal can draw it.
@@ -333,8 +355,9 @@ The actions and their default keys:
 | `back`, `forward` | `backspace`, `H`, `alt-left`; `L`, `alt-right` |
 | `search` | `/` |
 | `next_match`, `prev_match` | `n`; `N` |
+| `reload` | `r` |
 
-A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. With `ctrl-`, the letters `a` to `z` ignore case, so `ctrl-o` and `ctrl-O` are the same key. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.
+A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. A digit bound to an action is no longer part of a number typed before a key. With `ctrl-`, the letters `a` to `z` ignore case, so `ctrl-o` and `ctrl-O` are the same key. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.
 
 ## Limitations
 

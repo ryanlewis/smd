@@ -1,0 +1,355 @@
+//! Images on the web, fetched only when the config or `--remote-images`
+//! turns them on. Each is fetched off the UI thread, a few at a time, and kept
+//! in a disk cache for a day, so a note opens without the network the second
+//! time. A fetch that fails leaves the image as text, as a missing file does.
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
+
+use crate::images::{self, Job};
+use crate::mermaid;
+
+/// How long a fetch may take, redirects and all.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest image fetched, in bytes.
+const MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Redirects followed before a fetch is given up on.
+const MAX_REDIRECTS: u32 = 5;
+
+/// Fetches at once.
+const MAX_FETCHES: usize = 4;
+
+/// How long a cached image is used before it is fetched again.
+const FRESH: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most the cache may hold, in bytes.
+const CACHE_CAP: u64 = 100 * 1024 * 1024;
+
+/// The extension of cached images, which may be any format.
+const EXT: &str = "img";
+
+static ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Turn fetching on or off for the rest of the run. Only the first call counts.
+pub fn set_enabled(on: bool) {
+    let _ = ENABLED.set(on);
+}
+
+/// Whether web images are fetched. Off unless turned on.
+pub fn enabled() -> bool {
+    ENABLED.get().copied().unwrap_or(false)
+}
+
+/// Whether `src` is an http or https URL.
+pub fn is_remote(src: &str) -> bool {
+    let lower = src.get(..8).unwrap_or(src).to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Fetch the image at `url`, or take it from the cache.
+pub fn job(url: String) -> Job {
+    Box::new(move || {
+        let path = cache_dir().map(|dir| dir.join(cache_name(&url)));
+        let data = cached(&url, path.as_deref(), SystemTime::now(), |url| {
+            let _slot = Slot::take();
+            fetch(agent(), url, MAX_BYTES)
+        })?;
+        images::decode_remote(data)
+    })
+}
+
+/// The bytes at `url`: from the file at `cache` if it was fetched within
+/// [`FRESH`] of `now`, else from `fetch`, which are then cached.
+fn cached(
+    url: &str,
+    cache: Option<&Path>,
+    now: SystemTime,
+    fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    if let Some(path) = cache
+        && let Ok(meta) = std::fs::metadata(path)
+        && meta.modified().is_ok_and(|at| fresh(at, now))
+        && let Ok(data) = std::fs::read(path)
+    {
+        return Ok(data);
+    }
+    let data = fetch(url)?;
+    if let Some(path) = cache {
+        // An image that cannot be cached is still shown.
+        if mermaid::store(path, &data).is_ok()
+            && let Some(dir) = path.parent()
+        {
+            mermaid::evict_files(dir, CACHE_CAP, EXT);
+        }
+    }
+    Ok(data)
+}
+
+/// Whether a file written at `at` is still fresh at `now`. One from the
+/// future, as after the clock was set back, is not.
+fn fresh(at: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(at).is_ok_and(|age| age < FRESH)
+}
+
+/// The cache file name for `url`.
+fn cache_name(url: &str) -> String {
+    let mut hash = mermaid::Fnv::new();
+    hash.write(url.as_bytes());
+    format!("{:016x}.{EXT}", hash.0)
+}
+
+fn cache_dir() -> Option<PathBuf> {
+    cache_dir_in(
+        cfg!(target_os = "macos"),
+        std::env::var_os("HOME"),
+        std::env::var_os("XDG_CACHE_HOME"),
+    )
+}
+
+fn cache_dir_in(macos: bool, home: Option<OsString>, xdg: Option<OsString>) -> Option<PathBuf> {
+    Some(
+        mermaid::cache_root(macos, home, xdg)?
+            .join("smd")
+            .join("images"),
+    )
+}
+
+/// The client every fetch shares, so connections are reused.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| new_agent(TIMEOUT))
+}
+
+fn new_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .max_redirects(MAX_REDIRECTS)
+        .user_agent(concat!("smd/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+/// GET `url`, following redirects, failing on an error status or a body over
+/// `limit` bytes.
+fn fetch(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, String> {
+    let mut response = agent.get(url).call().map_err(|e| format!("{url}: {e}"))?;
+    response
+        .body_mut()
+        .with_config()
+        // ureq fails a body of exactly its limit, at the read that finds the end.
+        .limit(limit + 1)
+        .read_to_vec()
+        .map_err(|e| format!("{url}: {e}"))
+}
+
+/// A place among the [`MAX_FETCHES`] fetches, given back when dropped.
+struct Slot;
+
+static RUNNING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+impl Slot {
+    fn take() -> Slot {
+        let (lock, freed) = &RUNNING;
+        let mut running = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *running >= MAX_FETCHES {
+            running = freed.wait(running).unwrap_or_else(|e| e.into_inner());
+        }
+        *running += 1;
+        Slot
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let (lock, freed) = &RUNNING;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        freed.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::images::tests::png;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A server on localhost that answers every request with what `reply`
+    /// gives for its path, counting the requests. Its URL has no slash at the
+    /// end.
+    fn serve(reply: impl Fn(&str) -> Vec<u8> + Send + 'static) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let text = String::from_utf8_lossy(&request);
+                let path = text.split(' ').nth(1).unwrap_or("/").to_string();
+                let _ = stream.write_all(&reply(&path));
+            }
+        });
+        (url, hits)
+    }
+
+    fn ok(body: &[u8]) -> Vec<u8> {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        [head.as_bytes(), body].concat()
+    }
+
+    fn status(line: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    }
+
+    /// An agent that ignores proxies in the environment, as the server is
+    /// on localhost.
+    fn local_agent(timeout: Duration) -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .max_redirects(MAX_REDIRECTS)
+            .proxy(None)
+            .build()
+            .into()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("smd-remote-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn only_http_and_https_are_remote() {
+        assert!(is_remote("https://x.org/a.png"));
+        assert!(is_remote("http://x.org/a.png"));
+        assert!(is_remote("HTTPS://x.org/a.png"));
+        assert!(!is_remote("ftp://x.org/a.png"));
+        assert!(!is_remote("a.png"));
+        assert!(!is_remote("http:/a.png"));
+        assert!(!is_remote("日本"));
+    }
+
+    #[test]
+    fn web_images_are_off_unless_turned_on() {
+        // No test turns them on, so the default holds.
+        assert!(!enabled());
+    }
+
+    #[test]
+    fn the_cache_lives_in_the_platform_cache_directory() {
+        let os = |s: &str| Some(OsString::from(s));
+        assert_eq!(
+            cache_dir_in(false, os("/home/u"), os("/xdg")),
+            Some(PathBuf::from("/xdg/smd/images"))
+        );
+        assert_eq!(
+            cache_dir_in(false, os("/home/u"), None),
+            Some(PathBuf::from("/home/u/.cache/smd/images"))
+        );
+        assert_eq!(cache_dir_in(false, None, None), None);
+        let a = cache_name("https://x.org/a.png");
+        assert_eq!(a, cache_name("https://x.org/a.png"));
+        assert_ne!(a, cache_name("https://x.org/b.png"));
+        assert!(a.ends_with(".img"));
+    }
+
+    #[test]
+    fn a_cached_image_is_fresh_for_a_day() {
+        let now = SystemTime::now();
+        assert!(fresh(now, now));
+        assert!(fresh(now - Duration::from_secs(23 * 3600), now));
+        assert!(!fresh(now - Duration::from_secs(25 * 3600), now));
+        assert!(!fresh(now + Duration::from_secs(60), now));
+    }
+
+    #[test]
+    fn an_image_is_fetched_once_then_read_from_the_cache() {
+        let data = png(4, 2);
+        let body = data.clone();
+        let (url, hits) = serve(move |_| ok(&body));
+        let agent = local_agent(TIMEOUT);
+        let dir = scratch("cache");
+        let path = dir.join(cache_name(&url));
+        let get = |now| cached(&url, Some(&path), now, |u| fetch(&agent, u, MAX_BYTES));
+        let now = SystemTime::now();
+        assert_eq!(get(now).unwrap(), data);
+        assert_eq!(get(now).unwrap(), data);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Written whole, with no temporary file left behind.
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1);
+        // A day later it is fetched again.
+        assert_eq!(get(now + FRESH).unwrap(), data);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redirects_are_followed() {
+        let body = png(3, 3);
+        let (url, hits) = serve(move |path| {
+            match path {
+            "/old" => b"HTTP/1.1 302 Found\r\nLocation: /new\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            _ => ok(&body),
+        }
+        });
+        let agent = local_agent(TIMEOUT);
+        let got = fetch(&agent, &format!("{url}/old"), MAX_BYTES).unwrap();
+        assert_eq!(got, png(3, 3));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_failed_fetch_is_an_error_and_is_not_cached() {
+        let (url, _) = serve(|path| {
+            match path {
+            "/loop" => b"HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            "/big" => ok(&[0; 100]),
+            _ => status("404 Not Found"),
+        }
+        });
+        let agent = local_agent(TIMEOUT);
+        let dir = scratch("fail");
+        let path = dir.join("x.img");
+        let missing = format!("{url}/missing.png");
+        let got = cached(&missing, Some(&path), SystemTime::now(), |u| {
+            fetch(&agent, u, MAX_BYTES)
+        });
+        assert!(got.unwrap_err().contains("404"));
+        assert!(!path.exists());
+        assert!(fetch(&agent, &format!("{url}/loop"), MAX_BYTES).is_err());
+        // Over the size cap.
+        assert!(fetch(&agent, &format!("{url}/big"), 50).is_err());
+        assert!(fetch(&agent, &format!("{url}/big"), 100).is_ok());
+    }
+
+    #[test]
+    fn a_server_that_never_answers_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/slow.png", listener.local_addr().unwrap());
+        let agent = local_agent(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        assert!(fetch(&agent, &url, MAX_BYTES).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(listener);
+    }
+}

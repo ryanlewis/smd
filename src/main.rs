@@ -10,6 +10,7 @@ mod kitty;
 mod maths;
 mod mermaid;
 mod raster;
+mod remote;
 mod render;
 mod table;
 mod theme;
@@ -31,6 +32,12 @@ struct Args {
     /// Show images, diagrams and maths as their markdown source
     #[arg(long)]
     no_graphics: bool,
+    /// Fetch images from the web (http and https), whatever the config says
+    #[arg(long, overrides_with = "no_remote_images")]
+    remote_images: bool,
+    /// Do not fetch images from the web, whatever the config says
+    #[arg(long, overrides_with = "remote_images")]
+    no_remote_images: bool,
     /// The markdown file; with none, the `home` note from the config
     file: Option<PathBuf>,
 }
@@ -60,6 +67,15 @@ fn pick_file(given: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf, &
     given
         .or(home)
         .ok_or("no file given, and no `home` in ~/.config/smd/config.toml")
+}
+
+/// Whether web images are fetched: as the flags say, else as the config does.
+fn remote_images(on: bool, off: bool, config: bool) -> bool {
+    match (on, off) {
+        (true, _) => true,
+        (_, true) => false,
+        _ => config,
+    }
 }
 
 /// How the terminal and the config say things are drawn.
@@ -208,6 +224,11 @@ fn smd(args: Args) -> Result<(), Failure> {
     let look = Look::new(probe, config.code_background);
     apply(&look);
     mermaid::set_renderer(config.mermaid);
+    remote::set_enabled(remote_images(
+        args.remote_images,
+        args.no_remote_images,
+        config.remote_images,
+    ));
     let images = images_for(look.cell);
 
     let mut terminal = opened(ratatui::try_init())?;
@@ -260,6 +281,27 @@ mod tests {
         let home = Some(PathBuf::from("home.md"));
         assert_eq!(pick_file(given, home.clone()), Ok(PathBuf::from("a.md")));
         assert_eq!(pick_file(None, home), Ok(PathBuf::from("home.md")));
+    }
+
+    #[test]
+    fn the_remote_images_flags_win_over_the_config() {
+        assert!(!remote_images(false, false, false));
+        assert!(remote_images(false, false, true));
+        assert!(remote_images(true, false, false));
+        assert!(!remote_images(false, true, true));
+        // The last of the two flags given wins.
+        let args = Args::parse_from(["smd", "--remote-images", "--no-remote-images", "a.md"]);
+        assert!(!remote_images(
+            args.remote_images,
+            args.no_remote_images,
+            true
+        ));
+        let args = Args::parse_from(["smd", "--no-remote-images", "--remote-images", "a.md"]);
+        assert!(remote_images(
+            args.remote_images,
+            args.no_remote_images,
+            false
+        ));
     }
 
     #[test]

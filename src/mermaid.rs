@@ -203,10 +203,16 @@ fn cache_cap() -> u64 {
 }
 
 /// Delete the least recently used `.png` files in `dir` until the rest fit in
-/// `cap` bytes. A temporary file is another write in progress and is left
-/// alone, unless it is older than [`STALE_TMP`], when it was left by a write
-/// that never finished. The jobs run off the UI thread, so this does too.
+/// `cap` bytes.
 fn evict(dir: &Path, cap: u64) {
+    evict_files(dir, cap, "png");
+}
+
+/// Delete the least recently used files ending in `.{ext}` in `dir` until the
+/// rest fit in `cap` bytes. A temporary file is another write in progress and
+/// is left alone, unless it is older than [`STALE_TMP`], when it was left by a
+/// write that never finished. The jobs run off the UI thread, so this does too.
+pub(crate) fn evict_files(dir: &Path, cap: u64, ext: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -218,7 +224,7 @@ fn evict(dir: &Path, cap: u64) {
             let meta = entry.metadata().ok()?;
             let modified = meta.modified().ok()?;
             match path.extension()?.to_str()? {
-                "png" => Some((modified, path, meta.len())),
+                e if e == ext => Some((modified, path, meta.len())),
                 "tmp" => {
                     if now
                         .duration_since(modified)
@@ -335,16 +341,17 @@ fn error_line(stderr: &str) -> Option<String> {
     (!line.is_empty()).then(|| line.to_string())
 }
 
-/// Write the PNG under a temporary name, then move it into place, so a
+/// Write the file under a temporary name, then move it into place, so a
 /// reader never sees half a file. The name is unique to this write, as two
-/// jobs for the same diagram can finish together.
-fn store(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// jobs for the same file can finish together.
+pub(crate) fn store(path: &Path, data: &[u8]) -> std::io::Result<()> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let n = WRITES.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("png.{}.{n}.tmp", std::process::id()));
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let tmp = path.with_extension(format!("{ext}.{}.{n}.tmp", std::process::id()));
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -362,7 +369,11 @@ fn cache_dir() -> Option<PathBuf> {
 
 /// The platform cache directory: `~/Library/Caches` on macOS, elsewhere
 /// `$XDG_CACHE_HOME` or `~/.cache`. Relative paths are ignored.
-fn cache_root(macos: bool, home: Option<OsString>, xdg: Option<OsString>) -> Option<PathBuf> {
+pub(crate) fn cache_root(
+    macos: bool,
+    home: Option<OsString>,
+    xdg: Option<OsString>,
+) -> Option<PathBuf> {
     let absolute = |p: Option<OsString>| p.map(PathBuf::from).filter(|p| p.is_absolute());
     let home = absolute(home);
     if macos {
@@ -398,14 +409,14 @@ impl Drop for Slot {
 
 /// 64-bit FNV-1a, which unlike the standard hasher is the same in every
 /// build, so cache names stay valid across upgrades.
-struct Fnv(u64);
+pub(crate) struct Fnv(pub(crate) u64);
 
 impl Fnv {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Fnv(0xcbf2_9ce4_8422_2325)
     }
 
-    fn write(&mut self, bytes: &[u8]) {
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
         }

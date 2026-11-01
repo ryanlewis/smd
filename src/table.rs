@@ -65,7 +65,8 @@ impl Table {
         let options = Options::ENABLE_TABLES
             | Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_MATH
-            | Options::ENABLE_WIKILINKS;
+            | Options::ENABLE_WIKILINKS
+            | Options::ENABLE_SMART_PUNCTUATION;
         let mut builder = Builder::default();
         for event in Parser::new_ext(source, options) {
             builder.event(event);
@@ -781,6 +782,19 @@ mod tests {
                     vec![("x".into(), strong), (" y".into(), plain)],
                     vec![("l".into(), link)],
                 ],
+            ]
+        );
+    }
+
+    #[test]
+    fn cells_get_smart_punctuation_but_code_does_not() {
+        let table = Table::parse("| \"a\" -- b | `\"c\"` |\n|---|---|");
+        assert_eq!(
+            plain(&table, 80),
+            vec![
+                "┌─────────┬─────┐",
+                "│ “a” – b │ \"c\" │",
+                "└─────────┴─────┘"
             ]
         );
     }

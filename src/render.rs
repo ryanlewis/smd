@@ -1258,6 +1258,51 @@ mod tests {
     }
 
     #[test]
+    fn smart_punctuation_keeps_checkboxes_and_links_in_place() {
+        // Each "--" and "..." is drawn shorter than it is written.
+        let md = "- [ ] \"a\" -- b... [it's](u) -- [\"c\"](v)\n> 1. [x] 'q' --- [d](w)\n";
+        let layout = render(&parse(md), 80, &no_images());
+        let text = |row: usize| -> String {
+            layout.lines[row]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text(0), "• [ ] “a” – b… it’s – “c”");
+        assert_eq!(text(2), "│ 1. [x] ‘q’ — d");
+        let cells = |row: usize, cols: &Range<u16>| -> String {
+            text(row)
+                .chars()
+                .skip(cols.start.into())
+                .take(cols.len())
+                .collect()
+        };
+        let tasks: Vec<_> = layout
+            .tasks
+            .iter()
+            .map(|t| (cells(t.cell.0, &t.cell.1), md.as_bytes()[t.mark]))
+            .collect();
+        assert_eq!(
+            tasks,
+            [("[ ]".to_string(), b' '), ("[x]".to_string(), b'x')]
+        );
+        let links: Vec<_> = layout
+            .links
+            .iter()
+            .map(|l| (l.link.dest.as_str(), cells(l.cells[0].0, &l.cells[0].1)))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("u", "it’s".to_string()),
+                ("v", "“c”".to_string()),
+                ("w", "d".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn anchor_is_the_innermost_block_or_the_next_one() {
         // A quote (block 0) holding two paragraphs (1 and 2), then one more.
         let layout = render(&parse("> one\n>\n> two\n\nthree\n"), 20, &no_images());

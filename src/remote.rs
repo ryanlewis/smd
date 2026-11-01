@@ -64,23 +64,32 @@ pub fn job(url: String) -> Job {
 
 /// The image at `url`: from the file at `cache` if it was fetched within
 /// [`FRESH`] of `now`, else from `fetch`. What `fetch` gives is cached only
-/// if it is an image, so an error page is not kept.
+/// if it is an image, so an error page is not kept. An older cached image is
+/// used when `fetch` fails or gives no image, as when offline.
 fn cached(
     url: &str,
     cache: Option<&Path>,
     now: SystemTime,
     fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Png, String> {
+    let mut stale = None;
     if let Some(path) = cache
         && let Ok(meta) = std::fs::metadata(path)
-        && meta.modified().is_ok_and(|at| fresh(at, now))
         && let Ok(data) = std::fs::read(path)
-        && let Ok(png) = images::decode_remote(data)
     {
-        return Ok(png);
+        if meta.modified().is_ok_and(|at| fresh(at, now))
+            && let Ok(png) = images::decode_remote(data.clone())
+        {
+            return Ok(png);
+        }
+        stale = Some(data);
     }
-    let data = fetch(url)?;
-    let png = images::decode_remote(data.clone())?;
+    let fetched = fetch(url).and_then(|data| Ok((images::decode_remote(data.clone())?, data)));
+    let (png, data) = match (fetched, stale) {
+        (Ok(fetched), _) => fetched,
+        (Err(e), Some(old)) => return images::decode_remote(old).map_err(|_| e),
+        (Err(e), None) => return Err(e),
+    };
     if let Some(path) = cache {
         // An image that cannot be cached is still shown.
         if mermaid::store(path, &data).is_ok()
@@ -296,6 +305,9 @@ mod tests {
         let now = SystemTime::now();
         let want = Png::new(data.clone());
         assert_eq!(get(now), want);
+        // Written at `now`, as the file system's clock may run ahead of it.
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(now).unwrap();
         assert_eq!(get(now), want);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // Written whole, with no temporary file left behind.
@@ -305,6 +317,27 @@ mod tests {
         assert_eq!(get(now + FRESH), want);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_image_is_used_when_it_cannot_be_fetched_again() {
+        let served = Arc::new(AtomicUsize::new(0));
+        let body = png(4, 2);
+        let (url, hits) = serve(move |_| match served.fetch_add(1, Ordering::SeqCst) {
+            0 => ok(&body),
+            _ => status("500 Internal Server Error"),
+        });
+        let agent = local_agent(TIMEOUT);
+        let dir = scratch("stale");
+        let path = dir.join(cache_name(&url));
+        let get = |now| cached(&url, Some(&path), now, |u| fetch(&agent, u, MAX_BYTES));
+        let now = SystemTime::now();
+        let first = get(now);
+        let later = get(now + FRESH + Duration::from_secs(60));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(first, Png::new(png(4, 2)));
+        assert_eq!(later, first);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     #[test]

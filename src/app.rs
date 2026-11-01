@@ -22,6 +22,7 @@ use ratatui::{DefaultTerminal, Frame, Terminal};
 
 use crate::config::{Action, Config, Tasks, WebLinks};
 use crate::doc::{self, BlockKind, Document, Inline, Link};
+use crate::embed;
 use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
@@ -665,6 +666,7 @@ pub fn parse(vault: &Vault, source: &str, path: &Path) -> Document {
     let theme = theme::reported().then(theme::current);
     let mut doc = doc::parse_for(source, theme);
     vault.resolve_embeds(&mut doc.blocks, path);
+    embed::embed_notes(vault, &mut doc, path, theme);
     doc
 }
 

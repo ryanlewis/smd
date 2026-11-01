@@ -118,6 +118,9 @@ struct Ctx<'a> {
     /// The starts of the blocks that fold, drawn the other way from how
     /// they start.
     flipped: &'a HashSet<usize>,
+    /// Inside an embedded note, the span of the embed in the note shown,
+    /// which every block inside is put down as. Its tasks cannot be ticked.
+    embedded: Option<Range<usize>>,
 }
 
 /// Lay out the whole document for a view `width` columns wide. Blocks whose
@@ -166,6 +169,7 @@ fn layout_folds(
         panel,
         syntaxes,
         flipped,
+        embedded: None,
     };
     blocks(&doc.blocks, width as usize, &[], &[], false, &mut ctx);
     ctx.layout
@@ -199,7 +203,7 @@ fn block(
     let index = ctx.layout.blocks.len();
     let start = ctx.layout.lines.len();
     ctx.layout.blocks.push(BlockRows {
-        span: block.span.clone(),
+        span: ctx.embedded.clone().unwrap_or_else(|| block.span.clone()),
         rows: start..start,
         image: None,
     });
@@ -331,6 +335,10 @@ fn contents(
             tight,
             items,
         } => list(*start, *tight, items, width, first, rest, ctx),
+        BlockKind::Embed { title, link, doc } => {
+            let span = block.span.clone();
+            embed(title, link, doc, span, width, first, rest, ctx);
+        }
     }
 }
 
@@ -444,7 +452,10 @@ fn fold_title(
     let row = ctx.layout.lines.len();
     let links = wrap(&content, style, width, first, rest, &mut ctx.layout.lines);
     ctx.layout.links.extend(links);
+    // A block in an embedded note is not a stop, as its start is in the
+    // other note.
     if fold.is_some()
+        && ctx.embedded.is_none()
         && let Some(line) = ctx.layout.lines.get(row)
     {
         let from = spans_width(first) as u16;
@@ -478,6 +489,47 @@ fn callout_look(kind: CalloutKind) -> (Color, &'static str) {
         Example => (Color::Magenta, "»"),
         Quote => (Color::DarkGray, "❝"),
     }
+}
+
+/// An embedded note in a frame, under its name as a link to it.
+#[allow(clippy::too_many_arguments)]
+fn embed(
+    title: &str,
+    link: &Link,
+    doc: &Document,
+    span: Range<usize>,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    ctx: &mut Ctx,
+) {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let title = Inline::Text {
+        text: title.to_string(),
+        style: InlineStyle {
+            link: Some(link.clone()),
+            ..InlineStyle::default()
+        },
+    };
+    let top = with(first, Span::styled("╭─ ", dim));
+    let under = with(rest, Span::styled("│  ", dim));
+    let links = wrap(&[title], dim, width, &top, &under, &mut ctx.layout.lines);
+    ctx.layout.links.extend(links);
+    let bar = with(rest, Span::styled("│ ", dim));
+    let mut inner = Ctx {
+        source: &doc.source,
+        images: ctx.images,
+        layout: std::mem::take(&mut ctx.layout),
+        sizes: std::mem::take(&mut ctx.sizes),
+        panel: ctx.panel,
+        syntaxes: ctx.syntaxes,
+        flipped: &HashSet::new(),
+        embedded: Some(ctx.embedded.clone().unwrap_or(span)),
+    };
+    blocks(&doc.blocks, width, &bar, &bar, false, &mut inner);
+    ctx.layout = inner.layout;
+    ctx.sizes = inner.sizes;
+    emit(rest, vec![Span::styled("╰─", dim)], &mut ctx.layout.lines);
 }
 
 /// Plain text as inline content.
@@ -605,7 +657,7 @@ fn list(
         if let Some(done) = item.task {
             marker.push_str(if done { "[x] " } else { "[ ] " });
             indent += 4;
-            if let Some(mark) = item.mark {
+            if let Some(mark) = item.mark.filter(|_| ctx.embedded.is_none()) {
                 // The item's first line is the next one out.
                 let at = (spans_width(prefix) + marker_width) as u16;
                 ctx.layout.tasks.push(TaskSpot {

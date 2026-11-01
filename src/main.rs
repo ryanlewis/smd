@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod doc;
+mod embed;
 mod heading;
 mod highlight;
 mod images;

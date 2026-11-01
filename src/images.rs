@@ -117,14 +117,19 @@ impl Uploaded {
     /// delete every image in the terminal. The objects go first, so they are
     /// removed even when the terminal can no longer be written to.
     pub fn delete_all(&self, out: &mut impl Write) -> io::Result<()> {
-        for name in lock(&self.objects).drain() {
-            kitty::shm::unlink(&name);
-        }
+        self.remove_objects();
         let ids = lock(&self.ids);
         for &id in ids.iter() {
             kitty::delete(out, id)?;
         }
         out.flush()
+    }
+
+    /// Remove every shared memory object the terminal may not have read.
+    pub fn remove_objects(&self) {
+        for name in lock(&self.objects).drain() {
+            kitty::shm::unlink(&name);
+        }
     }
 
     fn set(&self, id: u32, uploaded: bool) {

@@ -7,7 +7,8 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -1664,31 +1665,222 @@ pub fn raise(signal: i32) {
 #[cfg(not(unix))]
 pub fn raise(_: i32) {}
 
-/// Make SIGTERM and SIGHUP end the run loop rather than the process at once.
-/// Ctrl-C is a key while the terminal is raw, so it is left alone.
+/// True until smd starts to set the terminal up. Until then a signal ends
+/// smd at once, as nothing needs restoring.
+static AT_ONCE: AtomicBool = AtomicBool::new(true);
+
+/// Whether `reading stdin…` is on stderr's line, for a signal to clear.
+static STDIN_HINT: AtomicBool = AtomicBool::new(false);
+
+/// The end of a pipe a stop signal writes a byte to, to wake the thread that
+/// makes sure smd ends (see `make_sure_smd_ends`). -1 when there is none.
+static WAKE: AtomicI32 = AtomicI32::new(-1);
+
+/// The shared memory objects to remove if smd is stuck when asked to stop.
+static OBJECTS: OnceLock<images::Uploaded> = OnceLock::new();
+
+/// How long the terminal may go without taking any output, after a stop
+/// signal, before smd is taken to be stuck writing to it and is ended.
+const STOP_GRACE: Duration = Duration::from_secs(1);
+
+/// How often to look again whether the terminal takes output while smd is
+/// busy rather than stuck after a stop signal.
+const STOP_RECHECK: Duration = Duration::from_millis(100);
+
+/// What clears the stdin hint: back to the line's start, then erase it.
+pub const CLEAR_LINE: &str = "\r\x1b[K";
+
+/// Say whether the stdin hint is on stderr's line.
+pub fn stdin_hint(showing: bool) {
+    STDIN_HINT.store(showing, Ordering::Relaxed);
+}
+
+/// Remove the objects `uploaded` holds if a stop signal cannot end the run
+/// loop, as when smd is stuck writing to a terminal that does not read.
+pub fn remove_on_stop(uploaded: images::Uploaded) {
+    let _ = OBJECTS.set(uploaded);
+}
+
+/// Make SIGTERM and SIGHUP end smd cleanly, and Ctrl-C too while smd waits
+/// for piped stdin. A signal smd was started with ignored, as SIGHUP under
+/// `nohup`, stays ignored. Until `stop_later`, a signal ends smd at once,
+/// after clearing the stdin hint if it shows.
 #[cfg(unix)]
 pub fn stop_on_signals() {
-    // Only stores to an atomic, which is safe in a signal handler.
-    extern "C" fn on_signal(signal: libc::c_int) {
-        STOP.store(signal, Ordering::Relaxed);
+    if let Some(read) = wake_pipe() {
+        let _ = std::thread::Builder::new()
+            .name("stop".into())
+            .spawn(move || make_sure_smd_ends(read));
     }
-    for signal in [libc::SIGTERM, libc::SIGHUP] {
-        // SAFETY: a zeroed sigaction is valid; the handler is async-signal
-        // safe. SA_RESTART keeps other system calls from failing with EINTR.
-        // SA_RESETHAND makes a second signal stop smd at once, as when it is
-        // stuck writing to a terminal that does not read.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART | libc::SA_RESETHAND;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(signal, &action, std::ptr::null_mut());
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        if !ignored(signal) {
+            handle(
+                signal,
+                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
         }
     }
 }
 
 #[cfg(not(unix))]
 pub fn stop_on_signals() {}
+
+/// From now on a stop signal ends the run loop rather than smd at once, and
+/// Ctrl-C is left to the terminal: it is a key while the terminal is raw.
+#[cfg(unix)]
+pub fn stop_later() {
+    if !ignored(libc::SIGINT) {
+        handle(libc::SIGINT, libc::SIG_DFL);
+    }
+    AT_ONCE.store(false, Ordering::Relaxed);
+}
+
+#[cfg(not(unix))]
+pub fn stop_later() {
+    AT_ONCE.store(false, Ordering::Relaxed);
+}
+
+/// Only loads and stores atomics and calls `write` and `raise`, which are
+/// safe in a signal handler.
+#[cfg(unix)]
+extern "C" fn on_signal(signal: libc::c_int) {
+    if AT_ONCE.load(Ordering::Relaxed) {
+        if STDIN_HINT.load(Ordering::Relaxed) {
+            // SAFETY: writes a constant buffer to stderr.
+            unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    CLEAR_LINE.as_ptr().cast(),
+                    CLEAR_LINE.len(),
+                )
+            };
+        }
+        // SA_RESETHAND has set the default action back, so this ends smd as
+        // the signal would have once the handler returns.
+        // SAFETY: raise is async-signal safe.
+        unsafe { libc::raise(signal) };
+        return;
+    }
+    STOP.store(signal, Ordering::Relaxed);
+    let wake = WAKE.load(Ordering::Relaxed);
+    if wake >= 0 {
+        // SAFETY: writes one byte from a local; the pipe does not block.
+        unsafe { libc::write(wake, [1u8].as_ptr().cast(), 1) };
+    }
+}
+
+/// Whether `signal` is ignored, as SIGHUP is under `nohup`.
+#[cfg(unix)]
+fn ignored(signal: libc::c_int) -> bool {
+    // SAFETY: a zeroed sigaction is valid; a null new action only reads the
+    // current one.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Handle `signal` with `handler`, a function or `SIG_DFL`.
+#[cfg(unix)]
+fn handle(signal: libc::c_int, handler: libc::sighandler_t) {
+    // SAFETY: a zeroed sigaction is valid; the handler is async-signal
+    // safe. SA_RESTART keeps other system calls from failing with EINTR.
+    // SA_RESETHAND makes a second signal stop smd at once.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler;
+        action.sa_flags = libc::SA_RESTART | libc::SA_RESETHAND;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(signal, &action, std::ptr::null_mut());
+    }
+}
+
+/// A pipe for the stop signal to wake a thread with. Its write end, which
+/// never blocks, goes to `WAKE`; the read end is returned. Neither is passed
+/// on to child processes.
+#[cfg(unix)]
+fn wake_pipe() -> Option<libc::c_int> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe writes two descriptors into fds; fcntl only changes
+    // flags on them.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return None;
+        }
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let flags = libc::fcntl(fds[1], libc::F_GETFL);
+        libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    WAKE.store(fds[1], Ordering::Relaxed);
+    Some(fds[0])
+}
+
+/// Wait on `read` for a stop signal, then end smd here if the terminal takes
+/// no output for `STOP_GRACE`: smd is then stuck writing to it. While the
+/// terminal takes output, even slowly as over ssh, smd is busy rather than
+/// stuck, as with a large document to lay out, and the run loop is left to
+/// end it and restore the terminal. Only the shared memory objects are
+/// removed, as the terminal cannot be written to. Their lock is never held
+/// across a write, so this does not wait on a stuck thread.
+#[cfg(unix)]
+fn make_sure_smd_ends(read: libc::c_int) {
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: reads at most one byte into a local.
+        let n = unsafe { libc::read(read, (&raw mut byte).cast(), 1) };
+        if n == 1 {
+            break;
+        }
+        if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return;
+    }
+    loop {
+        match takes_output(libc::STDOUT_FILENO, STOP_GRACE) {
+            Ok(true) => std::thread::sleep(STOP_RECHECK),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            _ => break,
+        }
+    }
+    if let Some(objects) = OBJECTS.get() {
+        objects.remove_objects();
+    }
+    if let Some(signal) = stop_signal() {
+        raise(signal);
+    }
+}
+
+/// Whether a write to `fd` would go through within `wait` rather than wait
+/// longer. Asked with select, as poll on macOS does not work with terminals.
+#[cfg(unix)]
+fn takes_output(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
+    let mut wait = libc::timeval {
+        tv_sec: wait.as_secs() as libc::time_t,
+        tv_usec: wait.subsec_micros() as libc::suseconds_t,
+    };
+    // SAFETY: a zeroed fd_set is valid and fd is below FD_SETSIZE; select
+    // only looks at the descriptor and writes to the set and the timeval.
+    let ready = unsafe {
+        let mut set: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut set);
+        libc::FD_SET(fd, &mut set);
+        libc::select(
+            fd + 1,
+            std::ptr::null_mut(),
+            &mut set,
+            std::ptr::null_mut(),
+            &mut wait,
+        )
+    };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ready > 0)
+}
 
 /// Where the run loop gets the terminal's events and the time, so a test
 /// can stand in for both.
@@ -4117,5 +4309,38 @@ mod tests {
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(b.path, dir.join("B.md"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_is_seen_as_ignored_only_when_it_is() {
+        // SIGUSR2 stands in for SIGHUP under nohup; nothing else uses it.
+        // SAFETY: sets and reads one signal's disposition.
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_IGN) };
+        assert!(ignored(libc::SIGUSR2));
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
+        assert!(!ignored(libc::SIGUSR2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_is_taken_until_the_reader_stops_reading() {
+        // A pipe nobody reads stands in for a terminal that stopped reading.
+        let mut fds = [0; 2];
+        let wait = Duration::from_millis(20);
+        // SAFETY: pipe writes two descriptors into fds; fcntl only sets a
+        // flag; the writes are from a local; both descriptors are ours and
+        // closed once.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let flags = libc::fcntl(fds[1], libc::F_GETFL);
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            assert!(takes_output(fds[1], wait).unwrap());
+            let chunk = [0u8; 4096];
+            while libc::write(fds[1], chunk.as_ptr().cast(), chunk.len()) > 0 {}
+            assert!(!takes_output(fds[1], wait).unwrap());
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 }

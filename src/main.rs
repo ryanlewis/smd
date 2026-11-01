@@ -192,11 +192,16 @@ fn shows_stdin_hint(fd: libc::c_int, stderr_is_terminal: bool) -> bool {
 fn read_stdin() -> io::Result<String> {
     let hint = shows_stdin_hint(libc::STDIN_FILENO, io::stderr().is_terminal());
     if hint {
+        // Set first, so a signal from here on clears whatever was printed.
+        app::stdin_hint(true);
         eprint!("reading stdin…");
     }
     let read = io::read_to_string(io::stdin());
     if hint {
-        eprint!("\r\x1b[K");
+        // Cleared first, so a signal before the hint is noted gone clears
+        // it again rather than not at all.
+        eprint!("{}", app::CLEAR_LINE);
+        app::stdin_hint(false);
     }
     read
 }
@@ -282,6 +287,9 @@ fn main() -> ExitCode {
 }
 
 fn smd(args: Args) -> Result<(), Failure> {
+    // Until the terminal is set up, SIGTERM, SIGHUP and Ctrl-C end smd at
+    // once; after, they end the loop below, so the terminal is restored.
+    app::stop_on_signals();
     let config = loaded(config::Config::load())?;
     let picked = pick_source(args.file, config.home.clone(), is_piped(libc::STDIN_FILENO));
     let picked = picked.unwrap_or_else(|message| {
@@ -305,8 +313,14 @@ fn smd(args: Args) -> Result<(), Failure> {
         source(&path, read)?
     };
     let vault = vault::Vault::for_file(&path);
+    app::stop_later();
     // Asked before the terminal is set up, while nothing else reads its replies.
     let probe = (!args.no_graphics).then(kitty::probe);
+    // A signal during the probe ends smd once the probe has put the terminal
+    // back.
+    if let Some(signal) = app::stop_signal() {
+        app::raise(signal);
+    }
     let look = Look::new(probe, config.code_background);
     apply(&look);
     let text_sizing = probe.is_some_and(|p| p.text_sizing);
@@ -319,14 +333,13 @@ fn smd(args: Args) -> Result<(), Failure> {
     ));
     let mut images = images_for(look.cell);
     images.use_shared_memory(probe.is_some_and(|p| p.shared_memory));
+    app::remove_on_stop(images.uploaded());
 
     let mut terminal = opened(ratatui::try_init())?;
     let mouse = config.mouse;
     set_mouse(&mut io::stdout(), mouse, true);
     // After ratatui's hook, so it runs first.
     set_panic_hook(images.uploaded(), mouse);
-    // SIGTERM and SIGHUP now end the loop below, so the terminal is restored.
-    app::stop_on_signals();
     // Started once the hook is set, like the jobs below.
     highlight::load_in_background();
     // Made once the hook is set, as this starts the jobs.

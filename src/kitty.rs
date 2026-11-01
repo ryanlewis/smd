@@ -855,7 +855,7 @@ mod tests {
         let reply = exchange(&mut Vec::new(), pipe.read, REPLY_TIMEOUT, None);
         let done = t0.elapsed();
         let wrote = terminal.join().unwrap();
-        eprintln!("DEBUG {}: wrote at {wrote:?}, exchange done at {done:?}, reply {:?}", "a_graphics_reply_after_da1_is_read", String::from_utf8_lossy(&reply));
+        eprintln!("DEBUG a_graphics_reply_after_da1_is_read: wrote at {wrote:?}, exchange done at {done:?}, reply {:?}", String::from_utf8_lossy(&reply));
         assert!(parse_graphics_reply(&reply));
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
     }
@@ -880,7 +880,7 @@ mod tests {
         let reply = exchange(&mut out, pipe.read, REPLY_TIMEOUT, Some("/smd-1-0"));
         let done = t0.elapsed();
         let wrote = terminal.join().unwrap();
-        eprintln!("DEBUG {}: wrote at {wrote:?}, exchange done at {done:?}, reply {:?}", "a_shared_memory_reply_after_da1_is_read", String::from_utf8_lossy(&reply));
+        eprintln!("DEBUG a_shared_memory_reply_after_da1_is_read: wrote at {wrote:?}, exchange done at {done:?}, reply {:?}", String::from_utf8_lossy(&reply));
         assert!(parse_shm_reply(&reply));
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
         assert_eq!(

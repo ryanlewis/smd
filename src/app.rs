@@ -1,6 +1,7 @@
 //! The full-screen view: a scrollable window onto the laid-out document, and
 //! the browser that moves it from note to note along links.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use crate::doc::{self, BlockKind, Document, Inline, Link};
 use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
-use crate::render::{Layout, render};
+use crate::render::{Layout, render_folds};
 use crate::theme;
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
@@ -57,14 +58,18 @@ pub struct View {
     /// Other notes, with their image directories, whose images are kept so
     /// they show at once when the reader goes back to them.
     kept: Vec<(Rc<Document>, PathBuf)>,
+    /// The starts of the blocks the reader folded the other way from how
+    /// they start.
+    flipped: HashSet<usize>,
 }
 
-/// Something Tab stops at: a link or a task's checkbox, by its index in the
-/// layout's links or tasks.
+/// Something Tab stops at: a link, a task's checkbox or a folding title, by
+/// its index in the layout's links, tasks or folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
     Link(usize),
     Task(usize),
+    Fold(usize),
 }
 
 /// What an action asks of the browser around the view.
@@ -79,6 +84,8 @@ pub enum Go {
     },
     Back,
     Forward,
+    /// Fold the block that starts at this byte of the source open or shut.
+    Fold(usize),
 }
 
 /// The block at the top of the view, found again after the document is laid
@@ -129,6 +136,7 @@ impl View {
             selected: None,
             tasks: false,
             kept: Vec::new(),
+            flipped: HashSet::new(),
         };
         view.want_images();
         view
@@ -140,6 +148,7 @@ impl View {
         self.base = base;
         self.scroll = 0;
         self.selected = None;
+        self.flipped.clear();
         self.want_images();
         self.relayout(None);
     }
@@ -185,7 +194,7 @@ impl View {
     fn relayout(&mut self, anchor: Option<Anchor>) {
         if self.width > 0 {
             self.highlighted = highlight::ready().is_some();
-            self.layout = render(&self.doc, self.width, &self.images);
+            self.layout = render_folds(&self.doc, self.width, &self.images, &self.flipped);
             if let Some(row) = anchor.and_then(|a| self.find(&a)) {
                 self.scroll = row;
             }
@@ -264,7 +273,7 @@ impl View {
         if width != self.width {
             let old_len = self.layout.lines.len().max(1);
             self.highlighted = highlight::ready().is_some();
-            self.layout = render(&self.doc, width, &self.images);
+            self.layout = render_folds(&self.doc, width, &self.images, &self.flipped);
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
             self.selected = self.selected.filter(|&s| self.has(s));
@@ -367,7 +376,8 @@ impl View {
         let links = (0..self.layout.links.len()).map(Stop::Link);
         let tasks = (0..self.layout.tasks.len()).map(Stop::Task);
         let tasks = tasks.filter(|_| self.tasks);
-        let mut stops: Vec<Stop> = links.chain(tasks).collect();
+        let folds = (0..self.layout.folds.len()).map(Stop::Fold);
+        let mut stops: Vec<Stop> = links.chain(tasks).chain(folds).collect();
         stops.sort_by_key(|&s| self.cells(s).first().map(|(row, cols)| (*row, cols.start)));
         stops
     }
@@ -377,6 +387,7 @@ impl View {
         match stop {
             Stop::Link(i) => i < self.layout.links.len(),
             Stop::Task(i) => self.tasks && i < self.layout.tasks.len(),
+            Stop::Fold(i) => i < self.layout.folds.len(),
         }
     }
 
@@ -385,12 +396,15 @@ impl View {
         match stop {
             Stop::Link(i) => self.layout.links[i].cells.clone(),
             Stop::Task(i) => vec![self.layout.tasks[i].cell.clone()],
+            Stop::Fold(i) => vec![self.layout.folds[i].cell.clone()],
         }
     }
 
-    /// What choosing `stop` does: follow the link, or tick the checkbox.
+    /// What choosing `stop` does: follow the link, tick the checkbox, or
+    /// fold the block.
     fn choose(&self, stop: Stop) -> Go {
         match stop {
+            Stop::Fold(i) => Go::Fold(self.layout.folds[i].at),
             Stop::Link(i) => Go::Follow(self.layout.links[i].link.clone()),
             Stop::Task(i) => {
                 let task = &self.layout.tasks[i];
@@ -422,12 +436,34 @@ impl View {
             // Only a checkbox: a selected link stays where it is.
             Action::Toggle => match self.selected? {
                 stop @ Stop::Task(_) => return Some(self.choose(stop)),
-                Stop::Link(_) => {}
+                Stop::Link(_) | Stop::Fold(_) => {}
             },
             Action::Back => return Some(Go::Back),
             Action::Forward => return Some(Go::Forward),
         }
         None
+    }
+
+    /// Fold the block starting at `at` open or shut, keeping its title on
+    /// the same row of the screen and selected if it was.
+    fn fold(&mut self, at: usize) {
+        let row = |layout: &Layout| {
+            let spot = layout.folds.iter().position(|f| f.at == at)?;
+            Some((spot, layout.folds[spot].cell.0))
+        };
+        let before = row(&self.layout);
+        let was_selected = before.is_some_and(|(i, _)| self.selected == Some(Stop::Fold(i)));
+        if !self.flipped.remove(&at) {
+            self.flipped.insert(at);
+        }
+        self.relayout(None);
+        if let (Some((_, old)), Some((i, new))) = (before, row(&self.layout)) {
+            let screen = old.saturating_sub(self.scroll);
+            self.scroll = new.saturating_sub(screen).min(self.max_scroll());
+            if was_selected {
+                self.selected = Some(Stop::Fold(i));
+            }
+        }
     }
 
     /// The rows in view.
@@ -489,7 +525,9 @@ fn heading_start(blocks: &[doc::Block], wanted: &str) -> Option<usize> {
                 .collect();
             vault::heading_matches(&text, wanted).then_some(b.span.start)
         }
-        BlockKind::Quote(inner) => heading_start(inner, wanted),
+        BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
+            heading_start(inner, wanted)
+        }
         BlockKind::List { items, .. } => items
             .iter()
             .find_map(|item| heading_start(&item.blocks, wanted)),
@@ -720,6 +758,7 @@ impl Browser {
             Go::Toggle { mark, done } => self.toggle(mark, done),
             Go::Back => self.back(),
             Go::Forward => self.forward(),
+            Go::Fold(at) => self.view.fold(at),
         }
     }
 
@@ -1580,6 +1619,40 @@ mod tests {
     }
 
     #[test]
+    fn enter_or_a_click_on_a_callout_title_folds_it() {
+        let note = "> [!note]- Shut\n> hidden [[Plan]]\n\nafter [[Plan]]\n";
+        let (mut b, dir) = browser("fold", &[("HOME.md", note), ("Plan.md", "p\n")]);
+        let rows = |b: &Browser| b.view.layout.lines.len();
+        assert_eq!(rows(&b), 3);
+        // The title is the first stop; the shut body's link is not drawn.
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.selected, Some(Stop::Fold(0)));
+        assert_eq!(b.view.stops(), [Stop::Fold(0), Stop::Link(0)]);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(rows(&b), 4);
+        assert_eq!(b.view.selected, Some(Stop::Fold(0)));
+        assert_eq!(
+            b.view.stops(),
+            [Stop::Fold(0), Stop::Link(0), Stop::Link(1)]
+        );
+        assert_eq!(b.path, dir.join("HOME.md"));
+        // A click on the title, below the toolbar, shuts it again.
+        b.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(rows(&b), 3);
+        // A new note starts with its callouts as they are written.
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(rows(&b), 4);
+        b.view.show(parse(note), dir.clone());
+        assert_eq!(rows(&b), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_click_ticks_a_checkbox() {
         let (mut b, dir) = browser("tick-click", &[("HOME.md", "- [ ] one\n")]);
         let click = |column| MouseEvent {
@@ -1939,7 +2012,9 @@ mod tests {
         for block in blocks {
             match &block.kind {
                 BlockKind::Image { src, .. } => srcs.push(src.clone()),
-                BlockKind::Quote(inner) => srcs.extend(image_srcs(inner)),
+                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
+                    srcs.extend(image_srcs(inner))
+                }
                 BlockKind::List { items, .. } => {
                     for item in items {
                         srcs.extend(image_srcs(&item.blocks));

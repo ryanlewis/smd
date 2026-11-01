@@ -37,6 +37,11 @@ pub enum BlockKind {
         code: String,
     },
     Quote(Vec<Block>),
+    /// An Obsidian callout or GitHub alert: a quote starting `[!type]`.
+    Callout {
+        callout: Callout,
+        blocks: Vec<Block>,
+    },
     List {
         /// The number of the first item for an ordered list.
         start: Option<u64>,
@@ -74,6 +79,116 @@ pub struct Frontmatter {
     /// Each top-level key and its value, or `None` when the block is not the
     /// simple YAML read here, and is shown as its raw text instead.
     pub properties: Option<Vec<(String, String)>>,
+}
+
+/// The head of a callout: its type, title and whether it folds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Callout {
+    pub kind: CalloutKind,
+    /// The text after the marker, or the type's name when there is none.
+    pub title: Vec<Inline>,
+    /// `Some(open)` when the callout can fold: `+` starts it open, `-` shut.
+    pub fold: Option<bool>,
+}
+
+/// GitHub's five alert types and Obsidian's callout types. Each alias is
+/// read as the type it stands for, and an unknown type as a note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalloutKind {
+    Note,
+    Abstract,
+    Info,
+    Todo,
+    Tip,
+    Important,
+    Success,
+    Question,
+    Warning,
+    Caution,
+    Failure,
+    Danger,
+    Bug,
+    Example,
+    Quote,
+}
+
+impl CalloutKind {
+    fn from_name(name: &str) -> CalloutKind {
+        use CalloutKind::*;
+        match name.to_ascii_lowercase().as_str() {
+            "abstract" | "summary" | "tldr" => Abstract,
+            "info" => Info,
+            "todo" => Todo,
+            "tip" | "hint" => Tip,
+            "important" => Important,
+            "success" | "check" | "done" => Success,
+            "question" | "help" | "faq" => Question,
+            "warning" | "attention" => Warning,
+            "caution" => Caution,
+            "failure" | "fail" | "missing" => Failure,
+            "danger" | "error" => Danger,
+            "bug" => Bug,
+            "example" => Example,
+            "quote" | "cite" => Quote,
+            _ => Note,
+        }
+    }
+}
+
+/// The `[!type]` marker at the start of `line`, with its `+` or `-`: the
+/// type's name, the fold, and the marker's length in bytes.
+fn callout_marker(line: &str) -> Option<(&str, Option<bool>, usize)> {
+    let rest = line.strip_prefix("[!")?;
+    let end = rest.find(']')?;
+    let name = &rest[..end];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let len = 2 + end + 1;
+    let fold = match line[len..].chars().next() {
+        Some('+') => Some(true),
+        Some('-') => Some(false),
+        _ => None,
+    };
+    Some((name, fold, len + usize::from(fold.is_some())))
+}
+
+/// A callout's type name with its first letter in capitals and the rest
+/// not, for a callout with no title.
+fn default_title(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let mut chars = lower.chars();
+    chars
+        .next()
+        .map_or(String::new(), |c| c.to_uppercase().chain(chars).collect())
+}
+
+/// `inlines` with `skip` bytes taken off the front and the spaces at either
+/// end trimmed.
+fn trimmed_title(mut inlines: Vec<Inline>, skip: usize) -> Vec<Inline> {
+    if let Some(Inline::Text { text, .. }) = inlines.first_mut() {
+        *text = text.get(skip..).unwrap_or("").trim_start().to_string();
+    }
+    if let Some(Inline::Text { text, .. }) = inlines.last_mut() {
+        *text = text.trim_end().to_string();
+    }
+    inlines.retain(|i| !matches!(i, Inline::Text { text, .. } if text.is_empty()));
+    while matches!(inlines.last(), Some(Inline::Break)) {
+        inlines.pop();
+    }
+    inlines
+}
+
+/// A quote that starts with a callout marker, while it is read.
+struct CalloutHead {
+    name: String,
+    fold: Option<bool>,
+    /// The title, once its line has been read.
+    title: Option<Vec<Inline>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -520,7 +635,7 @@ struct Frame {
 
 enum FrameKind {
     Root,
-    Quote,
+    Quote(Option<CalloutHead>),
     List {
         start: Option<u64>,
         tight: bool,
@@ -530,7 +645,9 @@ enum FrameKind {
         task: Option<bool>,
         mark: Option<usize>,
     },
-    Paragraph,
+    /// A paragraph; for the first one in a callout, the length of the
+    /// marker in front of the title, until the title's line has been read.
+    Paragraph(Option<usize>),
     Heading(u8),
     Code {
         lang: Option<String>,
@@ -690,6 +807,7 @@ impl<'a> Builder<'a> {
             Event::FootnoteReference(label) => {
                 self.text(&format!("[^{label}]"), self.style(), range);
             }
+            Event::SoftBreak | Event::HardBreak if self.ends_title(range.end) => {}
             Event::SoftBreak => self.text(" ", self.style(), range),
             Event::HardBreak => self.inline(Inline::Break, range),
             Event::Rule => self.push_block(BlockKind::Rule, range),
@@ -729,7 +847,7 @@ impl<'a> Builder<'a> {
                 ..
             } => self.start_image(is_wiki(link_type), &dest_url, range),
             tag => {
-                if let Some(kind) = self.block_frame(tag) {
+                if let Some(kind) = self.block_frame(tag, range.clone()) {
                     self.top().flush_inlines();
                     self.stack.push(Frame::new(kind, range));
                 }
@@ -739,16 +857,16 @@ impl<'a> Builder<'a> {
 
     /// The frame a block-level tag opens, or `None` for a tag that is not
     /// enabled or is kept as plain inline text.
-    fn block_frame(&mut self, tag: Tag) -> Option<FrameKind> {
+    fn block_frame(&mut self, tag: Tag, range: Range<usize>) -> Option<FrameKind> {
         Some(match tag {
             Tag::Paragraph => {
                 if let FrameKind::Item { .. } = self.top().kind {
                     self.mark_list_loose();
                 }
-                FrameKind::Paragraph
+                FrameKind::Paragraph(self.callout_title(range))
             }
             Tag::Heading { level, .. } => FrameKind::Heading(level as u8),
-            Tag::BlockQuote(_) => FrameKind::Quote,
+            Tag::BlockQuote(_) => FrameKind::Quote(None),
             Tag::CodeBlock(kind) => FrameKind::Code {
                 lang: code_lang(kind),
                 code: String::new(),
@@ -849,7 +967,12 @@ impl<'a> Builder<'a> {
         }
         let kind = match std::mem::replace(&mut frame.kind, FrameKind::Root) {
             FrameKind::Root => unreachable!("root frame is never closed"),
-            FrameKind::Paragraph => {
+            FrameKind::Paragraph(Some(marker)) => {
+                // The title was the paragraph's only line.
+                self.take_title(std::mem::take(&mut frame.inlines), marker);
+                return;
+            }
+            FrameKind::Paragraph(None) => {
                 let blocks = paragraph_blocks(&mut frame, span);
                 self.top().blocks.extend(blocks);
                 return;
@@ -873,7 +996,27 @@ impl<'a> Builder<'a> {
                 level,
                 content: frame.inlines,
             },
-            FrameKind::Quote => {
+            FrameKind::Quote(Some(head)) => {
+                frame.flush_inlines();
+                let title = head.title.unwrap_or_default();
+                let title = if title.is_empty() {
+                    vec![Inline::Text {
+                        text: default_title(&head.name),
+                        style: InlineStyle::default(),
+                    }]
+                } else {
+                    title
+                };
+                BlockKind::Callout {
+                    callout: Callout {
+                        kind: CalloutKind::from_name(&head.name),
+                        title,
+                        fold: head.fold,
+                    },
+                    blocks: frame.blocks,
+                }
+            }
+            FrameKind::Quote(None) => {
                 frame.flush_inlines();
                 if emptied(&frame) {
                     return;
@@ -900,6 +1043,62 @@ impl<'a> Builder<'a> {
         let top = self.top();
         top.flush_inlines();
         top.blocks.push(Block { kind, span });
+    }
+
+    /// For a paragraph opening at `range` as the first thing in a quote,
+    /// the length of the callout marker it starts with, if it does. The
+    /// quote becomes a callout.
+    fn callout_title(&mut self, range: Range<usize>) -> Option<usize> {
+        let line = self.source[range.start..].lines().next().unwrap_or("");
+        let (name, fold, len) = callout_marker(line)?;
+        let top = self.stack.last_mut()?;
+        if !(matches!(top.kind, FrameKind::Quote(None))
+            && top.blocks.is_empty()
+            && top.inlines.is_empty())
+        {
+            return None;
+        }
+        top.kind = FrameKind::Quote(Some(CalloutHead {
+            name: name.to_string(),
+            fold,
+            title: None,
+        }));
+        Some(len)
+    }
+
+    /// At a line break: when it ends a callout's title line, take the line
+    /// so far as the title and return true. The paragraph goes on as the
+    /// body from `end`.
+    fn ends_title(&mut self, end: usize) -> bool {
+        if self.image.is_some() {
+            return false;
+        }
+        let top = self.top();
+        let FrameKind::Paragraph(Some(marker)) = top.kind else {
+            return false;
+        };
+        top.kind = FrameKind::Paragraph(None);
+        top.inline_span = None;
+        top.span.start = end;
+        let inlines = std::mem::take(&mut top.inlines);
+        self.take_title(inlines, marker);
+        true
+    }
+
+    /// Give the callout holding the paragraph on top of the stack its title.
+    fn take_title(&mut self, inlines: Vec<Inline>, marker: usize) {
+        // The paragraph is on top while it is open, and gone once closed.
+        let quote = match self.top().kind {
+            FrameKind::Paragraph(_) => self.under_top(),
+            _ => self.stack.last_mut(),
+        };
+        if let Some(Frame {
+            kind: FrameKind::Quote(Some(head)),
+            ..
+        }) = quote
+        {
+            head.title = Some(trimmed_title(inlines, marker));
+        }
     }
 
     /// Mark the open list item as a task. In a loose list the marker comes
@@ -1476,6 +1675,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_quote_starting_with_a_marker_is_a_callout() {
+        assert_eq!(
+            outline("> [!tip]- Read *this* first\n> body\n> more\n"),
+            "\
+callout Tip fold=Some(false) @0..42
+  title
+    \"Read \"
+    \"this\" em
+    \" first\"
+  paragraph @28..42
+    \"body more\"
+"
+        );
+    }
+
+    #[test]
+    fn a_github_alert_takes_its_type_as_its_title() {
+        assert_eq!(
+            outline("> [!WARNING]\n> Mind the step.\n"),
+            "\
+callout Warning fold=None @0..30
+  title
+    \"Warning\"
+  paragraph @13..30
+    \"Mind the step.\"
+"
+        );
+    }
+
+    #[test]
+    fn callout_types_aliases_and_folds() {
+        let head = |md: &str| match &parse(md).blocks[0].kind {
+            BlockKind::Callout { callout, blocks } => (
+                callout.kind,
+                callout.fold,
+                callout.title.clone(),
+                blocks.len(),
+            ),
+            other => panic!("not a callout: {other:?}"),
+        };
+        assert_eq!(
+            head("> [!FAQ]+\n"),
+            (CalloutKind::Question, Some(true), vec![text("Faq")], 0)
+        );
+        assert_eq!(head("> [!tldr] Short\n").0, CalloutKind::Abstract);
+        assert_eq!(head("> [!cite]\n").0, CalloutKind::Quote);
+        assert_eq!(head("> [!error]\n").0, CalloutKind::Danger);
+        assert_eq!(head("> [!Caution]\n").0, CalloutKind::Caution);
+        assert_eq!(head("> [!whatever] x\n").0, CalloutKind::Note);
+        assert_eq!(head("> [!whatever]\n").2, vec![text("Whatever")]);
+        // The marker alone, then a blank line, then the body.
+        assert_eq!(head("> [!note]\n>\n> one\n>\n> two\n").3, 2);
+    }
+
+    #[test]
+    fn callouts_nest_and_sit_in_lists() {
+        assert_eq!(
+            outline("- > [!info] Outer\n  > > [!bug] Inner\n  > > text\n"),
+            "\
+list None tight=true @0..48
+  item task=None
+    callout Info fold=None @2..48
+      title
+        \"Outer\"
+      callout Bug fold=None @22..48
+        title
+          \"Inner\"
+        paragraph @37..48
+          \"text\"
+"
+        );
+    }
+
+    #[test]
+    fn a_marker_not_at_the_start_of_a_quote_is_text() {
+        assert_eq!(
+            outline("> one\n>\n> [!note] two\n\n[!note] three\n"),
+            "\
+quote @0..22
+  paragraph @2..6
+    \"one\"
+  paragraph @10..22
+    \"[!note] two\"
+paragraph @23..37
+  \"[!note] three\"
+"
+        );
+    }
+
     /// Every field of the parsed blocks as indented lines, one block or
     /// inline per line, so a test can pin the whole of the builder's output.
     fn outline(md: &str) -> String {
@@ -1492,6 +1781,9 @@ mod tests {
                 BlockKind::Paragraph(_) => "paragraph".to_string(),
                 BlockKind::Code { lang, code } => format!("code {lang:?} {code:?}"),
                 BlockKind::Quote(_) => "quote".to_string(),
+                BlockKind::Callout { callout, .. } => {
+                    format!("callout {:?} fold={:?}", callout.kind, callout.fold)
+                }
                 BlockKind::List { start, tight, .. } => format!("list {start:?} tight={tight}"),
                 BlockKind::Rule => "rule".to_string(),
                 BlockKind::Frontmatter(Frontmatter { raw, properties }) => match properties {
@@ -1510,6 +1802,11 @@ mod tests {
                     outline_inlines(content, depth + 1, out);
                 }
                 BlockKind::Quote(blocks) => outline_blocks(blocks, depth + 1, out),
+                BlockKind::Callout { callout, blocks } => {
+                    out.push_str(&format!("{pad}  title\n"));
+                    outline_inlines(&callout.title, depth + 2, out);
+                    outline_blocks(blocks, depth + 1, out);
+                }
                 BlockKind::List { items, .. } => {
                     for ListItem { task, blocks, .. } in items {
                         out.push_str(&format!("{pad}  item task={task:?}\n"));

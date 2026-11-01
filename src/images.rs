@@ -425,7 +425,9 @@ pub fn wanted_in(blocks: &[Block], base: &Path, out: &mut Vec<(Key, Job)>) {
     for block in blocks {
         out.extend(wanted(block, base));
         match &block.kind {
-            BlockKind::Quote(inner) => wanted_in(inner, base, out),
+            BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
+                wanted_in(inner, base, out)
+            }
             BlockKind::List { items, .. } => {
                 for item in items {
                     wanted_in(&item.blocks, base, out);

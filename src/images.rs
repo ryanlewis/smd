@@ -142,7 +142,7 @@ impl Uploaded {
     }
 
     /// Note that the object `name` was sent, or that it was removed.
-    fn set_object(&self, name: &str, sent: bool) {
+    pub fn set_object(&self, name: &str, sent: bool) {
         let mut objects = lock(&self.objects);
         if sent {
             objects.insert(name.to_string());

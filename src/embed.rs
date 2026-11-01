@@ -44,9 +44,9 @@ impl Embedder<'_> {
                 continue;
             }
             match &mut block.kind {
-                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
-                    self.embed_in(inner, source, from)
-                }
+                BlockKind::Quote(inner)
+                | BlockKind::Callout { blocks: inner, .. }
+                | BlockKind::Details { blocks: inner, .. } => self.embed_in(inner, source, from),
                 BlockKind::List { items, .. } => {
                     for item in items {
                         self.embed_in(&mut item.blocks, source, from);
@@ -111,9 +111,9 @@ impl Embedder<'_> {
                         *wiki = false;
                     }
                 }
-                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
-                    self.rebase(inner, from)
-                }
+                BlockKind::Quote(inner)
+                | BlockKind::Callout { blocks: inner, .. }
+                | BlockKind::Details { blocks: inner, .. } => self.rebase(inner, from),
                 BlockKind::List { items, .. } => {
                     for item in items {
                         self.rebase(&mut item.blocks, from);
@@ -556,6 +556,39 @@ mod tests {
             };
             assert_eq!(style.link.as_ref().unwrap().dest, c);
         }
+    }
+
+    #[test]
+    fn an_embed_in_details_is_framed_there_and_its_links_rebased() {
+        let v = TempVault::new(
+            "details",
+            &[
+                (
+                    "a.md",
+                    "<details><summary>S</summary>\n\n![[sub/b]]\n\n</details>\n",
+                ),
+                ("sub/b.md", "<details>\n\n[[c]]\n\n</details>\n"),
+                ("sub/c.md", ""),
+            ],
+        );
+        let doc = v.open("a.md");
+        let BlockKind::Details { blocks, .. } = &doc.blocks[0].kind else {
+            panic!("no details: {:?}", doc.blocks);
+        };
+        let BlockKind::Embed { doc: inner, .. } = &blocks[0].kind else {
+            panic!("not embedded: {blocks:?}");
+        };
+        let BlockKind::Details { blocks, .. } = &inner.blocks[0].kind else {
+            panic!("no inner details: {:?}", inner.blocks);
+        };
+        let BlockKind::Paragraph(content) = &blocks[0].kind else {
+            panic!("no paragraph");
+        };
+        let Inline::Text { style, .. } = &content[0] else {
+            panic!("no text");
+        };
+        let c = format!("{}/c.md", absolute(v.0.join("sub")).display());
+        assert_eq!(style.link.as_ref().unwrap().dest, c);
     }
 
     #[test]

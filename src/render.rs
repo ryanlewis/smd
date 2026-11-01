@@ -330,6 +330,19 @@ fn contents(
         BlockKind::Callout { callout, blocks } => {
             self::callout(block.span.start, callout, blocks, width, first, rest, ctx);
         }
+        BlockKind::Details {
+            summary,
+            open,
+            blocks: inner,
+        } => {
+            let at = block.span.start;
+            let style = Style::default();
+            if fold_title(at, Some(*open), "", summary, style, width, first, rest, ctx) {
+                // The body sits under the summary, past the ▾.
+                let indent = with(rest, Span::raw("  "));
+                blocks(inner, width, &indent, &indent, false, ctx);
+            }
+        }
         BlockKind::List {
             start,
             tight,
@@ -737,6 +750,12 @@ fn inline_style(base: Style, style: &InlineStyle) -> Style {
     if style.strikethrough {
         s = s.add_modifier(Modifier::CROSSED_OUT);
     }
+    if style.underline {
+        s = s.add_modifier(Modifier::UNDERLINED);
+    }
+    if style.kbd {
+        s = s.add_modifier(Modifier::REVERSED);
+    }
     if style.code {
         s = s.fg(Color::Yellow);
     }
@@ -799,8 +818,22 @@ struct Units {
 
 impl Units {
     fn text(&mut self, text: &str, inline: &InlineStyle, base: Style) {
-        let style = inline_style(base, inline);
+        let mut style = inline_style(base, inline);
         self.open = self.link(inline.link.as_ref());
+        let raised = match (inline.superscript, inline.subscript) {
+            (true, _) => Some(script(text, SUPERSCRIPT)),
+            (_, true) => Some(script(text, SUBSCRIPT)),
+            _ => None,
+        };
+        let text = match raised {
+            Some(Some(raised)) => raised,
+            // Not every character has a raised or lowered form.
+            Some(None) => {
+                style = style.add_modifier(Modifier::DIM);
+                text.to_string()
+            }
+            None => text.to_string(),
+        };
         for c in text.chars() {
             // Code keeps its spaces and is not broken at them, and nor is
             // text at a no-break space.
@@ -886,6 +919,31 @@ impl Units {
         }
         (self.units, links)
     }
+}
+
+/// Characters with a superscript form, and those forms.
+const SUPERSCRIPT: (&str, &str) = (
+    "0123456789+-=()abcdefghijklmnoprstuvwxyz",
+    "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ",
+);
+
+/// Characters with a subscript form, and those forms.
+const SUBSCRIPT: (&str, &str) = (
+    "0123456789+-=()aehijklmnoprstuvx",
+    "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ",
+);
+
+/// `text` in the forms in `table`, if every character but a space has one.
+fn script(text: &str, (from, to): (&str, &str)) -> Option<String> {
+    text.chars()
+        .map(|c| match c {
+            ' ' => Some(' '),
+            c => from
+                .chars()
+                .position(|f| f == c)
+                .and_then(|i| to.chars().nth(i)),
+        })
+        .collect()
 }
 
 /// Whether a line may break at `c`: any space but a no-break one.
@@ -2500,5 +2558,48 @@ graph TD
                 ("B", true, vec![(1, 16..17)]),
             ]
         );
+    }
+
+    #[test]
+    fn html_and_markdown_scripts_keys_and_underline_are_styled() {
+        let lines = render(
+            &parse("H<sub>2</sub>O ^2n^ <sup>Q</sup> <kbd>Ctrl</kbd> <u>u</u> <sub>a b</sub>\n"),
+            40,
+            &no_images(),
+        )
+        .lines;
+        // Q and b have no raised or lowered form, so their runs are dim.
+        assert_eq!(
+            styled(&lines),
+            ["[H₂O ²ⁿ |][Q|DIM][ |][Ctrl|REVERSED][ |][u|UNDERLINED][ |][a b|DIM]"]
+        );
+    }
+
+    #[test]
+    fn html_comments_and_breaks_render() {
+        assert_eq!(
+            plain(
+                "one <!-- hidden --> two<br>three\n\n<!--\nall\n-->\n\nend\n",
+                40
+            ),
+            ["one two", "three", "", "end"]
+        );
+    }
+
+    #[test]
+    fn details_start_shut_unless_open_and_flip() {
+        let md = "<details>\n<summary>More</summary>\n\nhidden\n\n</details>\n\n\
+                  <details open><summary>Shown</summary>\n\n- body\n\n</details>\n";
+        let doc = parse(md);
+        let text = |layout: &Layout| -> Vec<String> {
+            let line = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect();
+            layout.lines.iter().map(line).collect()
+        };
+        let layout = render(&doc, 20, &no_images());
+        assert_eq!(text(&layout), ["▸ More", "", "▾ Shown", "  • body"]);
+        let folds: Vec<_> = layout.folds.iter().map(|f| (f.at, f.open)).collect();
+        assert_eq!(folds, [(0, false), (55, true)]);
+        let layout = render_folds(&doc, 20, &no_images(), &HashSet::from([0, 55]));
+        assert_eq!(text(&layout), ["▾ More", "  hidden", "", "▸ Shown"]);
     }
 }

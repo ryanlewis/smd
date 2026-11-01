@@ -11,6 +11,7 @@ use pulldown_cmark::{
     CodeBlockKind, Event, LinkType, MetadataBlockKind, Options, Parser, Tag, TagEnd,
 };
 
+use crate::html::{self, Piece};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +84,12 @@ pub enum BlockKind {
         /// An Obsidian embed, `![[name.png]]`, whose `src` is a name to look
         /// up in the vault rather than a path.
         wiki: bool,
+    },
+    /// A `<details>` block, which folds. It starts shut unless `open`.
+    Details {
+        summary: Vec<Inline>,
+        open: bool,
+        blocks: Vec<Block>,
     },
     /// A block the graphics layer will draw as an image. Until it does, the
     /// block is shown as its source text.
@@ -260,6 +267,11 @@ pub struct InlineStyle {
     pub highlight: bool,
     /// An Obsidian tag, `#tag` or `#nested/tag`.
     pub tag: bool,
+    pub underline: bool,
+    /// A key, `<kbd>`.
+    pub kbd: bool,
+    pub superscript: bool,
+    pub subscript: bool,
     pub link: Option<Link>,
 }
 
@@ -390,7 +402,9 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         | Options::ENABLE_WIKILINKS
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_DEFINITION_LIST
-        | Options::ENABLE_SMART_PUNCTUATION;
+        | Options::ENABLE_SMART_PUNCTUATION
+        // Not subscript: `~x~` is strikethrough, as on GitHub.
+        | Options::ENABLE_SUPERSCRIPT;
     let mut builder = Builder::new(source);
     builder.hide = theme.map(other_theme);
     // The body is parsed without metadata blocks, which pulldown-cmark would
@@ -805,6 +819,41 @@ struct Builder<'a> {
     definitions: HashMap<String, (Vec<Block>, Range<usize>)>,
 }
 
+/// A style or link opened and not yet closed.
+#[derive(Debug, Clone, PartialEq)]
+enum Open {
+    Strong,
+    Emphasis,
+    Strike,
+    Underline,
+    Kbd,
+    Superscript,
+    Subscript,
+    /// An `<a>`, and where it goes if it has an `href`.
+    Link(Option<Link>),
+}
+
+impl Open {
+    /// What an inline HTML tag named `name` opens, if it is one smd reads.
+    fn of(name: &str, tag: &html::Tag) -> Option<Open> {
+        Some(match name {
+            "b" | "strong" => Open::Strong,
+            "i" | "em" => Open::Emphasis,
+            "s" | "del" => Open::Strike,
+            "u" => Open::Underline,
+            "kbd" => Open::Kbd,
+            "sup" => Open::Superscript,
+            "sub" => Open::Subscript,
+            "a" => Open::Link(tag.attr("href").map(|h| Link::from(h.trim()))),
+            _ => return None,
+        })
+    }
+
+    fn same(&self, other: &Open) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
 struct Frame {
     kind: FrameKind,
     span: Range<usize>,
@@ -826,6 +875,9 @@ struct Frame {
     highlight: Option<(usize, InlineStyle)>,
     /// Whether a footnote's definition in it was moved to the end.
     held_footnote: bool,
+    /// Styles opened by inline HTML or `^sup^`, and links opened by
+    /// `<a>`, innermost last. A tag left open ends with its frame.
+    open: Vec<Open>,
 }
 
 enum FrameKind {
@@ -854,7 +906,13 @@ enum FrameKind {
     /// A definition list, whose terms become blocks in its parent.
     Definitions,
     Term,
-    Details,
+    /// A definition's blocks, under its term.
+    Definition,
+    /// A `<details>` block, and its `<summary>` and `open` attribute.
+    Details {
+        summary: Vec<Inline>,
+        open: bool,
+    },
 }
 
 impl Frame {
@@ -869,6 +927,7 @@ impl Frame {
             images: Vec::new(),
             other_inline: false,
             left_out: false,
+            open: Vec::new(),
             highlight: None,
             held_footnote: false,
         }
@@ -1061,12 +1120,24 @@ impl<'a> Builder<'a> {
     }
 
     fn style(&self) -> InlineStyle {
+        let open = &self.stack.last().expect("root frame").open;
+        let has = |o: Open| open.contains(&o);
+        // A markdown link inside an `<a>` wins, as does one around it, which
+        // the `<a>` cannot have closed.
+        let html_link = open.iter().rev().find_map(|o| match o {
+            Open::Link(link) => link.clone(),
+            _ => None,
+        });
         InlineStyle {
-            emphasis: self.emphasis > 0,
-            strong: self.strong > 0,
-            strikethrough: self.strikethrough > 0,
+            emphasis: self.emphasis > 0 || has(Open::Emphasis),
+            strong: self.strong > 0 || has(Open::Strong),
+            strikethrough: self.strikethrough > 0 || has(Open::Strike),
+            underline: has(Open::Underline),
+            kbd: has(Open::Kbd),
+            superscript: has(Open::Superscript),
+            subscript: has(Open::Subscript),
             highlight: self.stack.last().is_some_and(|f| f.highlight.is_some()),
-            link: self.links.last().cloned(),
+            link: self.links.last().cloned().or(html_link),
             ..InlineStyle::default()
         }
     }
@@ -1124,7 +1195,7 @@ impl<'a> Builder<'a> {
                 FrameKind::Html(buf) => buf.push_str(&html),
                 _ => self.text(&html, self.style(), range),
             },
-            Event::InlineHtml(html) => self.text(&html, self.style(), range),
+            Event::InlineHtml(html) => self.inline_html(&html, range),
             Event::Code(code) => self.text(&code, self.style_with(true, false), range),
             Event::InlineMath(math) => {
                 self.text(&format!("${math}$"), self.style_with(false, true), range);
@@ -1154,6 +1225,7 @@ impl<'a> Builder<'a> {
             Tag::Emphasis => self.emphasis += 1,
             Tag::Strong => self.strong += 1,
             Tag::Strikethrough => self.strikethrough += 1,
+            Tag::Superscript => self.top().open.push(Open::Superscript),
             Tag::Link {
                 link_type,
                 dest_url,
@@ -1208,7 +1280,7 @@ impl<'a> Builder<'a> {
             Tag::FootnoteDefinition(label) => FrameKind::Footnote(fold(&label)),
             Tag::DefinitionList => FrameKind::Definitions,
             Tag::DefinitionListTitle => FrameKind::Term,
-            Tag::DefinitionListDefinition => FrameKind::Details,
+            Tag::DefinitionListDefinition => FrameKind::Definition,
             _ => return None,
         })
     }
@@ -1241,7 +1313,8 @@ impl<'a> Builder<'a> {
         }
         self.embeds.push(false);
         // A linked image stays inline so it keeps its link.
-        if !self.links.is_empty() {
+        let html_link = (self.top().open.iter()).any(|o| matches!(o, Open::Link(Some(_))));
+        if !self.links.is_empty() || html_link {
             self.top().other_inline = true;
         }
         self.push_text("[image: ", self.style(), range);
@@ -1263,10 +1336,17 @@ impl<'a> Builder<'a> {
             | TagEnd::FootnoteDefinition
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
-            | TagEnd::DefinitionListDefinition => self.close(),
+            | TagEnd::DefinitionListDefinition => {
+                // A `<details>` left open ends with the block around it.
+                while matches!(self.top().kind, FrameKind::Details { .. }) {
+                    self.close();
+                }
+                self.close();
+            }
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
             TagEnd::Strikethrough => self.strikethrough = self.strikethrough.saturating_sub(1),
+            TagEnd::Superscript => self.close_open(&Open::Superscript),
             TagEnd::Link => {
                 self.links.pop();
             }
@@ -1377,13 +1457,35 @@ impl<'a> Builder<'a> {
                 term: frame.inlines,
                 definitions: Vec::new(),
             },
-            FrameKind::Details => {
+            FrameKind::Definition => {
                 frame.flush_inlines();
                 self.add_definition(frame.blocks, span);
                 return;
             }
             FrameKind::Code { lang, code } => code_block(lang, code),
-            FrameKind::Html(html) => BlockKind::Html(html),
+            FrameKind::Details { summary, open } => {
+                frame.flush_inlines();
+                let end = frame.blocks.last().map_or(span.end, |b| b.span.end);
+                let summary = if summary.is_empty() {
+                    vec![Inline::Text {
+                        text: "Details".to_string(),
+                        style: InlineStyle::default(),
+                    }]
+                } else {
+                    summary
+                };
+                let kind = BlockKind::Details {
+                    summary,
+                    open,
+                    blocks: frame.blocks,
+                };
+                self.push_block(kind, span.start..span.end.max(end));
+                return;
+            }
+            FrameKind::Html(html) => {
+                self.html_block(&html, span);
+                return;
+            }
             FrameKind::List { items, .. } if frame.left_out && items.is_empty() => return,
             FrameKind::List {
                 start,
@@ -1396,6 +1498,244 @@ impl<'a> Builder<'a> {
             },
         };
         self.push_block(kind, span);
+    }
+
+    /// Close the innermost `open` like `what`.
+    fn close_open(&mut self, what: &Open) {
+        let open = &mut self.top().open;
+        if let Some(i) = open.iter().rposition(|o| o.same(what)) {
+            open.remove(i);
+        }
+    }
+
+    /// Inline HTML: comments are hidden, `<br>` breaks the line, `<img>` is
+    /// an image and formatting tags and `<a>` style the text. Any other tag
+    /// stays as text.
+    fn inline_html(&mut self, html: &str, range: Range<usize>) {
+        for piece in html::pieces(html) {
+            match piece {
+                Piece::Text(text) => self.text(text, self.style(), range.clone()),
+                Piece::Comment(_) => {}
+                Piece::Tag(tag) => {
+                    if !self.html_tag(&tag, range.clone()) {
+                        self.text(tag.raw, self.style(), range.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Act on an inline HTML tag, or return false if smd does not read it.
+    fn html_tag(&mut self, tag: &html::Tag, range: Range<usize>) -> bool {
+        if tag.name == "br" {
+            if !tag.close {
+                self.inline(Inline::Break, range);
+            }
+            return true;
+        }
+        if tag.name == "img" {
+            if tag.close {
+                return true;
+            }
+            let Some(src) = tag.attr("src").filter(|s| !s.is_empty()) else {
+                return false;
+            };
+            self.start_image(false, src, range.clone());
+            if self.hidden > 0 {
+                // Left out for the theme: there are no events to skip.
+                self.hidden = 0;
+            } else {
+                self.text(tag.attr("alt").unwrap_or(""), self.style(), range);
+                self.end_image();
+            }
+            return true;
+        }
+        let Some(open) = Open::of(&tag.name, tag) else {
+            return false;
+        };
+        if tag.close {
+            self.close_open(&open);
+        } else {
+            self.top().open.push(open);
+        }
+        true
+    }
+
+    /// An HTML block. Comments are hidden. A block of nothing but `<p>`,
+    /// images, links, line breaks and formatting is read as a paragraph, so
+    /// an image in it is drawn as a markdown one is. `<details>` opens a
+    /// block that folds, holding the blocks up to its `</details>`, with its
+    /// `<summary>` as the title. Any other block is kept as its source.
+    fn html_block(&mut self, html: &str, span: Range<usize>) {
+        let pieces = html::pieces(html);
+        let tag_is = |p: &Piece, names: &[&str]| matches!(p, Piece::Tag(t) if names.contains(&t.name.as_str()));
+        let details = pieces.iter().any(|p| tag_is(p, &["details", "summary"]));
+        let inline = pieces.iter().all(|p| match p {
+            Piece::Tag(t) => {
+                matches!(t.name.as_str(), "p" | "br" | "img" | "details" | "summary")
+                    || Open::of(&t.name, t).is_some()
+            }
+            _ => true,
+        });
+        // Inside these a comment is text.
+        let keep_comments = pieces
+            .iter()
+            .any(|p| tag_is(p, &["pre", "script", "style", "textarea"]));
+        if !inline && !details {
+            if keep_comments {
+                self.push_block(BlockKind::Html(html.to_string()), span);
+                return;
+            }
+            let kept: String = pieces
+                .iter()
+                .filter_map(|p| match p {
+                    Piece::Text(t) => Some(*t),
+                    Piece::Tag(t) => Some(t.raw),
+                    Piece::Comment(_) => None,
+                })
+                .collect();
+            if !kept.trim().is_empty() {
+                self.push_block(BlockKind::Html(kept), span);
+            }
+            return;
+        }
+        // Where a tag is in the source: exact at the top level, and in order
+        // inside a quote or list, whose markers the HTML has lost.
+        let at = |tag: &html::Tag| {
+            let offset = tag.raw.as_ptr() as usize - html.as_ptr() as usize;
+            (span.start + offset).min(span.end)
+        };
+        self.top().flush_inlines();
+        // Whether a paragraph is open on top of the stack, and whether it is
+        // a summary.
+        let mut part = None;
+        // Other HTML around a `<details>`, kept as its source.
+        let mut raw = String::new();
+        for piece in pieces {
+            let fold_tag = tag_is(&piece, &["details", "summary"]);
+            if !inline && part != Some(true) && !fold_tag {
+                match piece {
+                    Piece::Text(t) => raw.push_str(t),
+                    Piece::Tag(t) => raw.push_str(t.raw),
+                    Piece::Comment(c) if keep_comments => raw.push_str(c),
+                    Piece::Comment(_) => {}
+                }
+                continue;
+            }
+            self.push_raw_html(&mut raw, span.clone());
+            let tag = match piece {
+                Piece::Comment(_) => continue,
+                Piece::Text(text) => {
+                    if part.is_none() && text.trim().is_empty() {
+                        continue;
+                    }
+                    self.open_html_part(&mut part, false, span.clone());
+                    self.html_text(text, span.clone());
+                    continue;
+                }
+                Piece::Tag(tag) => tag,
+            };
+            let in_details = matches!(self.top().kind, FrameKind::Details { .. });
+            match (tag.name.as_str(), tag.close) {
+                ("p", _) if part == Some(false) => self.end_html_part(&mut part),
+                ("p", _) => {}
+                ("details", false) => {
+                    self.end_html_part(&mut part);
+                    let kind = FrameKind::Details {
+                        summary: Vec::new(),
+                        open: tag.attr("open").is_some(),
+                    };
+                    let from = at(&tag);
+                    self.stack.push(Frame::new(kind, from..span.end));
+                }
+                ("details", true) => {
+                    self.end_html_part(&mut part);
+                    if matches!(self.top().kind, FrameKind::Details { .. }) {
+                        self.top().span.end = at(&tag) + tag.raw.len();
+                        self.close();
+                    }
+                }
+                ("summary", false) if part.is_none() && in_details => {
+                    self.open_html_part(&mut part, true, span.clone());
+                }
+                ("summary", true) if part == Some(true) => self.end_html_part(&mut part),
+                _ => {
+                    self.open_html_part(&mut part, false, span.clone());
+                    if !self.html_tag(&tag, span.clone()) {
+                        self.text(tag.raw, self.style(), span.clone());
+                    }
+                }
+            }
+        }
+        self.end_html_part(&mut part);
+        self.push_raw_html(&mut raw, span);
+    }
+
+    /// Push HTML kept as its source, if there is any.
+    fn push_raw_html(&mut self, raw: &mut String, span: Range<usize>) {
+        let html = std::mem::take(raw);
+        let html = html.trim_start_matches(['\n', '\r']);
+        if !html.trim().is_empty() {
+            let mut html = html.to_string();
+            if !html.ends_with('\n') {
+                html.push('\n');
+            }
+            self.push_block(BlockKind::Html(html), span);
+        }
+    }
+
+    /// Open a paragraph, or a summary, for HTML read as markdown, unless one
+    /// is open.
+    fn open_html_part(&mut self, part: &mut Option<bool>, summary: bool, span: Range<usize>) {
+        if part.is_none() {
+            self.stack
+                .push(Frame::new(FrameKind::Paragraph(None), span));
+            *part = Some(summary);
+        }
+    }
+
+    /// Text in HTML read as markdown: runs of white space are one space, and
+    /// none at the start of a line.
+    fn html_text(&mut self, text: &str, span: Range<usize>) {
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut out = String::new();
+        let line_start = matches!(self.top().inlines.last(), None | Some(Inline::Break));
+        if text.starts_with(char::is_whitespace) && !line_start {
+            out.push(' ');
+        }
+        if !words.is_empty() {
+            out.push_str(&words);
+            if text.ends_with(char::is_whitespace) {
+                out.push(' ');
+            }
+        }
+        self.text(&out, self.style(), span);
+    }
+
+    /// Close the paragraph or summary HTML is read into, without a space at
+    /// its end. An empty paragraph is dropped, and a summary becomes the
+    /// title of the `<details>` under it.
+    fn end_html_part(&mut self, part: &mut Option<bool>) {
+        let Some(summary) = part.take() else {
+            return;
+        };
+        let top = self.top();
+        if let Some(Inline::Text { text, .. }) = top.inlines.last_mut() {
+            text.truncate(text.trim_end().len());
+            if text.is_empty() {
+                top.inlines.pop();
+            }
+        }
+        if summary {
+            let frame = self.stack.pop().expect("summary frame");
+            if let FrameKind::Details { summary, .. } = &mut self.top().kind {
+                *summary = frame.inlines;
+            }
+        } else if self.top().inlines.is_empty() && !self.top().left_out {
+            self.stack.pop();
+        } else {
+            self.close();
+        }
     }
 
     fn push_block(&mut self, kind: BlockKind, span: Range<usize>) {
@@ -2442,6 +2782,7 @@ paragraph @23..37
                 BlockKind::Figure { kind, source } => format!("figure {kind:?} {source:?}"),
                 BlockKind::Embed { title, .. } => format!("embed {title:?}"),
                 BlockKind::Definition { .. } => "definition".to_string(),
+                BlockKind::Details { open, .. } => format!("details open={open}"),
             };
             out.push_str(&format!("{pad}{head} @{span:?}\n"));
             match kind {
@@ -2460,6 +2801,13 @@ paragraph @23..37
                         out.push_str(&format!("{pad}  details\n"));
                         outline_blocks(blocks, depth + 2, out);
                     }
+                }
+                BlockKind::Details {
+                    summary, blocks, ..
+                } => {
+                    out.push_str(&format!("{pad}  summary\n"));
+                    outline_inlines(summary, depth + 2, out);
+                    outline_blocks(blocks, depth + 1, out);
                 }
                 BlockKind::List { items, .. } => {
                     for ListItem { task, blocks, .. } in items {
@@ -2486,6 +2834,10 @@ paragraph @23..37
                         math,
                         highlight,
                         tag,
+                        underline,
+                        kbd,
+                        superscript,
+                        subscript,
                         link,
                     } = style;
                     let mut line = format!("{text:?}");
@@ -2497,6 +2849,10 @@ paragraph @23..37
                         (math, "math"),
                         (highlight, "highlight"),
                         (tag, "tag"),
+                        (underline, "u"),
+                        (kbd, "kbd"),
+                        (superscript, "sup"),
+                        (subscript, "sub"),
                     ] {
                         if *on {
                             line.push_str(&format!(" {name}"));
@@ -2985,9 +3341,10 @@ paragraph @17..27
   "Text"
   "[1]" link="#fn:1" wiki=false
   "."
-html "<!-- c -->\n" @28..39
 paragraph @40..56
-  "a <b>bold</b> c"
+  "a "
+  "bold" strong
+  " c"
 rule @57..61
 rule @61..65
 rule @65..65
@@ -3432,6 +3789,315 @@ quote @45..55
         assert_outline(
             "Done %%a%%\n:tada: -- x\n",
             "paragraph @0..23\n  \"Done  🎉 – x\"\n",
+        );
+    }
+
+    #[test]
+    fn html_comments_are_hidden() {
+        assert_outline(
+            "a <!-- one\nline --> b\n\n<!--\nmany\n\nlines\n-->\n\n<div>x</div> <!-- y -->\n\n<!-- open\n",
+            r#"paragraph @0..22
+  "a  b"
+html "<div>x</div> \n" @45..69
+"#,
+        );
+    }
+
+    #[test]
+    fn inline_formatting_tags_style_their_text() {
+        assert_outline(
+            "<b>b</b> <I>i</I> <em>e <strong>s</strong></em> <u>u</u> <kbd>Ctrl</kbd>+<kbd>C</kbd> \
+             H<sub>2</sub>O x<sup>2</sup> <del>d</del> <span>keep</span>\n",
+            r#"paragraph @0..146
+  "b" strong
+  " "
+  "i" em
+  " "
+  "e " em
+  "s" em strong
+  " "
+  "u" u
+  " "
+  "Ctrl" kbd
+  "+"
+  "C" kbd
+  " H"
+  "2" sub
+  "O x"
+  "2" sup
+  " "
+  "d" strike
+  " <span>keep</span>"
+"#,
+        );
+    }
+
+    #[test]
+    fn an_html_tag_left_open_ends_with_its_paragraph() {
+        assert_outline(
+            "a <b>bold\n\nplain </i> <a href=u>link\n\nafter\n",
+            r#"paragraph @0..10
+  "a "
+  "bold" strong
+paragraph @11..37
+  "plain  "
+  "link" link="u" wiki=false
+paragraph @38..44
+  "after"
+"#,
+        );
+    }
+
+    #[test]
+    fn br_is_a_hard_break() {
+        assert_outline(
+            "one<br>two<br/>three<BR />four\n",
+            r#"paragraph @0..31
+  "one"
+  break
+  "two"
+  break
+  "three"
+  break
+  "four"
+"#,
+        );
+    }
+
+    #[test]
+    fn markdown_superscript_and_strikethrough_with_one_or_two_tildes() {
+        assert_outline(
+            "x ^2^ and ~n~ but ~~struck~~\n",
+            r#"paragraph @0..29
+  "x "
+  "2" sup
+  " and "
+  "n" strike
+  " but "
+  "struck" strike
+"#,
+        );
+    }
+
+    #[test]
+    fn html_images_are_images() {
+        // Alone in a block or a centred paragraph, an image is an image block.
+        assert_outline(
+            "<img src=\"a.png\" alt=\"A\" width=\"100\">\n\n<p align=\"center\">\n  <img src=\"logo.png\">\n</p>\n",
+            r#"image "a.png" alt="A" wiki=false @0..38
+image "logo.png" alt="" wiki=false @39..86
+"#,
+        );
+        // In a link or with other content it stays inline, as in markdown.
+        assert_outline(
+            "<p align=\"center\">\n  <a href=\"https://x.org\"><img src=\"l.png\" alt=\"L\"></a>\n  <b>Tag line</b>\n</p>\n\nsee <img src=\"b.png\" alt=\"B\"> here\n",
+            r#"paragraph @0..98
+  "[image: L]" link="https://x.org" wiki=false
+  " "
+  "Tag line" strong
+paragraph @99..134
+  "see [image: B] here"
+"#,
+        );
+    }
+
+    #[test]
+    fn an_html_logo_for_the_other_background_is_left_out() {
+        let md = "<p align=\"center\">\n<img src=\"d.png#gh-dark-mode-only\">\n<img src=\"l.png#gh-light-mode-only\">\n</p>\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "image \"d.png#gh-dark-mode-only\" alt=\"\" wiki=false @0..97\n"
+        );
+    }
+
+    #[test]
+    fn other_html_blocks_stay_as_source() {
+        assert_outline(
+            "<table><tr><td>x</td></tr></table>\n\n<p>a <img> b</p>\n",
+            r#"html "<table><tr><td>x</td></tr></table>\n" @0..35
+paragraph @36..53
+  "a <img> b"
+"#,
+        );
+    }
+
+    #[test]
+    fn an_html_tag_stays_in_its_own_block() {
+        // Alone in an HTML block, in a tight item with a nested list, and
+        // inside a markdown link, which keeps its own link; the `<a>`, left
+        // open, runs to the end of the paragraph.
+        assert_outline(
+            "<b>\n\nplain\n\n<a href=\"x\">\n\nplain\n",
+            "paragraph @5..11\n  \"plain\"\nparagraph @26..32\n  \"plain\"\n",
+        );
+        assert_outline(
+            "- a <b>x\n  - nested\n",
+            r#"list None tight=true @0..20
+  item task=None
+    paragraph @2..8
+      "a "
+      "x" strong
+    list None tight=true @11..20
+      item task=None
+        paragraph @13..19
+          "nested"
+"#,
+        );
+        assert_outline(
+            "[md <a href=x>](y) after\n",
+            r#"paragraph @0..25
+  "md " link="y" wiki=false
+  " after" link="x" wiki=false
+"#,
+        );
+    }
+
+    #[test]
+    fn each_html_paragraph_is_a_paragraph() {
+        assert_outline(
+            "<p>one</p>\n<p><img src=\"a.png\"></p>\n<p>a<br>\n  b</p>\n",
+            r#"paragraph @0..53
+  "one"
+image "a.png" alt="" wiki=false @0..53
+paragraph @0..53
+  "a"
+  break
+  "b"
+"#,
+        );
+    }
+
+    #[test]
+    fn comments_stay_in_preformatted_html() {
+        assert_outline(
+            "<pre>\nx <!-- y\n</pre>\n",
+            "html \"<pre>\\nx <!-- y\\n</pre>\\n\" @0..22\n",
+        );
+    }
+
+    #[test]
+    fn details_holds_the_markdown_up_to_its_end() {
+        assert_outline(
+            "<details>\n<summary>The <b>title</b></summary>\n\nbody *x*\n\n- item\n\n</details>\n\nafter\n",
+            r#"details open=false @0..75
+  summary
+    "The "
+    "title" strong
+  paragraph @47..56
+    "body "
+    "x" em
+  list None tight=true @57..65
+    item task=None
+      paragraph @59..63
+        "item"
+paragraph @77..83
+  "after"
+"#,
+        );
+    }
+
+    #[test]
+    fn details_in_one_block_open_and_without_a_summary() {
+        assert_outline(
+            "<details open><summary>T</summary>Some text</details>\n\n<details>\n\nbody\n",
+            r#"details open=true @0..54
+  summary
+    "T"
+  paragraph @0..54
+    "Some text"
+details open=false @55..71
+  summary
+    "Details"
+  paragraph @66..71
+    "body"
+"#,
+        );
+    }
+
+    #[test]
+    fn details_nest_and_end_with_the_block_around_them() {
+        assert_outline(
+            "<details><summary>A</summary>\n\n<details><summary>B</summary>\n\ninner\n\n</details>\n</details>\n",
+            r#"details open=false @0..90
+  summary
+    "A"
+  details open=false @31..79
+    summary
+      "B"
+    paragraph @62..68
+      "inner"
+"#,
+        );
+        assert_outline(
+            "> <details><summary>Q</summary>\n>\n> in\n\nout\n",
+            r#"quote @0..39
+  details open=false @2..39
+    summary
+      "Q"
+    paragraph @36..39
+      "in"
+paragraph @40..44
+  "out"
+"#,
+        );
+        assert_outline(
+            "- item\n\n  <details><summary>L</summary>\n\n  in list\n\n  </details>\n\nafter\n",
+            r#"list None tight=false @0..66
+  item task=None
+    paragraph @2..7
+      "item"
+    details open=false @10..64
+      summary
+        "L"
+      paragraph @43..51
+        "in list"
+paragraph @66..72
+  "after"
+"#,
+        );
+    }
+
+    #[test]
+    fn details_in_a_definition() {
+        assert_outline(
+            "Term\n: <details><summary>S</summary>\n\n  body\n\n  </details>\n\nafter\n",
+            r#"definition @0..60
+  "Term"
+  details
+    details open=false @7..58
+      summary
+        "S"
+      paragraph @40..45
+        "body"
+paragraph @60..66
+  "after"
+"#,
+        );
+    }
+
+    #[test]
+    fn an_html_linked_image_keeps_its_link() {
+        assert_outline(
+            "<a href=\"u\"><img src=\"l.png\" alt=\"L\"></a>\n",
+            "paragraph @0..42\n  \"[image: L]\" link=\"u\" wiki=false\n",
+        );
+        assert_outline(
+            "<a href=\"https://x.org\"><img src=\"l.png\" alt=\"L\"></img></a>\n",
+            r#"paragraph @0..60
+  "[image: L]" link="https://x.org" wiki=false
+"#,
+        );
+    }
+
+    #[test]
+    fn other_html_in_details_stays_as_source() {
+        assert_outline(
+            "<details>\n<summary>S</summary>\n<pre>\na\n  b\n</pre>\n</details>\n",
+            r#"details open=false @0..61
+  summary
+    "S"
+  html "<pre>\na\n  b\n</pre>\n" @0..61
+"#,
         );
     }
 }

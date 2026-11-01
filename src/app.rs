@@ -270,7 +270,8 @@ impl View {
 
     /// `relayout`, with the match the reader is on given by `kept`, as
     /// `current_match` gives it.
-    /// A current match that was in view is brought back into view.
+    /// A current match that was in view and is pushed out of it is brought
+    /// back into view.
     fn relayout_keeping(&mut self, anchor: Option<Anchor>, kept: Option<(Anchor, usize)>) {
         let seen = self.current_seen();
         if self.width > 0 {
@@ -283,7 +284,7 @@ impl View {
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.selected = self.selected.filter(|&s| self.has(s));
-        if seen {
+        if seen && !self.current_seen() {
             self.show_current();
         }
     }
@@ -415,7 +416,7 @@ impl View {
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
-        if seen {
+        if seen && !self.current_seen() {
             self.show_current();
         }
     }
@@ -1442,6 +1443,8 @@ impl Browser {
         self.view.scroll = visited.scroll;
         self.view.selected = visited.selected;
         self.view.relayout(None);
+        // The place gone back to stays put rather than the current match.
+        self.view.scroll = visited.scroll.min(self.view.max_scroll());
         true
     }
 
@@ -2146,6 +2149,21 @@ mod tests {
         v.resize(10, 5);
         assert_eq!(v.search.current, Some(0));
         assert_eq!(v.scroll, 0);
+    }
+
+    #[test]
+    fn a_match_half_in_view_does_not_move_the_view_on_a_relayout() {
+        // At 40 columns "eight nine" is on lines 0 and 1.
+        let md = format!(
+            "one two three four five six seven eight nine ten\n\n{}",
+            paragraphs(10)
+        );
+        let mut v = new_view(&md);
+        v.resize(40, 4);
+        on_match(&mut v, "eight nine", 0);
+        v.scroll = 1;
+        v.relayout(None);
+        assert_eq!(v.scroll, 1);
     }
 
     #[test]

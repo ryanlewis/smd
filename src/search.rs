@@ -188,6 +188,12 @@ pub fn find(term: &str, layout: &Layout, doc: &Document) -> Vec<Match> {
         };
         match joins.peek().filter(|j| j.row == row) {
             Some(join) => {
+                if let (Some(end), Some(last)) = (join.end, run.last().map(|d| d.row)) {
+                    while run
+                        .pop_if(|d| d.row == last && d.cols.start >= end)
+                        .is_some()
+                    {}
+                }
                 if join.space
                     && let Some(last) = run.last()
                 {

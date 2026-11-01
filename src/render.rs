@@ -50,6 +50,8 @@ pub struct Join {
     pub col: u16,
     /// Whether a space was dropped at the break, rather than a word broken.
     pub space: bool,
+    /// Where the text of the line above ends, when filler follows it.
+    pub end: Option<u16>,
 }
 
 /// A link and the cells its text takes, which may be on several lines.
@@ -1313,13 +1315,19 @@ impl<'a> Lines<'a> {
             row: self.out.len(),
             col: spans_width(self.prefix()) as u16,
             space,
+            end: None,
         }
     }
 
     fn push_breaking(&mut self, s: &str, style: Style) {
         for piece in clusters(s) {
+            // A panel fills the gap a wide character leaves at the edge.
+            let end = self
+                .pad
+                .map(|_| (spans_width(self.prefix()) + self.used) as u16);
             if self.break_before(piece.width()) {
-                self.edges.push(self.join(false));
+                let join = self.join(false);
+                self.edges.push(Join { end, ..join });
             }
             self.push(piece, style);
         }
@@ -1508,6 +1516,7 @@ mod tests {
             row: 3,
             col: 2,
             space: true,
+            end: None,
         };
         assert_eq!(layout.joins, [join]);
         let doc = parse("> # Going [to it](x.md)\n");
@@ -2425,6 +2434,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_code_panel_broken_before_a_wide_character_is_searched_without_its_filler() {
+        // One column is left for "界", so the panel fills it with a space.
+        let doc = parse(&format!("```\n{}界\n```\n", "x".repeat(9)));
+        let layout = layout(&doc, 10, &no_images(), Some(BG), None);
+        assert_eq!(crate::search::find("x界", &layout, &doc).len(), 1);
+        assert_eq!(crate::search::find("x 界", &layout, &doc), []);
     }
 
     #[test]

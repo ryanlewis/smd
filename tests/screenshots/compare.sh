@@ -27,7 +27,7 @@ fi
 here=$(cd "$(dirname "$0")" && pwd)
 refs=$here/reference
 out=$1
-fuzz=${FUZZ:-10%}
+fuzz=${FUZZ:-2%}
 max=${MAX_PIXELS:-100}
 
 shopt -s nullglob

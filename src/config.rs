@@ -15,6 +15,12 @@
 //! # Whether images on the web (http and https) are fetched and shown.
 //! # `--remote-images` and `--no-remote-images` override it.
 //! remote_images = false
+//! # The widest the text gets, in columns, and where it sits when the
+//! # window is wider: "centre" or "left".
+//! max_width = 100
+//! align = "centre"
+//! # How headings are drawn: "auto", "image" or "text".
+//! headings = "auto"
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -29,6 +35,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::heading;
 use crate::mermaid::Renderer;
 use crate::theme::Rgb;
 
@@ -51,6 +58,10 @@ pub enum Action {
     Toggle,
     Back,
     Forward,
+    Search,
+    NextMatch,
+    PrevMatch,
+    Reload,
 }
 
 impl Action {
@@ -72,6 +83,10 @@ impl Action {
             Action::Toggle => &["x"],
             Action::Back => &["backspace", "H", "alt-left"],
             Action::Forward => &["L", "alt-right"],
+            Action::Search => &["/"],
+            Action::NextMatch => &["n"],
+            Action::PrevMatch => &["N"],
+            Action::Reload => &["r"],
         }
     }
 
@@ -84,7 +99,7 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 15] = [
+    const ALL: [Action; 19] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -100,6 +115,10 @@ impl Action {
         Action::Toggle,
         Action::Back,
         Action::Forward,
+        Action::Search,
+        Action::NextMatch,
+        Action::PrevMatch,
+        Action::Reload,
     ];
 }
 
@@ -126,6 +145,18 @@ pub enum Tasks {
     Toggle,
     /// They are only shown.
     ReadOnly,
+}
+
+/// Where the text sits when the window is wider than `max_width`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Align {
+    /// In the middle of the window.
+    #[default]
+    #[serde(alias = "center")]
+    Centre,
+    /// At the left edge.
+    Left,
 }
 
 /// The named keys, as the config spells them in lower case.
@@ -238,6 +269,11 @@ struct File {
     mermaid: Renderer,
     #[serde(default)]
     tasks: Tasks,
+    max_width: Option<u16>,
+    #[serde(default)]
+    align: Align,
+    #[serde(default)]
+    headings: heading::Mode,
     #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
@@ -258,6 +294,12 @@ pub struct Config {
     pub mermaid: Renderer,
     /// Whether task checkboxes can be ticked.
     pub tasks: Tasks,
+    /// The widest the text gets, in columns; none for the whole window.
+    pub max_width: Option<u16>,
+    /// Where the text sits when the window is wider than `max_width`.
+    pub align: Align,
+    /// How headings are drawn.
+    pub headings: heading::Mode,
     keys: HashMap<Key, Action>,
 }
 
@@ -289,16 +331,32 @@ impl Config {
         }
     }
 
-    fn from_str(text: &str) -> Result<Config, String> {
+    pub(crate) fn from_str(text: &str) -> Result<Config, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_string())?;
         let mut keys = HashMap::new();
+        // The search keys came after configs were written that may use
+        // them, so they give way to a key the config names.
+        let named: Vec<Key> = file
+            .keys
+            .values()
+            .flatten()
+            .flat_map(|n| Key::parse(n))
+            .collect();
         for action in Action::ALL {
-            let names: Vec<&str> = match file.keys.get(&action) {
+            let given = file.keys.get(&action);
+            let names: Vec<&str> = match given {
                 Some(names) => names.iter().map(String::as_str).collect(),
                 None => action.defaults().to_vec(),
             };
             for name in names {
                 let key = Key::parse(name)?;
+                let newer = matches!(
+                    action,
+                    Action::Search | Action::NextMatch | Action::PrevMatch
+                );
+                if given.is_none() && newer && named.contains(&key) {
+                    continue;
+                }
                 if let Some(other) = keys.insert(key, action)
                     && other != action
                 {
@@ -314,6 +372,9 @@ impl Config {
             })?),
             None => None,
         };
+        if file.max_width == Some(0) {
+            return Err("max_width must be more than 0".to_string());
+        }
         Ok(Config {
             home: file.home.as_deref().map(expand_home),
             web_links: file.web_links,
@@ -322,6 +383,9 @@ impl Config {
             remote_images: file.remote_images,
             mermaid: file.mermaid,
             tasks: file.tasks,
+            max_width: file.max_width,
+            align: file.align,
+            headings: file.headings,
             keys,
         })
     }
@@ -404,6 +468,19 @@ mod tests {
         assert_eq!(c.code_background, None);
         assert!(c.mouse);
         assert!(!c.remote_images);
+        assert_eq!(c.max_width, None);
+        assert_eq!(c.align, Align::Centre);
+    }
+
+    #[test]
+    fn max_width_and_align_are_read() {
+        let c = Config::from_str("max_width = 80\nalign = \"left\"").unwrap();
+        assert_eq!(c.max_width, Some(80));
+        assert_eq!(c.align, Align::Left);
+        let c = Config::from_str("align = \"center\"").unwrap();
+        assert_eq!(c.align, Align::Centre);
+        assert!(Config::from_str("max_width = 0").is_err());
+        assert!(Config::from_str("align = \"right\"").is_err());
     }
 
     #[test]
@@ -470,6 +547,20 @@ mod tests {
     }
 
     #[test]
+    fn a_config_that_took_a_search_key_keeps_it() {
+        let c = Config::from_str("[keys]\nnext_link = [\"tab\", \"n\"]\n").unwrap();
+        let none = KeyModifiers::NONE;
+        assert_eq!(
+            c.action(press(KeyCode::Char('n'), none)),
+            Some(Action::NextLink)
+        );
+        assert_eq!(
+            c.action(press(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            Some(Action::PrevMatch)
+        );
+    }
+
+    #[test]
     fn mistakes_are_errors() {
         for (text, wanted) in [
             ("[keys]\nback = [\"hyper-x\"]\n", "unknown key"),
@@ -485,6 +576,17 @@ mod tests {
             let err = Config::from_str(text).unwrap_err();
             assert!(err.contains(wanted), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn headings_are_auto_unless_set() {
+        assert_eq!(Config::default().headings, heading::Mode::Auto);
+        let c = Config::from_str("headings = \"image\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Image);
+        let c = Config::from_str("headings = \"text\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Text);
+        let err = Config::from_str("headings = \"big\"\n").unwrap_err();
+        assert!(err.contains("big"), "{err}");
     }
 
     fn key(code: KeyCode, ctrl: bool, alt: bool) -> Result<Key, String> {

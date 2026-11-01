@@ -148,7 +148,10 @@ fn new_agent(timeout: Duration) -> ureq::Agent {
 /// GET `url`, following redirects, failing on an error status or a body over
 /// `limit` bytes.
 fn fetch(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, String> {
-    let mut response = agent.get(url).call().map_err(|e| format!("{url}: {e}"))?;
+    let mut response = agent
+        .get(escaped(url))
+        .call()
+        .map_err(|e| format!("{url}: {e}"))?;
     response
         .body_mut()
         .with_config()
@@ -156,6 +159,27 @@ fn fetch(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, String> 
         .limit(limit + 1)
         .read_to_vec()
         .map_err(|e| format!("{url}: {e}"))
+}
+
+/// `url` with each character ureq would refuse written as `%XX`, as a
+/// browser does: a space, `<` or `>` anywhere, a backtick before the query
+/// and a double quote in it. Others, such as letters outside ASCII, are sent
+/// as they are.
+fn escaped(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    let mut query = false;
+    for c in url.chars() {
+        query |= matches!(c, '?' | '#');
+        let refused = c.is_ascii_control()
+            || matches!(c, ' ' | '<' | '>')
+            || c == if query { '"' } else { '`' };
+        if refused {
+            out.push_str(&format!("%{:02X}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A place among the [`MAX_FETCHES`] fetches, given back when dropped.
@@ -376,6 +400,29 @@ mod tests {
         let got = fetch(&agent, &format!("{url}/old"), MAX_BYTES).unwrap();
         assert_eq!(got, png(3, 3));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_url_with_spaces_or_brackets_is_escaped() {
+        let (url, _) = serve(|path| match path {
+            "/my%20image.png" | "/a%3Cb%3E%60.png" | "/q.png?a=%22b%22" | "/café.png" => {
+                ok(&png(1, 1))
+            }
+            _ => status("404 Not Found"),
+        });
+        let agent = local_agent(TIMEOUT);
+        let paths = [
+            "/my image.png",
+            "/a<b>`.png",
+            "/q.png?a=\"b\"",
+            // Already escaped, or sent as it is as before.
+            "/my%20image.png",
+            "/café.png",
+        ];
+        for path in paths {
+            let got = fetch(&agent, &format!("{url}{path}"), MAX_BYTES);
+            assert_eq!(got, Ok(png(1, 1)), "{path}");
+        }
     }
 
     #[test]

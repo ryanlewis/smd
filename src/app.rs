@@ -431,7 +431,7 @@ impl View {
         if y >= self.height {
             return None;
         }
-        let x = x.checked_sub(self.left)?;
+        let x = x.checked_sub(self.left).filter(|&x| x < self.width)?;
         let line = self.scroll + y as usize;
         let hit = |stop: &Stop| {
             self.cells(*stop)
@@ -1844,6 +1844,19 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal.draw(|f| b.draw(f)).unwrap();
         assert_eq!(b.view.left, 20);
+        // A search match is marked where its text is drawn.
+        for code in "/now".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            enter(&mut b, code);
+        }
+        terminal.draw(|f| b.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let marked: Vec<(u16, String)> = (0..60)
+            .filter(|&x| buf[(x, 1)].bg == Color::Yellow)
+            .map(|x| (x, buf[(x, 1)].symbol().to_string()))
+            .collect();
+        let (xs, text): (Vec<u16>, String) = marked.into_iter().unzip();
+        assert_eq!(text, "now");
+        assert!(xs.iter().all(|x| (20..40).contains(x)), "{xs:?}");
         let click = |column| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,

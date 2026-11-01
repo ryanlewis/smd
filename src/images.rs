@@ -539,6 +539,13 @@ fn raster_image(data: Vec<u8>) -> Result<Png, String> {
 pub fn decode_remote(data: Vec<u8>) -> Result<Png, String> {
     let raster = [b"GIF8".as_slice(), b"\xff\xd8\xff", b"\x89PNG"];
     if raster.iter().any(|magic| data.starts_with(magic)) {
+        if data.starts_with(b"\xff\xd8\xff") {
+            // The decoder makes room for every pixel the header claims.
+            let (w, h) = jpeg_size(&data)?;
+            if w * h > GIF_MAX_PIXELS {
+                return Err("JPEG too large".into());
+            }
+        }
         raster_image(data)
     } else if data.starts_with(b"\x1f\x8b") {
         // usvg would unzip an SVGZ with no limit on its size.
@@ -613,8 +620,12 @@ fn svg(data: &[u8], hrefs: Hrefs) -> Result<Png, String> {
     };
     match hrefs {
         Hrefs::Beside(dir) => options.resources_dir = dir.map(Path::to_path_buf),
-        // usvg reads any other href as a file path; refuse them all.
-        Hrefs::Embedded => options.image_href_resolver.resolve_string = Box::new(|_, _| None),
+        Hrefs::Embedded => {
+            // usvg reads any other href as a file path; refuse them all.
+            options.image_href_resolver.resolve_string = Box::new(|_, _| None);
+            options.image_href_resolver.resolve_data =
+                Box::new(|mime, data, _| web_data(mime, data));
+        }
     }
     let fallbacks = std::str::from_utf8(data).ok().map(css_fallbacks);
     let data = fallbacks.as_deref().map_or(data, str::as_bytes);
@@ -641,6 +652,24 @@ fn svg(data: &[u8], hrefs: Hrefs) -> Result<Png, String> {
         png::ColorType::Rgba,
         &pixels,
     )?)
+}
+
+/// A `data:` image inside an SVG from the web: a PNG, JPEG, GIF or WebP no
+/// larger than [`GIF_MAX_PIXELS`], as its header says. Not an SVG, as usvg
+/// would unzip a gzipped one with no limit on its size.
+fn web_data(mime: &str, data: Arc<Vec<u8>>) -> Option<resvg::usvg::ImageKind> {
+    use resvg::usvg::ImageKind;
+    let size = imagesize::blob_size(&data).ok()?;
+    if size.width.saturating_mul(size.height) > GIF_MAX_PIXELS {
+        return None;
+    }
+    match mime {
+        "image/png" => Some(ImageKind::PNG(data)),
+        "image/jpg" | "image/jpeg" => Some(ImageKind::JPEG(data)),
+        "image/gif" => Some(ImageKind::GIF(data)),
+        "image/webp" => Some(ImageKind::WEBP(data)),
+        _ => None,
+    }
 }
 
 /// `text` with each CSS `var(--name, fallback)` replaced by its fallback.
@@ -731,6 +760,14 @@ fn jpeg(data: &[u8]) -> Result<Png, String> {
     };
     let data = raster::encode(info.width.into(), info.height.into(), color, &pixels)?;
     Png::new(data)
+}
+
+/// A JPEG's width and height, from its header.
+fn jpeg_size(data: &[u8]) -> Result<(usize, usize), String> {
+    let mut decoder = zune_jpeg::JpegDecoder::new(io::Cursor::new(data));
+    decoder.decode_headers().map_err(|e| format!("JPEG: {e}"))?;
+    let info = decoder.info().ok_or("JPEG has no size")?;
+    Ok((info.width.into(), info.height.into()))
 }
 
 /// Cells to show an image of `px` pixels at its natural size, shrunk to at
@@ -954,6 +991,89 @@ pub mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(pixels_rgba(&local)[0][3], 255);
         assert!(pixels_rgba(&web).iter().all(|p| p[3] == 0));
+    }
+
+    /// `data` as a `data:` URL of type `mime`, every byte escaped.
+    fn data_url(mime: &str, data: &[u8]) -> String {
+        let escaped: String = data.iter().map(|b| format!("%{b:02X}")).collect();
+        format!("data:{mime},{escaped}")
+    }
+
+    #[test]
+    fn a_web_svg_draws_no_svg_inside_it() {
+        // A gzipped SVG of a red 5x3 rectangle, which usvg would unzip with
+        // no limit on its size.
+        let gzipped = [
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 109, 204, 61, 14, 128, 32, 12, 64, 225, 171, 116,
+            235, 102, 137, 196, 197, 0, 151, 17, 164, 36, 248, 19, 104, 172, 199, 87, 119, 231,
+            247, 229, 185, 126, 101, 184, 183, 186, 119, 143, 44, 114, 206, 68, 170, 58, 168, 29,
+            142, 150, 105, 52, 198, 208, 43, 16, 180, 68, 97, 143, 19, 2, 167, 146, 89, 60, 90, 12,
+            174, 165, 69, 126, 19, 172, 165, 86, 143, 45, 69, 164, 224, 190, 69, 120, 0, 63, 118,
+            209, 12, 106, 0, 0, 0,
+        ];
+        let jpeg = include_bytes!("../tests/fixtures/red-5x3.jpg");
+        let body = format!(
+            "<image xlink:href='{}' width='5' height='3'/>\
+             <image xlink:href='{}' x='5' width='5' height='3'/>",
+            data_url("image/svg+xml", &gzipped),
+            data_url("image/jpeg", jpeg),
+        );
+        let data = svg_bytes(10, 3, &body);
+        // As a local file, both are drawn.
+        let local = load_bytes("a.svg", &data).unwrap();
+        assert!(pixels_rgba(&local).iter().all(|p| p[3] == 255));
+        // From the web, the JPEG is drawn but not the SVG.
+        let web = pixels_rgba(&decode_remote(data).unwrap());
+        assert_eq!(web.len(), 20 * 6);
+        for (i, p) in web.iter().enumerate() {
+            assert_eq!(p[3] == 255, i % 20 >= 10, "pixel {i}");
+        }
+    }
+
+    /// The red 5x3 JPEG, its header claiming it is `w` by `h`.
+    fn jpeg_claiming(w: u16, h: u16) -> Vec<u8> {
+        let mut data = include_bytes!("../tests/fixtures/red-5x3.jpg").to_vec();
+        let sof = data.windows(2).position(|m| m == [0xff, 0xc0]).unwrap();
+        data[sof + 5..sof + 7].copy_from_slice(&h.to_be_bytes());
+        data[sof + 7..sof + 9].copy_from_slice(&w.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn a_web_jpeg_too_large_to_decode_is_refused_from_its_header() {
+        assert_eq!(
+            decode_remote(jpeg_claiming(16000, 16000)).unwrap_err(),
+            "JPEG too large"
+        );
+        assert!(decode_remote(jpeg_claiming(5, 3)).is_ok());
+    }
+
+    #[test]
+    fn a_web_svg_draws_no_image_too_large_to_decode() {
+        // A black PNG just over the limit, one bit a pixel so it stays small.
+        let side = 6400;
+        let mut big = Vec::new();
+        let mut encoder = png::Encoder::new(&mut big, side, side);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::One);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&vec![0; (side * side / 8) as usize])
+            .unwrap();
+        writer.finish().unwrap();
+        assert!((side * side) as usize > GIF_MAX_PIXELS);
+        let small = raster::encode(1, 1, png::ColorType::Grayscale, &[0]).unwrap();
+        let body = format!(
+            "<image xlink:href='{}' width='5' height='3' preserveAspectRatio='none'/>\
+             <image xlink:href='{}' x='5' width='5' height='3' preserveAspectRatio='none'/>",
+            data_url("image/png", &big),
+            data_url("image/png", &small),
+        );
+        let web = pixels_rgba(&decode_remote(svg_bytes(10, 3, &body)).unwrap());
+        assert_eq!(web.len(), 20 * 6);
+        for (i, p) in web.iter().enumerate() {
+            assert_eq!(p[3] == 255, i % 20 >= 10, "pixel {i}");
+        }
     }
 
     #[test]

@@ -403,12 +403,16 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         None => 0,
     };
     let body = &source[start..];
-    builder.comments = comments(body, options)
+    let comments: Vec<Range<usize>> = comments(body, options);
+    let patched = unspaced_definitions(body, options, &comments);
+    builder.colons = patched.is_some();
+    builder.comments = comments
         .into_iter()
         .map(|c| c.start + start..c.end + start)
         .collect();
+    let text = patched.as_deref().unwrap_or(body);
     let events = || {
-        Parser::new_ext(body, options)
+        Parser::new_ext(text, options)
             .into_offset_iter()
             .map(move |(event, range)| (event, range.start + start..range.end + start))
     };
@@ -723,6 +727,53 @@ fn fold(label: &str) -> String {
     out
 }
 
+/// Stands in for the `:` of a definition with no space or tab after it, such
+/// as `:tada:` on the line after a paragraph, or of one in a comment, so the line is read as more of
+/// the paragraph. It is one byte, as the colon is, so every range still
+/// points at the source, and the builder turns it back into a colon.
+const COLON: char = '\u{1}';
+
+/// `source` with the colon of each definition that has no space or tab after
+/// it, or that is inside one of the `comments`, swapped for [`COLON`], or
+/// `None` when there is none.
+fn unspaced_definitions(
+    source: &str,
+    options: Options,
+    comments: &[Range<usize>],
+) -> Option<String> {
+    let maybe = source.lines().any(|line| {
+        let line = line.trim_start_matches([' ', '\t', '>']);
+        line.starts_with(':') && (!comments.is_empty() || !line[1..].starts_with([' ', '\t']))
+    });
+    if !maybe {
+        return None;
+    }
+    let mut patched: Option<String> = None;
+    // Each round swaps at least one colon, so it ends.
+    loop {
+        let text = patched.as_deref().unwrap_or(source);
+        let bytes = text.as_bytes();
+        let unspaced: Vec<usize> = Parser::new_ext(text, options)
+            .into_offset_iter()
+            .filter(|(event, _)| matches!(event, Event::Start(Tag::DefinitionListDefinition)))
+            .map(|(_, range)| range.start)
+            .filter(|&at| {
+                let unspaced = !matches!(bytes.get(at + 1), Some(b' ' | b'\t'));
+                let hidden = comments.iter().any(|c| c.contains(&at));
+                bytes.get(at) == Some(&b':') && (unspaced || hidden)
+            })
+            .collect();
+        if unspaced.is_empty() {
+            return patched;
+        }
+        let mut swapped = text.to_string().into_bytes();
+        for at in unspaced {
+            swapped[at] = COLON as u8;
+        }
+        patched = Some(String::from_utf8(swapped).expect("one ASCII byte for another"));
+    }
+}
+
 struct Builder<'a> {
     source: &'a str,
     stack: Vec<Frame>,
@@ -739,6 +790,8 @@ struct Builder<'a> {
     hide: Option<&'static str>,
     /// How deep in an image being left out.
     hidden: u32,
+    /// Whether the parser reads a source with [`COLON`] in it.
+    colons: bool,
     /// For each image started and not yet ended, whether it was a wiki embed
     /// of a note, read as a link instead.
     embeds: Vec<bool>,
@@ -896,6 +949,7 @@ impl<'a> Builder<'a> {
             image_depth: 0,
             hide: None,
             hidden: 0,
+            colons: false,
             embeds: Vec::new(),
             comments: Vec::new(),
             numbered: Vec::new(),
@@ -1057,7 +1111,14 @@ impl<'a> Builder<'a> {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => match &mut self.top().kind {
                 FrameKind::Code { code, .. } => code.push_str(&text),
-                _ => self.prose(&text, range),
+                _ => {
+                    let text = match typed_dashes(self.source, range.clone()) {
+                        Some(typed) => Cow::Borrowed(typed),
+                        None if self.colons => Cow::Owned(text.replace(COLON, ":")),
+                        None => Cow::Borrowed(&*text),
+                    };
+                    self.prose(&text, range);
+                }
             },
             Event::Html(html) => match &mut self.top().kind {
                 FrameKind::Html(buf) => buf.push_str(&html),
@@ -1722,6 +1783,16 @@ fn table_source(source: &str, range: Range<usize>) -> String {
         out.push_str(rest);
     }
     out
+}
+
+/// The dashes at `range` of `source` as typed, when smart punctuation made a
+/// dash of them but they come straight before a letter or digit, as in
+/// `--force`.
+pub fn typed_dashes(source: &str, range: Range<usize>) -> Option<&str> {
+    let typed = source.get(range.clone())?;
+    let dashes = typed.len() > 1 && typed.bytes().all(|b| b == b'-');
+    let next = source[range.end..].chars().next();
+    (dashes && next.is_some_and(char::is_alphanumeric)).then_some(typed)
 }
 
 /// Text from the parser in a link to `link`, if any, with [`shortcodes`]
@@ -3297,6 +3368,70 @@ code None "\"y\" -- ...\n" @35..53
   "$:x:$" math
 code None ":x:\n" @73..84
 "#,
+        );
+    }
+
+    #[test]
+    fn a_colon_with_no_space_after_it_starts_no_definition() {
+        assert_outline(
+            "Done\n:tada: shipped\n\nx\n:30 mins\n\nTerm\n: def\n\n> Q\n> :x:\n",
+            r#"paragraph @0..20
+  "Done 🎉 shipped"
+paragraph @21..32
+  "x :30 mins"
+definition @33..45
+  "Term"
+  details
+    paragraph @40..43
+      "def"
+quote @45..55
+  paragraph @47..55
+    "Q ❌"
+"#,
+        );
+        // After frontmatter, which is parsed apart from the body.
+        let doc = parse("---\na: b\n---\nDone\n:tada: `x` -- [y](z)\n");
+        let BlockKind::Paragraph(inlines) = &doc.blocks[1].kind else {
+            panic!("expected a paragraph, got {:?}", doc.blocks);
+        };
+        assert_eq!(inlines[0], text("Done 🎉 "));
+        assert_eq!(
+            &doc.source[doc.blocks[1].span.clone()],
+            "Done\n:tada: `x` -- [y](z)\n"
+        );
+        // A term can still take a definition after the colon that is text.
+        assert_outline(
+            "Term\n:30 mins\n: def\n",
+            r#"definition @0..20
+  "Term :30 mins"
+  details
+    paragraph @16..19
+      "def"
+"#,
+        );
+    }
+
+    #[test]
+    fn dashes_before_a_letter_or_digit_stay_as_typed() {
+        assert_outline(
+            "use --force -- or --- not ---x 1--5 end--\n",
+            r#"paragraph @0..42
+  "use --force – or — not ---x 1--5 end–"
+"#,
+        );
+    }
+
+    #[test]
+    fn shortcodes_and_definitions_meet_highlights_and_comments() {
+        assert_outline(
+            "==:tada: done==\n",
+            "paragraph @0..16\n  \"🎉 done\" highlight\n",
+        );
+        // A definition in a comment is hidden with it, leaving the term as text.
+        assert_outline("Note %%\n: hidden\n%%\n", "paragraph @0..20\n  \"Note \"\n");
+        assert_outline(
+            "Done %%a%%\n:tada: -- x\n",
+            "paragraph @0..23\n  \"Done  🎉 – x\"\n",
         );
     }
 }

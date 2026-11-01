@@ -7,8 +7,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{Embed, InlineStyle, Link, embed, is_wiki, link_dest, with_emoji};
-use crate::render::{LinkSpot, breaks_at};
+use crate::doc::{Embed, InlineStyle, Link, embed, is_wiki, link_dest, typed_dashes, with_emoji};
+use crate::render::{LinkSpot, breaks_at, clusters};
 
 /// The longest word a column is widened to hold whole. A longer one, such as
 /// a URL, breaks.
@@ -68,7 +68,11 @@ impl Table {
             | Options::ENABLE_WIKILINKS
             | Options::ENABLE_SMART_PUNCTUATION;
         let mut builder = Builder::default();
-        for event in Parser::new_ext(source, options) {
+        for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+            let event = match (event, typed_dashes(source, range)) {
+                (Event::Text(_), Some(typed)) => Event::Text(typed.into()),
+                (event, _) => event,
+            };
             builder.event(event);
         }
         builder.finish()
@@ -480,17 +484,18 @@ impl Wrapped {
 /// Where to break a word too wide for `width`: how many characters stay on
 /// this line, and whether the break is after punctuation.
 fn break_point(word: &[(char, usize)], width: usize) -> (usize, bool) {
-    let mut fit = 0;
-    let mut used = 0;
-    for (c, _) in word {
-        used += c.width().unwrap_or(0);
+    let text: String = word.iter().map(|(c, _)| *c).collect();
+    let mut pieces = clusters(&text).map(|piece| (piece.chars().count(), piece.width()));
+    // At least one character and those drawn with it, so a character wider
+    // than the line still moves on.
+    let (mut fit, mut used) = pieces.next().unwrap_or((0, 0));
+    for (chars, w) in pieces {
+        used += w;
         if used > width {
             break;
         }
-        fit += 1;
+        fit += chars;
     }
-    // At least one character, so a character wider than the line still moves on.
-    let fit = fit.max(1);
     let after = word[..fit]
         .iter()
         .rposition(|(c, _)| BREAK_AFTER.contains(*c))
@@ -501,8 +506,10 @@ fn break_point(word: &[(char, usize)], width: usize) -> (usize, bool) {
     }
 }
 
+/// The columns `chars` take, measured as a whole so an emoji with U+FE0F
+/// after it counts two.
 fn chars_width(chars: &[(char, usize)]) -> usize {
-    chars.iter().map(|(c, _)| c.width().unwrap_or(0)).sum()
+    chars.iter().map(|(c, _)| *c).collect::<String>().width()
 }
 
 /// A table read from parser events, one at a time.
@@ -799,6 +806,23 @@ mod tests {
                 "└─────────┴─────┘"
             ]
         );
+    }
+
+    #[test]
+    fn dashes_before_a_word_stay_as_typed_in_cells() {
+        let table = Table::parse("| --force -- x |\n|---|");
+        assert_eq!(table.rows[0][0][0].0, "--force \u{2013} x");
+    }
+
+    #[test]
+    fn emoji_with_a_variation_selector_count_two_columns_in_cells() {
+        let hearts = "\u{2764}\u{fe0f}".repeat(4);
+        assert_eq!(
+            wrapped(&format!("{hearts} xx"), 8),
+            (vec![hearts.clone(), "xx".into()], 0)
+        );
+        let two = "\u{2764}\u{fe0f}".repeat(2);
+        assert_eq!(wrapped(&hearts, 4), (vec![two.clone(), two], 1));
     }
 
     #[test]

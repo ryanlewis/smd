@@ -793,7 +793,7 @@ impl Browser {
                 // no images.
                 let ahead = std::mem::take(&mut self.ahead);
                 if self.open(path) {
-                    self.history.push(here);
+                    self.remember(here);
                     if let Some(h) = heading {
                         self.jump(&h);
                     }
@@ -820,9 +820,19 @@ impl Browser {
         let here = self.here();
         self.jump(heading);
         if self.view.scroll != here.scroll {
-            self.history.push(here);
+            self.remember(here);
             self.ahead.clear();
         }
+    }
+
+    /// Add a place for Back to go to, dropping the oldest past
+    /// [`HISTORY_LIMIT`]. Forward only holds places Back gave up, so it
+    /// stays within the limit too.
+    fn remember(&mut self, here: Visited) {
+        if self.history.len() >= HISTORY_LIMIT {
+            self.history.remove(0);
+        }
+        self.history.push(here);
     }
 
     /// Go back to where the last link was followed from.
@@ -1021,6 +1031,10 @@ const FORWARD_BUTTON: &str = " Forward → ";
 
 /// How many notes each way along Back and Forward keep their images.
 const KEEP_IMAGES_OF: usize = 8;
+
+/// How many places Back can go to. Following a link past this drops the
+/// oldest.
+const HISTORY_LIMIT: usize = 100;
 
 /// The longest pause between two keys of a terminal reply.
 const REPLY_GAP: Duration = Duration::from_millis(50);
@@ -1865,6 +1879,25 @@ mod tests {
         assert_eq!(top(&b.view), "Top");
         b.back();
         assert_eq!(top(&b.view), "Later");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_keeps_only_the_latest_places() {
+        let home = format!("# Top\n\n{0}## Later\n\n{0}", paragraphs(8));
+        let (mut b, dir) = browser("limit", &[("HOME.md", &home)]);
+        for _ in 0..HISTORY_LIMIT + 5 {
+            b.follow(&wiki("#Later"));
+            b.follow(&wiki("#Top"));
+        }
+        assert_eq!(b.history.len(), HISTORY_LIMIT);
+        // The newest place is still the next one Back goes to.
+        b.back();
+        assert_eq!(top(&b.view), "Later");
+        while !b.history.is_empty() {
+            b.back();
+        }
+        assert_eq!(b.ahead.len(), HISTORY_LIMIT);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

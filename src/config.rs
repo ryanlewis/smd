@@ -15,6 +15,8 @@
 //! # Whether images on the web (http and https) are fetched and shown.
 //! # `--remote-images` and `--no-remote-images` override it.
 //! remote_images = false
+//! # How headings are drawn: "auto", "image" or "text".
+//! headings = "auto"
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -29,6 +31,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::heading;
 use crate::mermaid::Renderer;
 use crate::theme::Rgb;
 
@@ -248,6 +251,8 @@ struct File {
     #[serde(default)]
     tasks: Tasks,
     #[serde(default)]
+    headings: heading::Mode,
+    #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
 
@@ -267,6 +272,8 @@ pub struct Config {
     pub mermaid: Renderer,
     /// Whether task checkboxes can be ticked.
     pub tasks: Tasks,
+    /// How headings are drawn.
+    pub headings: heading::Mode,
     keys: HashMap<Key, Action>,
 }
 
@@ -347,6 +354,7 @@ impl Config {
             remote_images: file.remote_images,
             mermaid: file.mermaid,
             tasks: file.tasks,
+            headings: file.headings,
             keys,
         })
     }
@@ -524,6 +532,17 @@ mod tests {
             let err = Config::from_str(text).unwrap_err();
             assert!(err.contains(wanted), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn headings_are_auto_unless_set() {
+        assert_eq!(Config::default().headings, heading::Mode::Auto);
+        let c = Config::from_str("headings = \"image\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Image);
+        let c = Config::from_str("headings = \"text\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Text);
+        let err = Config::from_str("headings = \"big\"\n").unwrap_err();
+        assert!(err.contains("big"), "{err}");
     }
 
     fn key(code: KeyCode, ctrl: bool, alt: bool) -> Result<Key, String> {

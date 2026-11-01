@@ -356,6 +356,7 @@ impl View {
         let end = (self.scroll + area.height as usize).min(lines.len());
         let visible = Text::from(lines[self.scroll..end].to_vec());
         frame.render_widget(Paragraph::new(visible), area);
+        crate::heading::draw_sized(frame.buffer_mut(), area, self.scroll, &self.layout.sized);
         // The cells of a link or checkbox that are in view.
         let scroll = self.scroll;
         let cells = |spot: &[(usize, std::ops::Range<u16>)]| -> Vec<Rect> {
@@ -713,9 +714,15 @@ fn heading_start(source: &str, blocks: &[doc::Block], wanted: &str) -> Option<us
 /// the shared id lets the terminal treat them as one link.
 fn hyperlink(cell: &mut Cell, id: usize, url: &str) {
     let text = cell.symbol();
-    // The second column of a wide character holds nothing to wrap.
-    let Some(width) = NonZeroU16::new(text.width() as u16) else {
-        return;
+    // The second column of a wide character holds nothing to wrap, nor do
+    // the cells under a heading drawn larger. Its first cell keeps its width.
+    let width = match cell.diff_option {
+        CellDiffOption::Skip => return,
+        CellDiffOption::ForcedWidth(width) => width,
+        _ => match NonZeroU16::new(text.width() as u16) {
+            Some(width) => width,
+            None => return,
+        },
     };
     let symbol = format!("\x1b]8;id=smd{id};{url}\x1b\\{text}\x1b]8;;\x1b\\");
     cell.set_symbol(&symbol);
@@ -1750,6 +1757,24 @@ mod tests {
         // Each cell still takes one column.
         assert_eq!(buf[(5, 0)].symbol(), " ");
         assert_eq!(buf[(11, 0)].symbol(), "n");
+    }
+
+    #[test]
+    fn a_link_in_a_sized_heading_wraps_its_osc66_cell() {
+        let mut cell = Cell::new("\x1b]66;s=2:w=1;a\x1b\\");
+        let two = NonZeroU16::new(2).unwrap();
+        cell.set_diff_option(CellDiffOption::ForcedWidth(two));
+        hyperlink(&mut cell, 0, "https://e.com");
+        assert_eq!(
+            cell.symbol(),
+            "\x1b]8;id=smd0;https://e.com\x1b\\\x1b]66;s=2:w=1;a\x1b\\\x1b]8;;\x1b\\"
+        );
+        assert_eq!(cell.diff_option, CellDiffOption::ForcedWidth(two));
+        // The cells it covers are left alone.
+        let mut under = Cell::new(" ");
+        under.set_diff_option(CellDiffOption::Skip);
+        hyperlink(&mut under, 0, "https://e.com");
+        assert_eq!(under.symbol(), " ");
     }
 
     #[test]

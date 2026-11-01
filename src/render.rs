@@ -12,6 +12,7 @@ use crate::doc::{
     self, Block, BlockKind, Callout, CalloutKind, Document, FigureKind, Frontmatter, Inline,
     InlineStyle, Link, ListItem,
 };
+use crate::heading;
 use crate::highlight::{self, Segments};
 use crate::images::{self, Images, Placement};
 use crate::kitty;
@@ -33,6 +34,8 @@ pub struct Layout {
     pub tasks: Vec<TaskSpot>,
     /// Every title that folds a block open or shut, in document order.
     pub folds: Vec<FoldSpot>,
+    /// Every line of a heading the terminal draws larger, in document order.
+    pub sized: Vec<heading::SizedLine>,
 }
 
 /// A link and the cells its text takes, which may be on several lines.
@@ -272,8 +275,14 @@ fn contents(
             ctx.layout.links.extend(links);
         }
         BlockKind::Heading { level, content } => {
-            let links = wrap(content, heading_style(*level), width, first, rest, out);
-            ctx.layout.links.extend(links);
+            let prefix = spans_width(first).max(spans_width(rest));
+            let scale = heading::scale(*level, width.saturating_sub(prefix));
+            if scale > 1 {
+                sized_heading(content, *level, scale, width, first, rest, &mut ctx.layout);
+            } else {
+                let links = wrap(content, heading_style(*level), width, first, rest, out);
+                ctx.layout.links.extend(links);
+            }
         }
         BlockKind::Code { lang, code } => {
             let colours = lang
@@ -355,6 +364,66 @@ fn contents(
         BlockKind::Definition { term, definitions } => {
             definition(term, definitions, width, first, rest, ctx);
         }
+    }
+}
+
+/// A heading the terminal draws `scale` times larger (see
+/// [`heading::draw_sized`]). Each character takes `scale` times its columns
+/// and `scale` rows, so here it is followed by spaces to its full width and
+/// each line by blank rows. Its links take all the cells it covers.
+fn sized_heading(
+    content: &[Inline],
+    level: u8,
+    scale: u8,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    layout: &mut Layout,
+) {
+    let s = usize::from(scale);
+    let prefix = spans_width(first).max(spans_width(rest));
+    let avail = (width.saturating_sub(prefix) / s).max(1);
+    let mut wrapped = Vec::new();
+    let links = wrap(content, heading_style(level), avail, &[], &[], &mut wrapped);
+    let top = layout.lines.len();
+    let left = |i: usize| spans_width(if i == 0 { first } else { rest });
+    for (i, line) in wrapped.into_iter().enumerate() {
+        let row = layout.lines.len();
+        let mut col = left(i);
+        let mut spans = Vec::new();
+        let mut cells = Vec::new();
+        for span in line.spans {
+            for piece in clusters(&span.content) {
+                let w = piece.width();
+                spans.push(Span::styled(piece.to_string(), span.style));
+                if w > 0 {
+                    spans.push(Span::styled(" ".repeat((s - 1) * w), span.style));
+                    cells.push(heading::SizedCell {
+                        col: col as u16,
+                        width: w as u8,
+                        text: piece.to_string(),
+                    });
+                }
+                col += s * w;
+            }
+        }
+        emit(if i == 0 { first } else { rest }, spans, &mut layout.lines);
+        for _ in 1..s {
+            emit(rest, Vec::new(), &mut layout.lines);
+        }
+        layout.sized.push(heading::SizedLine { row, scale, cells });
+    }
+    for mut spot in links {
+        spot.cells = spot
+            .cells
+            .iter()
+            .flat_map(|(r, cols)| {
+                let (row, x) = (top + r * s, left(*r) as u16);
+                let cols = x + cols.start * scale as u16..x + cols.end * scale as u16;
+                (row..row + s).map(move |row| (row, cols.clone()))
+            })
+            .collect();
+        layout.links.push(spot);
     }
 }
 
@@ -1270,6 +1339,75 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    /// A heading's layout at `scale`, inside a quote.
+    fn sized(md: &str, scale: u8, width: usize) -> Layout {
+        let BlockKind::Heading { level, content } = parse(md).blocks.remove(0).kind else {
+            panic!("not a heading");
+        };
+        let bar = [Span::raw("> ")];
+        let mut layout = Layout::default();
+        sized_heading(&content, level, scale, width, &bar, &bar, &mut layout);
+        layout
+    }
+
+    fn texts(layout: &Layout) -> Vec<String> {
+        let line = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect();
+        layout.lines.iter().map(line).collect()
+    }
+
+    #[test]
+    fn sized_headings_are_spaced_out_with_rows_under_them() {
+        // A narrow letter, a wide one and an emoji with U+FE0F.
+        let layout = sized("# A 日❤\u{FE0F}\n", 2, 40);
+        assert_eq!(texts(&layout), ["> A   日  ❤\u{FE0F}  ", ">"]);
+        let cells: Vec<(u16, u8, &str)> = layout.sized[0]
+            .cells
+            .iter()
+            .map(|c| (c.col, c.width, c.text.as_str()))
+            .collect();
+        assert_eq!(
+            cells,
+            [(2, 1, "A"), (4, 1, " "), (6, 2, "日"), (10, 2, "❤\u{FE0F}")]
+        );
+        assert_eq!(layout.sized[0].row, 0);
+        assert_eq!(layout.sized[0].scale, 2);
+        // The block is as wide as the larger text, so it fits the view.
+        let wide: usize = layout.lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.width())
+            .sum();
+        assert_eq!(wide, 14);
+    }
+
+    #[test]
+    fn sized_headings_wrap_at_their_size_and_keep_their_links() {
+        // 22 columns less the bar hold 6 characters three times the size.
+        let layout = sized("# Going [to it](x.md)\n", 3, 22);
+        assert_eq!(texts(&layout).len(), 6);
+        let rows: Vec<usize> = layout.sized.iter().map(|l| l.row).collect();
+        assert_eq!(rows, [0, 3]);
+        let first: String = layout.sized[1]
+            .cells
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(first, "to it");
+        // The link is on all three rows of the second line, three columns
+        // a character.
+        assert_eq!(layout.links.len(), 1);
+        let cells = &layout.links[0].cells;
+        assert_eq!(cells, &[(3, 2..17), (4, 2..17), (5, 2..17)]);
+    }
+
+    #[test]
+    fn headings_are_text_of_one_size_unless_sized() {
+        // Nothing is set in tests, so headings lay out as before.
+        let layout = render(&parse("# Title\n"), 40, &Images::text());
+        assert!(layout.sized.is_empty());
+        assert_eq!(plain("# Title\n", 40), ["Title"]);
     }
 
     #[test]

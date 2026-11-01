@@ -1156,6 +1156,48 @@ mod tests {
     }
 
     #[test]
+    fn footnotes_are_numbered_and_listed_at_the_end() {
+        let md = "One[^b] two[^a] three[^b] none[^x].\n\n[^a]: First.\n\n\
+                  [^b]: Second.\n\n    More.\n\n    ```\n    code\n    ```\n\nAfter.\n";
+        assert_eq!(
+            plain(md, 40),
+            vec![
+                "One[1] two[2] three[1] none[^x].",
+                "",
+                "After.",
+                "",
+                "────────────────────────────────────────",
+                "",
+                "1. Second.",
+                "",
+                "   More.",
+                "",
+                "     code",
+                "",
+                "   ↩",
+                "",
+                "2. First. ↩",
+            ]
+        );
+        let layout = render(&parse(md), 40, &no_images());
+        let links: Vec<_> = layout
+            .links
+            .iter()
+            .map(|l| (l.link.dest.as_str(), l.cells.clone()))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("#fn:1", vec![(0, 3..6)]),
+                ("#fn:2", vec![(0, 10..13)]),
+                ("#fn:1", vec![(0, 19..22)]),
+                ("#fnref:1", vec![(12, 3..4)]),
+                ("#fnref:2", vec![(14, 10..11)]),
+            ]
+        );
+    }
+
+    #[test]
     fn each_checkbox_is_found_where_it_is_drawn() {
         let md = "- [ ] one\n- [x] two\n  - [ ] nested\n\n> 9. [ ] quoted\n> 10. [x] ten\n";
         let doc = parse(md);

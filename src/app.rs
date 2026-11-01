@@ -161,14 +161,22 @@ impl View {
         self.relayout(None);
     }
 
-    /// Scroll to the first heading matching `wanted`. Returns false when
-    /// there is none.
+    /// Scroll to the anchor named `wanted`, such as a footnote, or else the
+    /// first heading matching it, opening any shut fold around it. Returns
+    /// false when there is neither.
     pub fn jump_to_heading(&mut self, wanted: &str) -> bool {
-        let Some(start) = heading_start(&self.doc.blocks, wanted) else {
+        let anchor = self.doc.anchor(wanted);
+        let Some(at) = anchor.or_else(|| heading_start(&self.doc.blocks, wanted)) else {
             return false;
         };
-        self.open_folds_around(start);
-        if let Some(b) = self.layout.blocks.iter().find(|b| b.span.start == start) {
+        self.open_folds_around(at);
+        let blocks = &self.layout.blocks;
+        let block = match anchor {
+            // The innermost block the anchor is in.
+            Some(_) => blocks.iter().rfind(|b| b.span.contains(&at) || b.span.start == at),
+            None => blocks.iter().find(|b| b.span.start == at),
+        };
+        if let Some(b) = block {
             self.scroll = b.rows.start.min(self.max_scroll());
         }
         true
@@ -2023,6 +2031,34 @@ mod tests {
         assert_eq!(b.view.notice.as_deref(), Some("no heading found: Missing"));
         assert_eq!(b.history.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_footnote_and_its_back_link_jump_in_the_note_and_back_returns() {
+        let home = format!(
+            "# Top\n\n{0}Said[^n].\n\n{0}[^n]: The note.\n",
+            paragraphs(8)
+        );
+        let (mut b, _dir) = browser("footnote", &[("HOME.md", &home)]);
+        let link = |b: &Browser, dest: &str| {
+            let spot = b.view.layout.links.iter().find(|l| l.link.dest == dest);
+            spot.expect("a link").link.clone()
+        };
+        b.view.jump_to_heading("fnref:1");
+        assert_eq!(top(&b.view), "Said[1].");
+        b.follow(&link(&b, "#fn:1"));
+        // The footnotes end the note, so the view stops at its end, which
+        // shows them.
+        assert_eq!(b.view.scroll, b.view.max_scroll());
+        let shown = b.view.layout.lines[b.view.scroll..].iter();
+        let shown: Vec<_> = shown.map(ToString::to_string).collect();
+        assert!(shown.iter().any(|l| l == "1. The note. ↩"), "{shown:?}");
+        b.back();
+        assert_eq!(top(&b.view), "Said[1].");
+        b.forward();
+        b.follow(&link(&b, "#fnref:1"));
+        assert_eq!(top(&b.view), "Said[1].");
+        assert_eq!(b.history.len(), 2);
     }
 
     #[test]

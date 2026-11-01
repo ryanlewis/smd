@@ -16,6 +16,20 @@ use crate::theme::Theme;
 pub struct Document {
     pub source: String,
     pub blocks: Vec<Block>,
+    /// Places a link can jump to that are not headings, with the byte in
+    /// the source each is at: footnote `n`, `fn:n`, and its first
+    /// reference, `fnref:n`.
+    pub anchors: Vec<(String, usize)>,
+}
+
+impl Document {
+    /// Where the anchor `name` is in the source, if there is one.
+    pub fn anchor(&self, name: &str) -> Option<usize> {
+        self.anchors
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|&(_, at)| at)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -366,7 +380,8 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
-        | Options::ENABLE_WIKILINKS;
+        | Options::ENABLE_WIKILINKS
+        | Options::ENABLE_FOOTNOTES;
     let mut builder = Builder::new(source);
     builder.hide = theme.map(other_theme);
     // The body is parsed without metadata blocks, which pulldown-cmark would
@@ -635,6 +650,13 @@ struct Builder<'a> {
     embeds: Vec<bool>,
     /// Obsidian comments, which are hidden.
     comments: Vec<Range<usize>>,
+    /// Each footnote referenced, by its label in lower case, in the order
+    /// of first reference, which numbers it from 1, and where that
+    /// reference is.
+    referenced: Vec<(String, usize)>,
+    /// Each footnote's definition: its label in lower case, its blocks and
+    /// where it is. A label defined twice keeps the first.
+    definitions: Vec<(String, Vec<Block>, Range<usize>)>,
 }
 
 struct Frame {
@@ -679,6 +701,8 @@ enum FrameKind {
         code: String,
     },
     Html(String),
+    /// A footnote's definition, by its label in lower case.
+    Footnote(String),
 }
 
 impl Frame {
@@ -774,6 +798,8 @@ impl<'a> Builder<'a> {
             hidden: 0,
             embeds: Vec::new(),
             comments: Vec::new(),
+            referenced: Vec::new(),
+            definitions: Vec::new(),
         }
     }
 
@@ -783,10 +809,103 @@ impl<'a> Builder<'a> {
         }
         let mut root = self.stack.pop().expect("root frame");
         root.flush_inlines();
+        let mut blocks = root.blocks;
+        let anchors = self.footnotes(&mut blocks);
         Document {
             source: self.source.to_string(),
-            blocks: root.blocks,
+            blocks,
+            anchors,
         }
+    }
+
+    /// Add the footnotes referenced to the end of `blocks`, after a rule, as
+    /// a list numbered as their references are. Each ends with a link back
+    /// to its first reference. Returns the anchors for both.
+    fn footnotes(&mut self, blocks: &mut Vec<Block>) -> Vec<(String, usize)> {
+        if self.referenced.is_empty() {
+            return Vec::new();
+        }
+        let end = self.source.len();
+        let mut anchors = Vec::new();
+        let mut items = Vec::new();
+        for (i, (label, at)) in self.referenced.iter().enumerate() {
+            let n = i + 1;
+            let Some(i) = self.definitions.iter().position(|d| d.0 == *label) else {
+                continue;
+            };
+            let (_, mut def, range) = self.definitions.swap_remove(i);
+            anchors.push((format!("fnref:{n}"), *at));
+            anchors.push((
+                format!("fn:{n}"),
+                def.first().map_or(range.start, |b| b.span.start),
+            ));
+            let back = Inline::Text {
+                text: "↩".to_string(),
+                style: InlineStyle {
+                    link: Some(Link::from(format!("#fnref:{n}").as_str())),
+                    ..InlineStyle::default()
+                },
+            };
+            match def.last_mut() {
+                Some(Block {
+                    kind: BlockKind::Paragraph(inlines),
+                    ..
+                }) => {
+                    inlines.push(Inline::Text {
+                        text: " ".to_string(),
+                        style: InlineStyle::default(),
+                    });
+                    inlines.push(back);
+                }
+                last => {
+                    let span = last.map_or(range.clone(), |b| b.span.end..b.span.end);
+                    def.push(Block {
+                        kind: BlockKind::Paragraph(vec![back]),
+                        span,
+                    });
+                }
+            }
+            items.push(ListItem {
+                task: None,
+                mark: None,
+                blocks: def,
+            });
+        }
+        if items.is_empty() {
+            return anchors;
+        }
+        let tight = items.iter().all(|item| item.blocks.len() == 1);
+        blocks.push(Block {
+            kind: BlockKind::Rule,
+            span: end..end,
+        });
+        blocks.push(Block {
+            kind: BlockKind::List {
+                start: Some(1),
+                tight,
+                items,
+            },
+            span: end..end,
+        });
+        anchors
+    }
+
+    /// A reference to a footnote, shown as its number, `[1]`, linked to the
+    /// footnote.
+    fn footnote_reference(&mut self, label: &str, range: Range<usize>) {
+        let label = label.to_lowercase();
+        let n = match self.referenced.iter().position(|(l, _)| *l == label) {
+            Some(i) => i + 1,
+            None => {
+                self.referenced.push((label, range.start));
+                self.referenced.len()
+            }
+        };
+        let style = InlineStyle {
+            link: Some(Link::from(format!("#fn:{n}").as_str())),
+            ..self.style()
+        };
+        self.text(&format!("[{n}]"), style, range);
     }
 
     fn top(&mut self) -> &mut Frame {
@@ -860,9 +979,7 @@ impl<'a> Builder<'a> {
                 self.text(&format!("${math}$"), self.style_with(false, true), range);
             }
             Event::DisplayMath(math) => self.display_math(&math, range),
-            Event::FootnoteReference(label) => {
-                self.text(&format!("[^{label}]"), self.style(), range);
-            }
+            Event::FootnoteReference(label) => self.footnote_reference(&label, range),
             Event::SoftBreak | Event::HardBreak if self.ends_title(range.end) => {}
             Event::SoftBreak => self.text(" ", self.style(), range),
             Event::HardBreak => self.inline(Inline::Break, range),
@@ -937,6 +1054,7 @@ impl<'a> Builder<'a> {
                 task: None,
                 mark: None,
             },
+            Tag::FootnoteDefinition(label) => FrameKind::Footnote(label.to_lowercase()),
             _ => return None,
         })
     }
@@ -987,7 +1105,8 @@ impl<'a> Builder<'a> {
             | TagEnd::CodeBlock
             | TagEnd::HtmlBlock
             | TagEnd::List(_)
-            | TagEnd::Item => self.close(),
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition => self.close(),
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
             TagEnd::Strikethrough => self.strikethrough = self.strikethrough.saturating_sub(1),
@@ -1048,6 +1167,15 @@ impl<'a> Builder<'a> {
                         mark,
                         blocks: frame.blocks,
                     });
+                }
+                return;
+            }
+            FrameKind::Footnote(label) => {
+                // A quote or list item that held only this goes too.
+                self.top().left_out = true;
+                frame.flush_inlines();
+                if !self.definitions.iter().any(|d| d.0 == label) {
+                    self.definitions.push((label, frame.blocks, span));
                 }
                 return;
             }
@@ -2292,23 +2420,78 @@ paragraph @21..62
     }
 
     #[test]
-    fn stray_html_and_footnote_references_are_text() {
-        // The parser sends neither today: HTML comes inside an HTML block,
-        // and footnotes are not turned on.
+    fn stray_html_is_text() {
+        // The parser does not send it today: HTML comes inside an HTML block.
         use pulldown_cmark::CowStr;
-        let mut builder = Builder::new("x<b>[^1]");
-        builder.event(Event::Start(Tag::Paragraph), 0..8);
+        let mut builder = Builder::new("x<b>");
+        builder.event(Event::Start(Tag::Paragraph), 0..4);
         builder.event(Event::Text(CowStr::from("x")), 0..1);
         builder.event(Event::Html(CowStr::from("<b>")), 1..4);
-        builder.event(Event::FootnoteReference(CowStr::from("1")), 4..8);
-        builder.event(Event::End(TagEnd::Paragraph), 0..8);
+        builder.event(Event::End(TagEnd::Paragraph), 0..4);
         let kinds: Vec<BlockKind> = builder
             .finish()
             .blocks
             .into_iter()
             .map(|b| b.kind)
             .collect();
-        assert_eq!(kinds, vec![BlockKind::Paragraph(vec![text("x<b>[^1]")])]);
+        assert_eq!(kinds, vec![BlockKind::Paragraph(vec![text("x<b>")])]);
+    }
+
+    #[test]
+    fn a_reference_with_no_definition_adds_no_footnotes() {
+        // The parser sends none, leaving `[^1]` as text, but a reference
+        // with nothing to list adds no rule or empty list.
+        use pulldown_cmark::CowStr;
+        let mut builder = Builder::new("[^1]");
+        builder.event(Event::Start(Tag::Paragraph), 0..4);
+        builder.event(Event::FootnoteReference(CowStr::from("1")), 0..4);
+        builder.event(Event::End(TagEnd::Paragraph), 0..4);
+        let doc = builder.finish();
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(doc.anchors.is_empty());
+        assert_outline("Text[^1].\n", "paragraph @0..10\n  \"Text[^1].\"\n");
+    }
+
+    #[test]
+    fn footnotes_go_to_the_end_numbered_by_first_reference() {
+        let md = "A[^Two] b[^one] c[^two].\n\n\
+                  > [^one]: In a quote.\n\n\
+                  [^two]: Para.\n\n    - item\n\n[^two]: Again.\n\n[^unused]: No.\n";
+        assert_outline(
+            md,
+            r##"paragraph @0..25
+  "A"
+  "[1]" link="#fn:1" wiki=false
+  " b"
+  "[2]" link="#fn:2" wiki=false
+  " c"
+  "[1]" link="#fn:1" wiki=false
+  "."
+rule @107..107
+list Some(1) tight=false @107..107
+  item task=None
+    paragraph @57..63
+      "Para."
+    list None tight=true @68..76
+      item task=None
+        paragraph @70..74
+          "item"
+    paragraph @76..76
+      "↩" link="#fnref:1" wiki=false
+  item task=None
+    paragraph @36..48
+      "In a quote."
+      " "
+      "↩" link="#fnref:2" wiki=false
+"##,
+        );
+        let doc = parse(md);
+        let at = |name| &doc.source[doc.anchor(name).unwrap()..][..4];
+        assert_eq!(at("fnref:1"), "[^Tw");
+        assert_eq!(at("fnref:2"), "[^on");
+        assert_eq!(at("fn:1"), "Para");
+        assert_eq!(at("fn:2"), "In a");
+        assert_eq!(doc.anchor("fn:3"), None);
     }
 
     #[test]
@@ -2423,16 +2606,23 @@ paragraph @17..27
     fn pin_footnotes_html_and_rules() {
         assert_outline(
             "Text[^1].\n\n[^1]: The note.\n\n<!-- c -->\n\na <b>bold</b> c\n\n***\n___\n",
-            r#"paragraph @0..10
-  "Text[^1]."
-paragraph @11..27
-  "[^1]: The note."
+            r##"paragraph @0..10
+  "Text"
+  "[1]" link="#fn:1" wiki=false
+  "."
 html "<!-- c -->\n" @28..39
 paragraph @40..56
   "a <b>bold</b> c"
 rule @57..61
 rule @61..65
-"#,
+rule @65..65
+list Some(1) tight=true @65..65
+  item task=None
+    paragraph @17..27
+      "The note."
+      " "
+      "↩" link="#fnref:1" wiki=false
+"##,
         );
     }
 

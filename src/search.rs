@@ -404,6 +404,67 @@ mod tests {
         assert_eq!(find("g o", &layout, &doc), vec![]);
     }
 
+    /// The matches of `term` when the block that starts at the first `from`
+    /// in `md` is drawn as an image, on the lines of its text and `more`.
+    fn found_in_image(md: &str, from: &str, more: usize, term: &str) -> Vec<Match> {
+        use crate::images::Placement;
+        let doc = doc::parse(md);
+        let mut layout = render(&doc, 40, &Images::new((8, 16)));
+        let at = md.find(from).unwrap();
+        let block = layout.blocks.iter_mut().rfind(|b| b.span.start == at);
+        let block = block.expect("a block starts there");
+        block.rows.end += more;
+        let rows = block.rows.len() as u16;
+        block.image = Some(Placement {
+            id: 1,
+            cols: 20,
+            rows,
+        });
+        find(term, &layout, &doc)
+    }
+
+    #[test]
+    fn a_heading_drawn_as_an_image_matches_by_its_text() {
+        let on = |row| {
+            vec![Match {
+                row,
+                cells: Vec::new(),
+            }]
+        };
+        for (md, row) in [
+            ("# Big Title\n\nafter\n", 0),
+            ("> # Big Title\n", 0),
+            ("> [!NOTE]\n> # Big Title\n", 1),
+            (
+                "<details open>\n<summary>more</summary>\n\n# Big Title\n\n</details>\n",
+                1,
+            ),
+            ("- # Big Title\n", 0),
+            ("Term\n: # Big Title\n", 1),
+        ] {
+            assert_eq!(found_in_image(md, "#", 0, "big title"), on(row), "{md:?}");
+            assert_eq!(found_in_image(md, "#", 0, "Big Title"), on(row), "{md:?}");
+            assert_eq!(found_in_image(md, "#", 0, "Big title"), [], "{md:?}");
+            assert_eq!(found_in_image(md, "#", 0, "big titles"), [], "{md:?}");
+        }
+        // Only its first line matches: the lines under it are the image.
+        let md = "# Big Title\n\nbig title\n";
+        assert_eq!(found_in_image(md, "#", 2, "big title"), on(0));
+        // A hard break in the heading reads as a space.
+        assert_eq!(
+            found_in_image("Big\\\nTitle\n===\n", "Big", 0, "big title"),
+            on(0)
+        );
+    }
+
+    #[test]
+    fn the_lines_of_a_picture_drawn_as_an_image_are_passed_over() {
+        let md = "![big title](big.png)\n\nbig title\n";
+        let text = found(md, "big title");
+        assert_eq!(text.len(), 2, "{text:?}");
+        assert_eq!(found_in_image(md, "!", 0, "big title"), text[1..]);
+    }
+
     #[test]
     fn lower_case_ignores_case_and_a_capital_matches_it() {
         let md = "Apple apple APPLE\n";
@@ -531,6 +592,55 @@ mod tests {
         assert_eq!(search.step_by(true, 4..7, 2), Some((0, true)));
         assert_eq!(search.step_by(false, 4..7, 2), Some((2, true)));
         assert_eq!(Search::default().step_by(true, top, 2), None);
+    }
+
+    #[test]
+    fn a_match_is_seen_when_any_of_its_lines_is_in_view() {
+        let m = Match {
+            row: 2,
+            cells: vec![(2, 5..6), (3, 0..1)],
+        };
+        for (view, seen) in [(0..2, false), (1..3, true), (3..4, true), (4..6, false)] {
+            assert_eq!(m.seen(&view), seen, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn a_step_with_no_match_ahead_goes_round() {
+        let on = |row| Match {
+            row,
+            cells: vec![(row, 0..1)],
+        };
+        let search = Search {
+            term: "x".into(),
+            matches: vec![on(5), on(10)],
+            ..Search::default()
+        };
+        // Below the last match, forward goes round to the first.
+        assert_eq!(search.step(true, 11..14), Some((0, true)));
+        assert_eq!(search.first_from(11), Some((0, true)));
+        // Above the first match, back goes round to the last.
+        assert_eq!(search.step(false, 0..3), Some((1, true)));
+        // A match on the line under the view is not above its bottom.
+        assert_eq!(search.step(false, 2..5), Some((1, true)));
+    }
+
+    #[test]
+    fn the_prompt_counts_the_matches_so_far() {
+        let one = Match {
+            row: 0,
+            cells: vec![(0, 0..1)],
+        };
+        let mut search = Search::default();
+        assert!(!search.active());
+        assert_eq!(search.prompt(), "/");
+        search.term = "x".into();
+        assert!(search.active());
+        assert_eq!(search.prompt(), "/x  no matches");
+        search.matches = vec![one.clone()];
+        assert_eq!(search.prompt(), "/x  1 match");
+        search.matches = vec![one.clone(), one];
+        assert_eq!(search.prompt(), "/x  2 matches");
     }
 
     #[test]

@@ -104,6 +104,11 @@ const REPLY_TIMEOUT: Duration = Duration::from_millis(300);
 /// not sent the DA1 reply by the timeout.
 const LATE_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long to wait for a graphics reply that comes after the DA1 reply.
+/// herdr answers DA1 itself but passes the graphics query on to the outer
+/// terminal, so its graphics reply comes second.
+const GRAPHICS_GRACE: Duration = Duration::from_millis(100);
+
 /// Cell size used when the terminal reports none.
 const FALLBACK_CELL: (u16, u16) = (8, 16);
 
@@ -196,27 +201,42 @@ fn exchange(out: &mut impl Write, fd: libc::c_int, timeout: Duration) -> Vec<u8>
     let read = move |left| read_chunk(fd, left);
     let mut reply = Vec::new();
     if sent {
-        reply = read_replies(reply, Instant::now() + timeout, read);
+        reply = read_replies(reply, Instant::now() + timeout, has_da1_reply, read);
     }
     // A slow terminal, over ssh say, is given a little longer once it has
     // started to answer, so its last replies are read here and do not reach
     // the key reader as key presses.
     if !reply.is_empty() && !has_da1_reply(&reply) {
-        reply = read_replies(reply, Instant::now() + LATE_REPLY_TIMEOUT, read);
+        reply = read_replies(
+            reply,
+            Instant::now() + LATE_REPLY_TIMEOUT,
+            has_da1_reply,
+            read,
+        );
+    }
+    // A graphics reply may still follow DA1, as in herdr.
+    if has_da1_reply(&reply) && !parse_graphics_reply(&reply) {
+        reply = read_replies(
+            reply,
+            Instant::now() + GRAPHICS_GRACE,
+            parse_graphics_reply,
+            read,
+        );
     }
     let _ = out.write_all(b"\x1b[?1049l").and_then(|()| out.flush());
     reply
 }
 
-/// Add chunks from `next` to `buf` until it holds the DA1 reply or `deadline`
-/// passes. `next` is given the time left and returns `None` when nothing came
-/// in that time or the input ended.
+/// Add chunks from `next` to `buf` until `done` says it holds the reply
+/// waited for or `deadline` passes. `next` is given the time left and returns
+/// `None` when nothing came in that time or the input ended.
 fn read_replies(
     mut buf: Vec<u8>,
     deadline: Instant,
+    done: impl Fn(&[u8]) -> bool,
     mut next: impl FnMut(Duration) -> Option<Vec<u8>>,
 ) -> Vec<u8> {
-    while !has_da1_reply(&buf) {
+    while !done(&buf) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -440,11 +460,16 @@ mod tests {
     /// how many chunks it asked for.
     fn replies(chunks: &[&[u8]]) -> (Vec<u8>, usize) {
         let mut calls = 0;
-        let buf = read_replies(Vec::new(), Instant::now() + REPLY_TIMEOUT, |left| {
-            assert!(!left.is_zero() && left <= REPLY_TIMEOUT);
-            calls += 1;
-            chunks.get(calls - 1).map(|c| c.to_vec())
-        });
+        let buf = read_replies(
+            Vec::new(),
+            Instant::now() + REPLY_TIMEOUT,
+            has_da1_reply,
+            |left| {
+                assert!(!left.is_zero() && left <= REPLY_TIMEOUT);
+                calls += 1;
+                chunks.get(calls - 1).map(|c| c.to_vec())
+            },
+        );
         (buf, calls)
     }
 
@@ -489,8 +514,8 @@ mod tests {
 
     #[test]
     fn replies_after_da1_are_not_waited_for() {
-        // A terminal that answers DA1 first: the graphics reply that follows
-        // in a later read is not waited for, one in the same read is kept.
+        // Waiting for DA1 stops at DA1: a graphics reply in a later read is
+        // left for exchange's grace wait, one in the same read is kept.
         let (buf, calls) = replies(&[b"\x1b[?62c", b"\x1b_Gi=31;OK\x1b\\"]);
         assert_eq!(calls, 1);
         assert!(!parse_graphics_reply(&buf));
@@ -510,7 +535,7 @@ mod tests {
 
     #[test]
     fn a_passed_deadline_reads_nothing() {
-        let buf = read_replies(Vec::new(), Instant::now(), |_| {
+        let buf = read_replies(Vec::new(), Instant::now(), has_da1_reply, |_| {
             panic!("read after the deadline")
         });
         assert!(buf.is_empty());
@@ -520,10 +545,15 @@ mod tests {
     fn replies_stop_at_the_deadline() {
         // Input that never ends and never holds DA1 is cut off by the clock.
         let start = Instant::now();
-        let buf = read_replies(Vec::new(), start + Duration::from_millis(20), |_| {
-            std::thread::sleep(Duration::from_millis(2));
-            Some(b"x".to_vec())
-        });
+        let buf = read_replies(
+            Vec::new(),
+            start + Duration::from_millis(20),
+            has_da1_reply,
+            |_| {
+                std::thread::sleep(Duration::from_millis(2));
+                Some(b"x".to_vec())
+            },
+        );
         assert!(!buf.is_empty());
         assert!(start.elapsed() >= Duration::from_millis(20));
     }
@@ -626,6 +656,35 @@ mod tests {
         terminal.join().unwrap();
         assert_eq!(reply, b"\x1b[6;16;8t\x1b[?62c");
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_graphics_reply_after_da1_is_read() {
+        // herdr answers DA1 itself and the graphics reply comes later, from
+        // the outer terminal: it is read here, not by the key reader.
+        let pipe = Pipe::new(b"\x1b[6;16;8t\x1b[?62;22c", false);
+        let write = pipe.write.unwrap();
+        let terminal = std::thread::spawn(move || {
+            std::thread::sleep(GRAPHICS_GRACE / 4);
+            let reply = b"\x1b_Gi=31;OK\x1b\\";
+            // SAFETY: writes the reply from a live buffer to an open pipe.
+            unsafe { libc::write(write, reply.as_ptr().cast(), reply.len()) };
+        });
+        let reply = exchange(&mut Vec::new(), pipe.read, REPLY_TIMEOUT);
+        terminal.join().unwrap();
+        assert!(parse_graphics_reply(&reply));
+        assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn da1_without_graphics_waits_only_the_grace() {
+        let pipe = Pipe::new(b"\x1b[?62c", false);
+        let start = Instant::now();
+        let reply = exchange(&mut Vec::new(), pipe.read, Duration::from_secs(10));
+        assert_eq!(reply, b"\x1b[?62c");
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]

@@ -94,19 +94,33 @@ fn panicked(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// The ids of the images in the terminal, shared so a panic hook can delete
-/// them when the app cannot.
+/// The ids of the images in the terminal and the names of the shared memory
+/// objects sent to it, shared so a panic hook can delete and remove them when
+/// the app cannot.
 #[derive(Clone, Default)]
-pub struct Uploaded(Arc<Mutex<HashSet<u32>>>);
+pub struct Uploaded {
+    ids: Arc<Mutex<HashSet<u32>>>,
+    objects: Arc<Mutex<HashSet<String>>>,
+}
+
+/// The value behind `mutex`. A panic while the lock was held leaves it as it
+/// was.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(value) => value,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 impl Uploaded {
-    /// Delete every image in the terminal.
+    /// Remove every shared memory object the terminal may not have read, then
+    /// delete every image in the terminal. The objects go first, so they are
+    /// removed even when the terminal can no longer be written to.
     pub fn delete_all(&self, out: &mut impl Write) -> io::Result<()> {
-        // A panic while the lock was held leaves the set as it was.
-        let ids = match self.0.lock() {
-            Ok(ids) => ids,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        for name in lock(&self.objects).drain() {
+            kitty::shm::unlink(&name);
+        }
+        let ids = lock(&self.ids);
         for &id in ids.iter() {
             kitty::delete(out, id)?;
         }
@@ -114,14 +128,21 @@ impl Uploaded {
     }
 
     fn set(&self, id: u32, uploaded: bool) {
-        let mut ids = match self.0.lock() {
-            Ok(ids) => ids,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut ids = lock(&self.ids);
         if uploaded {
             ids.insert(id);
         } else {
             ids.remove(&id);
+        }
+    }
+
+    /// Note that the object `name` was sent, or that it was removed.
+    fn set_object(&self, name: &str, sent: bool) {
+        let mut objects = lock(&self.objects);
+        if sent {
+            objects.insert(name.to_string());
+        } else {
+            objects.remove(name);
         }
     }
 }
@@ -364,6 +385,7 @@ impl Images {
                     Some(name) => {
                         // Tracked first, so it is removed even if the write fails.
                         self.objects.push((name.clone(), Instant::now()));
+                        self.uploaded.set_object(&name, true);
                         kitty::upload_shared(out, entry.id, &name, data.len())?;
                     }
                     None => kitty::upload(out, entry.id, &data)?,
@@ -386,10 +408,12 @@ impl Images {
     /// Remove the shared memory objects sent `keep` or longer before `now`.
     /// Most are gone already: the terminal removes each it reads.
     fn unlink_objects(&mut self, now: Instant, keep: Duration) {
+        let uploaded = &self.uploaded;
         self.objects.retain(|(name, sent)| {
             let keep = now.saturating_duration_since(*sent) < keep;
             if !keep {
                 kitty::shm::unlink(name);
+                uploaded.set_object(name, false);
             }
             keep
         });
@@ -1752,6 +1776,42 @@ pub mod tests {
         let mut out = Vec::new();
         uploaded.delete_all(&mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_panic_hook_removes_objects_the_terminal_did_not_read() {
+        let mut images = Images::new((10, 20));
+        images.use_shared_memory(true);
+        images.request(file_key("a.png"), job(png(10, 20)));
+        settle(&mut images);
+        let id = images.ready(&file_key("a.png")).unwrap().id;
+        let at = [Placement {
+            id,
+            cols: 1,
+            rows: 1,
+        }];
+        let uploaded = images.uploaded();
+        images.flush(&mut Vec::new(), &at).unwrap();
+        let [(name, _)] = images.objects.as_slice() else {
+            panic!("one object: {:?}", images.objects);
+        };
+        let exists = |name: &str| {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            // SAFETY: c_name is a valid C string; the descriptor is closed.
+            unsafe {
+                let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0 as libc::c_uint);
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+                fd >= 0
+            }
+        };
+        assert!(exists(name));
+        // What the panic hook does, here with the terminal gone too.
+        assert!(uploaded.delete_all(&mut Gone).is_err());
+        assert!(!exists(name));
+        assert!(lock(&uploaded.objects).is_empty());
     }
 
     #[test]

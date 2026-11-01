@@ -30,7 +30,7 @@ use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
 use crate::render::{Layout, render_folds};
-use crate::search::Search;
+use crate::search::{Match, Search};
 use crate::theme;
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
@@ -271,7 +271,10 @@ impl View {
 
     /// `relayout`, with the match the reader is on given by `kept`, as
     /// `current_match` gives it.
+    /// A current match that was in view and is pushed out of it is brought
+    /// back into view.
     fn relayout_keeping(&mut self, anchor: Option<Anchor>, kept: Option<(Anchor, usize)>) {
+        let seen = self.current_seen();
         if self.width > 0 {
             self.highlighted = highlight::ready().is_some();
             self.layout = render_folds(&self.doc, self.width, &self.images, &self.flipped);
@@ -282,6 +285,9 @@ impl View {
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.selected = self.selected.filter(|&s| self.has(s));
+        if seen && !self.current_seen() {
+            self.show_current();
+        }
     }
 
     /// What to keep at the top of the view. A view at the very top stays there.
@@ -333,6 +339,27 @@ impl View {
         Some((self.anchor_of(index, 0), nth))
     }
 
+    /// Whether any of the current match is in view.
+    fn current_seen(&self) -> bool {
+        let rows = self.search.current.and_then(|i| self.search.matches.get(i));
+        let view = self.in_view();
+        rows.map(Match::rows)
+            .is_some_and(|rows| rows.start < view.end && view.start < rows.end)
+    }
+
+    /// Scroll as little as brings all of the current match into view.
+    fn show_current(&mut self) {
+        let Some(m) = self.search.current.and_then(|i| self.search.matches.get(i)) else {
+            return;
+        };
+        let rows = m.rows();
+        let height = (self.height as usize).max(1);
+        if rows.end > self.scroll + height {
+            self.scroll = rows.end - height;
+        }
+        self.scroll = self.scroll.min(rows.start).min(self.max_scroll());
+    }
+
     /// The top line that puts `anchor` back where it was: the same offset into
     /// its block. A block that got shorter keeps the view on its last line.
     fn find(&self, anchor: &Anchor) -> Option<usize> {
@@ -375,8 +402,9 @@ impl View {
     }
 
     /// Lay the document out again when the size changes, keeping roughly the
-    /// same part of it in view.
+    /// same part of it in view, and the current match when it was in view.
     fn resize(&mut self, width: u16, height: u16) {
+        let seen = (width, height) != (self.width, self.height) && self.current_seen();
         if width != self.width {
             let kept = self.current_match();
             let old_len = self.layout.lines.len().max(1);
@@ -389,6 +417,9 @@ impl View {
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
+        if seen && !self.current_seen() {
+            self.show_current();
+        }
     }
 
     fn max_scroll(&self) -> usize {
@@ -802,9 +833,11 @@ impl View {
         if !self.flipped.remove(&at) {
             self.flipped.insert(at);
         }
+        // The title stays put rather than the current match.
+        let scroll = self.scroll;
         self.relayout(None);
         if let (Some((_, old)), Some((i, new))) = (before, row(&self.layout)) {
-            let screen = old.saturating_sub(self.scroll);
+            let screen = old.saturating_sub(scroll);
             self.scroll = new.saturating_sub(screen).min(self.max_scroll());
             if was_selected {
                 self.selected = Some(Stop::Fold(i));
@@ -1411,6 +1444,8 @@ impl Browser {
         self.view.scroll = visited.scroll;
         self.view.selected = visited.selected;
         self.view.relayout(None);
+        // The place gone back to stays put rather than the current match.
+        self.view.scroll = visited.scroll.min(self.view.max_scroll());
         true
     }
 
@@ -2279,6 +2314,48 @@ mod tests {
         on_match(&mut v, "pin", 2);
         v.reload(parse("pin pin one pin two\n\nthe end\n"));
         assert_eq!(v.search.current, Some(2));
+    }
+
+    #[test]
+    fn a_current_match_in_view_stays_in_view_when_a_resize_pushes_it_down() {
+        // At 40 columns the first paragraph is two lines and "needle" is on
+        // line 3; at 10 it is six lines and "needle" is on line 7.
+        let words = "one two three four five six seven eight nine ten";
+        let md = format!("{words}\n\nneedle\n\n{}", paragraphs(10));
+        let mut v = new_view(&md);
+        v.resize(40, 5);
+        on_match(&mut v, "needle", 0);
+        assert_eq!((v.scroll, v.search.matches[0].row), (0, 3));
+        v.resize(10, 5);
+        assert_eq!(v.search.current, Some(0));
+        assert_eq!(v.search.matches[0].row, 7);
+        assert_eq!(v.scroll, 3);
+        // Shorter, it is still kept on the bottom line.
+        v.resize(10, 3);
+        assert_eq!(v.scroll, 5);
+        // A match out of view does not move the view.
+        let mut v = new_view(&md);
+        v.resize(40, 5);
+        on_match(&mut v, "line 9", 0);
+        v.scroll_by(-100);
+        v.resize(10, 5);
+        assert_eq!(v.search.current, Some(0));
+        assert_eq!(v.scroll, 0);
+    }
+
+    #[test]
+    fn a_match_half_in_view_does_not_move_the_view_on_a_relayout() {
+        // At 40 columns "eight nine" is on lines 0 and 1.
+        let md = format!(
+            "one two three four five six seven eight nine ten\n\n{}",
+            paragraphs(10)
+        );
+        let mut v = new_view(&md);
+        v.resize(40, 4);
+        on_match(&mut v, "eight nine", 0);
+        v.scroll = 1;
+        v.relayout(None);
+        assert_eq!(v.scroll, 1);
     }
 
     #[test]

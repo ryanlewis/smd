@@ -71,7 +71,9 @@ impl Embedder<'_> {
             return None;
         }
         let text = std::fs::read_to_string(&path).ok()?;
-        let mut doc = doc::parse_for(without_frontmatter(&text), self.theme);
+        let mut doc = doc::parse_for(&text, self.theme);
+        doc.blocks
+            .retain(|b| !matches!(b.kind, BlockKind::Frontmatter(_)));
         if let Some(heading) = heading {
             doc.blocks = section(std::mem::take(&mut doc.blocks), &heading)?;
         }
@@ -182,25 +184,6 @@ fn lone_embed(block: &Block, source: &str) -> Option<(String, Link)> {
         title.push_str(text);
     }
     Some((title, link?.clone()))
-}
-
-/// `source` without the `---` block of properties at its top, if it has
-/// one.
-fn without_frontmatter(source: &str) -> &str {
-    let Some(rest) = source
-        .strip_prefix("---\n")
-        .or_else(|| source.strip_prefix("---\r\n"))
-    else {
-        return source;
-    };
-    let mut at = 0;
-    for line in rest.split_inclusive('\n') {
-        at += line.len();
-        if line.trim_end() == "---" {
-            return &rest[at..];
-        }
-    }
-    source
 }
 
 /// The heading matching `wanted` and the blocks under it, up to the next
@@ -570,12 +553,5 @@ mod tests {
         let vault = Vault::for_file(&v.0.join("a.md"));
         let got = vault.follow(&Link::from(dests[0].as_str()), &v.0.join("a.md"));
         assert!(matches!(got, Target::Missing(_)), "{got:?}");
-    }
-
-    #[test]
-    fn frontmatter_is_left_out_only_when_closed() {
-        assert_eq!(without_frontmatter("---\na: 1\n---\nbody"), "body");
-        assert_eq!(without_frontmatter("---\na: 1\nbody"), "---\na: 1\nbody");
-        assert_eq!(without_frontmatter("body\n---\n"), "body\n---\n");
     }
 }

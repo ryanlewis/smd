@@ -69,6 +69,14 @@ pub enum BlockKind {
         kind: FigureKind,
         source: String,
     },
+    /// Another note shown in place of an `![[note]]` alone in a paragraph:
+    /// its name, a link to it, and the part of it embedded, whose spans
+    /// point into its own source.
+    Embed {
+        title: String,
+        link: Link,
+        doc: Document,
+    },
 }
 
 /// A frontmatter block's text between its delimiters, and its top-level
@@ -953,6 +961,8 @@ impl<'a> Builder<'a> {
             return;
         }
         if let Embed::Note(link) = embed(dest, wiki) {
+            // The span takes in the whole `![[note]]`, not only its text.
+            extend_span(&mut self.top().inline_span, range);
             self.embeds.push(true);
             self.links.push(link);
             return;
@@ -2035,6 +2045,7 @@ paragraph @23..37
                     format!("image {src:?} alt={alt:?} wiki={wiki}")
                 }
                 BlockKind::Figure { kind, source } => format!("figure {kind:?} {source:?}"),
+                BlockKind::Embed { title, .. } => format!("embed {title:?}"),
             };
             out.push_str(&format!("{pad}{head} @{span:?}\n"));
             match kind {

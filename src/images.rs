@@ -537,18 +537,25 @@ fn raster_image(data: Vec<u8>) -> Result<Png, String> {
 /// the wrong type and URLs often have no extension. An SVG may only use
 /// images inside itself, never files or other URLs.
 pub fn decode_remote(data: Vec<u8>) -> Result<Png, String> {
-    if looks_like_svg(&data) {
+    let raster = [b"GIF8".as_slice(), b"\xff\xd8\xff", b"\x89PNG"];
+    if raster.iter().any(|magic| data.starts_with(magic)) {
+        raster_image(data)
+    } else if data.starts_with(b"\x1f\x8b") {
+        // usvg would unzip an SVGZ with no limit on its size.
+        Err("gzipped images from the web are not shown".into())
+    } else if looks_like_svg(&data) {
         svg(&data, Hrefs::Embedded)
     } else {
         raster_image(data)
     }
 }
 
-/// Whether `data` is an SVG, or a gzipped one: an `<svg` tag near the start,
-/// past any XML declaration, comments or doctype.
+/// Whether `data` is an SVG: an `<svg` tag near the start, past any XML
+/// declaration, comments or doctype.
 fn looks_like_svg(data: &[u8]) -> bool {
-    let head = &data[..data.len().min(4096)];
-    head.starts_with(b"\x1f\x8b") || head.windows(4).any(|w| w == b"<svg")
+    data[..data.len().min(4096)]
+        .windows(4)
+        .any(|w| w == b"<svg")
 }
 
 /// The images an SVG may draw.
@@ -911,6 +918,22 @@ pub mod tests {
         assert_eq!(decode_remote(jpeg).unwrap().width, 5);
         assert_eq!(decode_remote(png(7, 8)).unwrap().width, 7);
         assert!(decode_remote(b"<html>not found</html>".to_vec()).is_err());
+    }
+
+    #[test]
+    fn a_web_image_with_svg_in_its_metadata_is_not_an_svg() {
+        let data = [png(2, 2), b"tEXt<svg xmlns".to_vec()].concat();
+        assert_eq!(decode_remote(data).unwrap().width, 2);
+    }
+
+    #[test]
+    fn a_gzipped_web_image_is_not_unzipped() {
+        // Unzipping has no limit, so a small download could fill memory.
+        let gzip = b"\x1f\x8b\x08\x00<svg".to_vec();
+        assert_eq!(
+            decode_remote(gzip).unwrap_err(),
+            "gzipped images from the web are not shown"
+        );
     }
 
     #[test]

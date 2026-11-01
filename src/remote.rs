@@ -1,14 +1,15 @@
 //! Images on the web, fetched only when the config or `--remote-images`
 //! turns them on. Each is fetched off the UI thread, a few at a time, and kept
 //! in a disk cache for a day, so a note opens without the network the second
-//! time. A fetch that fails leaves the image as text, as a missing file does.
+//! time that day. A fetch that fails leaves the image as text, as a missing
+//! file does.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use crate::images::{self, Job};
+use crate::images::{self, Job, Png};
 use crate::mermaid;
 
 /// How long a fetch may take, redirects and all.
@@ -54,30 +55,32 @@ pub fn is_remote(src: &str) -> bool {
 pub fn job(url: String) -> Job {
     Box::new(move || {
         let path = cache_dir().map(|dir| dir.join(cache_name(&url)));
-        let data = cached(&url, path.as_deref(), SystemTime::now(), |url| {
+        cached(&url, path.as_deref(), SystemTime::now(), |url| {
             let _slot = Slot::take();
             fetch(agent(), url, MAX_BYTES)
-        })?;
-        images::decode_remote(data)
+        })
     })
 }
 
-/// The bytes at `url`: from the file at `cache` if it was fetched within
-/// [`FRESH`] of `now`, else from `fetch`, which are then cached.
+/// The image at `url`: from the file at `cache` if it was fetched within
+/// [`FRESH`] of `now`, else from `fetch`. What `fetch` gives is cached only
+/// if it is an image, so an error page is not kept.
 fn cached(
     url: &str,
     cache: Option<&Path>,
     now: SystemTime,
     fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Png, String> {
     if let Some(path) = cache
         && let Ok(meta) = std::fs::metadata(path)
         && meta.modified().is_ok_and(|at| fresh(at, now))
         && let Ok(data) = std::fs::read(path)
+        && let Ok(png) = images::decode_remote(data)
     {
-        return Ok(data);
+        return Ok(png);
     }
     let data = fetch(url)?;
+    let png = images::decode_remote(data.clone())?;
     if let Some(path) = cache {
         // An image that cannot be cached is still shown.
         if mermaid::store(path, &data).is_ok()
@@ -86,7 +89,7 @@ fn cached(
             mermaid::evict_files(dir, CACHE_CAP, EXT);
         }
     }
-    Ok(data)
+    Ok(png)
 }
 
 /// Whether a file written at `at` is still fresh at `now`. One from the
@@ -291,16 +294,40 @@ mod tests {
         let path = dir.join(cache_name(&url));
         let get = |now| cached(&url, Some(&path), now, |u| fetch(&agent, u, MAX_BYTES));
         let now = SystemTime::now();
-        assert_eq!(get(now).unwrap(), data);
-        assert_eq!(get(now).unwrap(), data);
+        let want = Png::new(data.clone());
+        assert_eq!(get(now), want);
+        assert_eq!(get(now), want);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // Written whole, with no temporary file left behind.
         let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(names.len(), 1);
         // A day later it is fetched again.
-        assert_eq!(get(now + FRESH).unwrap(), data);
+        assert_eq!(get(now + FRESH), want);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_page_that_is_not_an_image_is_not_cached() {
+        // A captive portal's login page, then the image once logged in.
+        let served = Arc::new(AtomicUsize::new(0));
+        let body = png(4, 2);
+        let (url, _) = serve(move |_| match served.fetch_add(1, Ordering::SeqCst) {
+            0 => ok(b"<html>log in</html>"),
+            _ => ok(&body),
+        });
+        let agent = local_agent(TIMEOUT);
+        let dir = scratch("portal");
+        let path = dir.join(cache_name(&url));
+        let get = || {
+            cached(&url, Some(&path), SystemTime::now(), |u| {
+                fetch(&agent, u, MAX_BYTES)
+            })
+        };
+        assert!(get().is_err());
+        let second = get();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(second, Png::new(png(4, 2)));
     }
 
     #[test]

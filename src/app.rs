@@ -30,7 +30,7 @@ use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
 use crate::render::{Layout, render_folds};
-use crate::search::{Match, Search};
+use crate::search::{self, Search};
 use crate::theme;
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
@@ -276,13 +276,25 @@ impl View {
     fn relayout_keeping(&mut self, anchor: Option<Anchor>, kept: Option<(Anchor, usize)>) {
         let seen = self.current_seen();
         if self.width > 0 {
-            self.highlighted = highlight::ready().is_some();
-            self.layout = render_folds(&self.doc, self.width, &self.images, &self.flipped);
+            self.lay_out(kept);
             if let Some(row) = anchor.and_then(|a| self.find(&a)) {
                 self.scroll = row;
             }
-            self.refresh_search(kept);
         }
+        self.settle(seen);
+    }
+
+    /// Lay the document out at the view's width, with the match `kept`
+    /// names current, as `refresh_search` takes it.
+    fn lay_out(&mut self, kept: Option<(Anchor, usize)>) {
+        self.highlighted = highlight::ready().is_some();
+        self.layout = render_folds(&self.doc, self.width, &self.images, &self.flipped);
+        self.refresh_search(kept);
+    }
+
+    /// Keep the scroll and the selection within a new layout, and bring
+    /// back into view a current match that was `seen` before it.
+    fn settle(&mut self, seen: bool) {
         self.scroll = self.scroll.min(self.max_scroll());
         self.selected = self.selected.filter(|&s| self.has(s));
         if seen && !self.current_seen() {
@@ -331,20 +343,16 @@ impl View {
         let row = self.search.matches.get(i)?.row;
         let blocks = &self.layout.blocks;
         let index = blocks.iter().rposition(|b| b.rows.contains(&row))?;
+        // Matches are in row order, and the current one is in the block.
         let start = blocks[index].rows.start;
-        let nth = self.search.matches[..i]
-            .iter()
-            .filter(|m| m.row >= start)
-            .count();
+        let nth = i - self.search.matches.partition_point(|m| m.row < start);
         Some((self.anchor_of(index, 0), nth))
     }
 
     /// Whether any of the current match is in view.
     fn current_seen(&self) -> bool {
-        let rows = self.search.current.and_then(|i| self.search.matches.get(i));
-        let view = self.in_view();
-        rows.map(Match::rows)
-            .is_some_and(|rows| rows.start < view.end && view.start < rows.end)
+        let current = self.search.current.and_then(|i| self.search.matches.get(i));
+        current.is_some_and(|m| m.seen(&self.in_view()))
     }
 
     /// Scroll as little as brings all of the current match into view.
@@ -408,18 +416,12 @@ impl View {
         if width != self.width {
             let kept = self.current_match();
             let old_len = self.layout.lines.len().max(1);
-            self.highlighted = highlight::ready().is_some();
-            self.layout = render_folds(&self.doc, width, &self.images, &self.flipped);
-            self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
-            self.selected = self.selected.filter(|&s| self.has(s));
-            self.refresh_search(kept);
+            self.lay_out(kept);
+            self.scroll = self.scroll * self.layout.lines.len() / old_len;
         }
         self.height = height;
-        self.scroll = self.scroll.min(self.max_scroll());
-        if seen && !self.current_seen() {
-            self.show_current();
-        }
+        self.settle(seen);
     }
 
     fn max_scroll(&self) -> usize {
@@ -728,19 +730,11 @@ impl View {
     /// `current_match` gave it in the old layout, stays current when it is
     /// still there.
     fn refresh_search(&mut self, kept: Option<(Anchor, usize)>) {
-        self.search.refresh(&self.layout, &self.doc);
+        let kept = kept.and_then(|(anchor, nth)| Some((self.block(&anchor)?.rows.clone(), nth)));
+        self.search.refresh(&self.layout, &self.doc, kept);
         if self.search.typing {
             self.prompt = Some(self.search.prompt());
         }
-        let Some((anchor, nth)) = kept else {
-            return;
-        };
-        let Some(rows) = self.block(&anchor).map(|b| b.rows.clone()) else {
-            return;
-        };
-        let matches = &self.search.matches;
-        let i = matches.partition_point(|m| m.row < rows.start) + nth;
-        self.search.current = matches.get(i).filter(|m| rows.contains(&m.row)).map(|_| i);
     }
 
     /// Give up the search and stop marking its matches.
@@ -755,15 +749,7 @@ impl View {
         if !self.search.active() {
             return Go::Say("no search: press / to search".into());
         }
-        let found = self.search.step(forward, self.in_view()).map(|(i, round)| {
-            // The first step is from the view; the rest are from that match.
-            let (len, more) = (self.search.matches.len(), times.saturating_sub(1));
-            if forward {
-                ((i + more % len) % len, round || more >= len - i)
-            } else {
-                ((i + len - more % len) % len, round || more > i)
-            }
-        });
+        let found = self.search.step_by(forward, self.in_view(), times);
         self.go_to_match(found.map(|(i, round)| (i, round.then_some(forward))))
     }
 
@@ -859,30 +845,19 @@ impl View {
             .iter()
             .map(|&s| self.cells(s).first().map_or(0, |c| c.0))
             .collect();
-        let row = |i: usize| rows[i];
         let view = self.in_view();
         let at = self
             .selected
             .and_then(|s| links.iter().position(|&l| l == s));
-        let selected = at.filter(|&i| view.contains(&row(i)));
-        let next = match (selected, forward) {
-            (Some(i), true) => Some((i + 1) % links.len()),
-            (Some(i), false) => Some((i + links.len() - 1) % links.len()),
-            (None, true) => (0..links.len())
-                .find(|&i| row(i) >= view.start)
-                .or((!links.is_empty()).then_some(0)),
-            (None, false) => (0..links.len())
-                .rev()
-                .find(|&i| row(i) < view.end)
-                .or(links.len().checked_sub(1)),
-        };
-        let Some(next) = next else {
+        let selected = at.filter(|&i| view.contains(&rows[i]));
+        let row = |i: usize| rows[i];
+        let Some((next, _)) = search::step_round(links.len(), selected, forward, view, row) else {
             return;
         };
         self.selected = Some(links[next]);
         // Bring it into view, a little way down the page when that moves it,
         // and all of it when it fits, as a heading drawn larger takes rows.
-        let row = row(next);
+        let row = rows[next];
         let last = self.cells(links[next]).last().map_or(row, |c| c.0);
         let view = self.in_view();
         if !view.contains(&row) || !view.contains(&last) {

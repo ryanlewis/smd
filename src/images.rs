@@ -341,8 +341,9 @@ impl Images {
     /// Bring the terminal in line with a layout: delete images that left the
     /// document, upload images laid out for the first time and place images
     /// whose size changed. Nothing is sent for an image already placed at its
-    /// size, so redraws send no image commands at all.
-    pub fn flush(&mut self, out: &mut impl Write, placements: &[Placement]) -> io::Result<()> {
+    /// size, so redraws send no image commands at all. Returns whether
+    /// anything was sent.
+    pub fn flush(&mut self, out: &mut impl Write, placements: &[Placement]) -> io::Result<bool> {
         let mut sent = false;
         for id in self.deleted.drain(..) {
             kitty::delete(out, id)?;
@@ -379,7 +380,7 @@ impl Images {
             out.flush()?;
         }
         self.unlink_objects(Instant::now(), SHARED_MEMORY_KEEP);
-        Ok(())
+        Ok(sent)
     }
 
     /// Remove the shared memory objects sent `keep` or longer before `now`.
@@ -399,7 +400,7 @@ impl Images {
         self.want(Vec::new());
         let flushed = self.flush(out, &[]);
         self.unlink_objects(Instant::now(), Duration::ZERO);
-        flushed
+        flushed.map(|_| ())
     }
 }
 

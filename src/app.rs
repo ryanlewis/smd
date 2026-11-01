@@ -38,6 +38,11 @@ use unicode_width::UnicodeWidthStr;
 /// How often to look at the file on disk. A change shows after two checks.
 const CHECK_EVERY: Duration = Duration::from_millis(150);
 
+/// How long after sending images to ask the terminal to repaint, at each
+/// check. kitty may finish an image after it drew the cells that show it,
+/// and then leaves them blank until something else changes on screen.
+const REPAINT_FOR: Duration = Duration::from_secs(1);
+
 pub struct View {
     /// Shared with the place Back or Forward keeps when the reader leaves.
     doc: Rc<Document>,
@@ -315,7 +320,8 @@ impl View {
 
     /// Send the terminal what it needs to show the images on the last frame.
     /// This goes straight to the terminal, outside ratatui's buffer.
-    pub fn flush_images(&mut self, out: &mut impl Write) -> io::Result<()> {
+    /// Returns whether anything was sent.
+    pub fn flush_images(&mut self, out: &mut impl Write) -> io::Result<bool> {
         self.images.flush(out, &self.layout.placements())
     }
 
@@ -1556,10 +1562,18 @@ fn run_browser<W: Write>(
 ) -> io::Result<()> {
     let mut last_check = input.now();
     let mut redraw = true;
+    // Until when to ask the terminal to repaint (see `REPAINT_FOR`).
+    let mut repaint_until = None;
     loop {
         if redraw {
+            // Images go before the cells that show them, and a layout made
+            // while drawing, as on a resize, sends its images just after.
+            let before = browser.view.flush_images(terminal.backend_mut())?;
             terminal.draw(|frame| browser.draw(frame))?;
-            browser.view.flush_images(terminal.backend_mut())?;
+            let after = browser.view.flush_images(terminal.backend_mut())?;
+            if before || after {
+                repaint_until = Some(input.now() + REPAINT_FOR);
+            }
             redraw = false;
         }
         let elapsed = input.now().saturating_duration_since(last_check);
@@ -1576,6 +1590,9 @@ fn run_browser<W: Write>(
         }
         if input.now().saturating_duration_since(last_check) >= CHECK_EVERY {
             last_check = input.now();
+            if repaint_until.is_some_and(|until| last_check < until) {
+                crate::kitty::repaint(terminal.backend_mut())?;
+            }
             if !browser.piped
                 && let Some(change) = browser.watcher.check()
             {
@@ -3369,6 +3386,43 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 2);
         assert!(b.view.layout.lines.len() > lines, "the image took no rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_sends_an_image_before_the_cells_that_show_it() {
+        use crate::images::tests::png;
+        let (mut b, dir) = loaded("loop-image-first", &[("a.md", "one\n")]);
+        std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
+        b.view.show(parse("![a](a.png)\n"), dir.clone());
+        let out = Shared::default();
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 30, 7)),
+        };
+        let mut terminal =
+            Terminal::with_options(CrosstermBackend::new(out.clone()), options).unwrap();
+        // Checks for two seconds after the image is drawn.
+        let mut steps = vec![Step::Drawn];
+        steps.extend((0..14).map(|_| Step::Wait));
+        steps.push(quit());
+        let mut script = Script {
+            now: Instant::now(),
+            steps: steps.into(),
+            timeouts: Vec::new(),
+            out: out.clone(),
+            sent: None,
+        };
+        assert!(run_browser(&mut terminal, &mut b, &mut script).is_ok());
+        let sent = String::from_utf8(out.0.borrow().clone()).unwrap();
+        let image = sent.find("\x1b_G").expect("no image sent");
+        let cells = sent.find('\u{10EEEE}').expect("no placeholder cells");
+        assert!(image < cells, "{sent:?}");
+        // kitty may finish the image after it drew the cells, so it is asked
+        // to repaint at each check for a second after, and then no more.
+        let repaint = "\x1b[?25h\x1b[?25l";
+        assert!(sent.rfind(repaint).is_some_and(|r| r > cells), "{sent:?}");
+        let repaints = sent.matches(repaint).count();
+        assert!((5..=7).contains(&repaints), "{repaints} repaints");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

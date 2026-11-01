@@ -416,6 +416,23 @@ mod tests {
     }
 
     #[test]
+    fn a_code_line_broken_at_the_edge_is_searched_across_the_break() {
+        // The edge splits "needle", with or without the panel's indent.
+        let md = format!("```\n{}needle\nfoo\nbar\n```\n", "x".repeat(36));
+        let m = found(&md, "needle");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].cells.len(), 2);
+        assert_eq!(m[0].rows().len(), 2);
+        // No space is put back at the break.
+        assert_eq!(found(&md, "ne edle"), []);
+        assert_eq!(found(&md, "nee dle"), []);
+        // Separate lines of the code are still not joined.
+        assert_eq!(found(&md, "needlefoo"), []);
+        assert_eq!(found(&md, "needle foo"), []);
+        assert_eq!(found(&md, "foo bar"), []);
+    }
+
+    #[test]
     fn the_first_match_from_a_row_starts_on_or_below_it() {
         let search = Search {
             term: "x".into(),

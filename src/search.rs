@@ -56,7 +56,7 @@ impl Search {
     /// The first match on or below row `top`, going round to the first of
     /// all when there is none. Gives its index and whether it went round.
     pub fn first_from(&self, top: usize) -> Option<(usize, bool)> {
-        match self.matches.iter().position(|m| m.rows().end > top) {
+        match self.matches.iter().position(|m| m.row >= top) {
             Some(i) => Some((i, false)),
             None => (!self.matches.is_empty()).then_some((0, true)),
         }
@@ -403,6 +403,35 @@ mod tests {
             cells: vec![(0, 39..40), (1, 0..1)],
         };
         assert_eq!(found(&long, "yz"), [broken]);
+    }
+
+    #[test]
+    fn a_frontmatter_value_is_searched_across_its_wrap() {
+        let words = "one two three four five six seven eight nine ten";
+        let md = format!("---\ndescription: {words}\n---\n");
+        let words: Vec<&str> = words.split(' ').collect();
+        for pair in words.windows(2) {
+            assert_eq!(found(&md, &pair.join(" ")).len(), 1, "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn the_first_match_from_a_row_starts_on_or_below_it() {
+        let search = Search {
+            term: "x".into(),
+            matches: vec![
+                Match {
+                    row: 0,
+                    cells: vec![(0, 5..6), (1, 0..1)],
+                },
+                Match {
+                    row: 3,
+                    cells: vec![(3, 0..1)],
+                },
+            ],
+            ..Search::default()
+        };
+        assert_eq!(search.first_from(1), Some((1, false)));
     }
 
     #[test]

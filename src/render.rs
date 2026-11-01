@@ -331,7 +331,8 @@ fn contents(
             figure(source, error, width, first, rest, out);
         }
         BlockKind::Frontmatter(front) => {
-            let links = frontmatter(front, width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            let links = frontmatter(front, width, first, rest, out, joins);
             ctx.layout.links.extend(links);
         }
         BlockKind::Html(html) => {
@@ -494,6 +495,7 @@ fn frontmatter(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<Join>,
 ) -> Vec<LinkSpot> {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let mut links = Vec::new();
@@ -525,7 +527,6 @@ fn frontmatter(
             preformatted(value, dim, width, &key_first, &under, out);
         } else {
             let content = doc::value_inlines(value);
-            let joins = &mut Vec::new();
             links.extend(wrap(&content, dim, width, &key_first, &under, out, joins));
         }
     }

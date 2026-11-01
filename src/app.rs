@@ -741,8 +741,10 @@ impl View {
         let wrapped = found.and_then(|(_, w)| w);
         if let Some((i, _)) = found {
             self.search.current = Some(i);
-            let row = self.search.matches[i].row;
-            if !self.in_view().contains(&row) {
+            let rows = self.search.matches[i].rows();
+            let row = rows.start;
+            let view = self.in_view();
+            if !view.contains(&row) || !view.contains(&(rows.end - 1)) {
                 self.scroll = row
                     .saturating_sub(self.height as usize / 3)
                     .min(self.max_scroll());
@@ -2047,6 +2049,20 @@ mod tests {
         let buf = terminal.backend().buffer();
         assert_eq!(buf[(0, 0)].bg, Color::Yellow);
         assert_eq!(v.search.step(true, v.in_view()), Some((0, true)));
+    }
+
+    #[test]
+    fn going_to_a_wrapped_match_brings_both_its_lines_into_view() {
+        // "eight" is on row 4, the last in view, and "nine" on row 5.
+        let md = format!(
+            "a\n\nb\n\none two three four five six seven eight nine ten\n\n{}",
+            paragraphs(4)
+        );
+        let mut v = new_view(&md);
+        v.resize(40, 5);
+        on_match(&mut v, "eight nine", 0);
+        assert_eq!(v.search.matches[0].rows(), 4..6);
+        assert!(v.in_view().contains(&5), "scroll {}", v.scroll);
     }
 
     fn paragraphs(n: usize) -> String {

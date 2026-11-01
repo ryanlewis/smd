@@ -44,7 +44,9 @@ impl Embedder<'_> {
                 continue;
             }
             match &mut block.kind {
-                BlockKind::Quote(inner) => self.embed_in(inner, source, from),
+                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
+                    self.embed_in(inner, source, from)
+                }
                 BlockKind::List { items, .. } => {
                     for item in items {
                         self.embed_in(&mut item.blocks, source, from);
@@ -110,7 +112,9 @@ impl Embedder<'_> {
                         *wiki = false;
                     }
                 }
-                BlockKind::Quote(inner) => self.rebase(inner, from),
+                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
+                    self.rebase(inner, from)
+                }
                 BlockKind::List { items, .. } => {
                     for item in items {
                         self.rebase(&mut item.blocks, from);
@@ -165,7 +169,9 @@ fn lone_embed(block: &Block, source: &str) -> Option<(String, Link)> {
     let BlockKind::Paragraph(content) = &block.kind else {
         return None;
     };
+    // A paragraph in a callout can start at its line's quote marker.
     let written = source.get(block.span.clone())?.trim();
+    let written = written.trim_start_matches(|c: char| c == '>' || c.is_whitespace());
     let inside = written.strip_prefix("![[")?.strip_suffix("]]")?;
     if inside.contains("[[") || inside.contains("]]") {
         return None;
@@ -458,6 +464,41 @@ mod tests {
             v.lines("a.md"),
             ["• ╭─ Bee", "  │ hi", "  ╰─", "", "│ ╭─ b", "│ │ hi", "│ ╰─"]
         );
+    }
+
+    #[test]
+    fn an_embed_in_a_callout_is_framed_there_and_its_links_rebased() {
+        let v = TempVault::new(
+            "callout",
+            &[
+                ("a.md", "> [!note] Seen\n> ![[sub/b]]"),
+                ("sub/b.md", "[[c]]\n\n> [!tip]- Folded\n> [[c]]"),
+                ("sub/c.md", ""),
+            ],
+        );
+        let doc = v.open("a.md");
+        let BlockKind::Callout { blocks, .. } = &doc.blocks[0].kind else {
+            panic!("no callout: {:?}", doc.blocks);
+        };
+        let BlockKind::Embed { doc: inner, .. } = &blocks[0].kind else {
+            panic!("not embedded: {blocks:?}");
+        };
+        let c = format!("{}/c.md", absolute(v.0.join("sub")).display());
+        let BlockKind::Callout { blocks, .. } = &inner.blocks[1].kind else {
+            panic!("no inner callout");
+        };
+        for paragraph in [&inner.blocks[0], &blocks[0]] {
+            let BlockKind::Paragraph(content) = &paragraph.kind else {
+                panic!("no paragraph");
+            };
+            let Inline::Text { style, .. } = &content[0] else {
+                panic!("no text");
+            };
+            assert_eq!(style.link.as_ref().unwrap().dest, c);
+        }
+        // The folded callout inside the embed is not a stop.
+        let layout = render(&doc, 40, &Images::new((8, 16)));
+        assert_eq!(layout.folds.len(), 0);
     }
 
     /// `path` relative to the current folder, as when smd is started there.

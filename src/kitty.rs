@@ -173,16 +173,22 @@ fn queries() -> String {
 #[cfg(unix)]
 fn query() -> Option<Vec<u8>> {
     use ratatui::crossterm::terminal;
+    use std::os::fd::AsRawFd;
 
     // SAFETY: isatty only looks at the descriptor.
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
-        return None;
-    }
+    let stdin_is_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+    // With the markdown piped in, the replies come on the terminal itself.
+    let tty = if stdin_is_terminal {
+        None
+    } else {
+        Some(std::fs::File::open("/dev/tty").ok()?)
+    };
+    let fd = tty.as_ref().map_or(libc::STDIN_FILENO, |t| t.as_raw_fd());
     let was_raw = terminal::is_raw_mode_enabled().ok()?;
     if !was_raw {
         terminal::enable_raw_mode().ok()?;
     }
-    let reply = exchange(&mut io::stdout(), libc::STDIN_FILENO, REPLY_TIMEOUT);
+    let reply = exchange(&mut io::stdout(), fd, REPLY_TIMEOUT);
     if !was_raw {
         let _ = terminal::disable_raw_mode();
     }

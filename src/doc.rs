@@ -1024,7 +1024,8 @@ impl<'a> Builder<'a> {
             }
             FrameKind::Item { task, mark } => {
                 frame.flush_inlines();
-                if emptied(&frame) {
+                // A task keeps its box.
+                if task.is_none() && emptied(&frame) {
                     return;
                 }
                 if let FrameKind::List { items, .. } = &mut self.top().kind {
@@ -1231,8 +1232,8 @@ impl<'a> Builder<'a> {
     /// Text with each `==` that opens or closes a highlight taken out, and
     /// each tag in the tag style. When the text is `exact`, the same as the
     /// source at `range`, the source either side of it counts too: a `==`
-    /// must touch the text it highlights, and a tag must follow a space or
-    /// start a line.
+    /// must touch the text it highlights, and a tag must start a line or
+    /// follow a space, a bracket or markup such as `*`.
     fn marks(&mut self, text: &str, range: Range<usize>, exact: bool) {
         let source = self.source;
         let before = |i: usize| match text[..i].chars().next_back() {
@@ -1242,6 +1243,15 @@ impl<'a> Builder<'a> {
         let after = |i: usize| match text[i..].chars().next() {
             None if exact => source[range.end..].chars().next(),
             c => c,
+        };
+        // Whether byte `i` follows an odd number of backslashes.
+        let escaped = |i: usize| {
+            let head = if exact {
+                &source[..range.start + i]
+            } else {
+                &text[..i]
+            };
+            head.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
         };
         let piece = |s: usize, e: usize| match exact {
             true => range.start + s..range.start + e,
@@ -1256,7 +1266,8 @@ impl<'a> Builder<'a> {
         while let Some(c) = text[i..].chars().next() {
             let prev = before(i);
             if text[i..].starts_with("==")
-                && !matches!(prev, Some('=' | '\\'))
+                && prev != Some('=')
+                && !escaped(i)
                 && after(i + 2) != Some('=')
             {
                 let open = self.top().highlight.is_some();
@@ -1281,7 +1292,8 @@ impl<'a> Builder<'a> {
                 '#' => tag_len(&text[i + 1..]),
                 _ => 0,
             };
-            if len > 0 && self.links.is_empty() && prev.is_none_or(char::is_whitespace) {
+            let boundary = prev.is_none_or(|c| c.is_whitespace() || "([*_~=\"'".contains(c));
+            if len > 0 && self.links.is_empty() && boundary && !escaped(i) {
                 self.text(&text[start..i], self.style(), piece(start, i));
                 let end = i + 1 + len;
                 let style = InlineStyle {
@@ -2617,5 +2629,34 @@ paragraph @40..47
     #[test]
     fn a_comment_with_no_partner_is_shown() {
         assert_outline("a %%b\n", "paragraph @0..6\n  \"a %%b\"\n");
+    }
+
+    #[test]
+    fn a_task_holding_only_a_comment_keeps_its_box() {
+        assert_outline(
+            "- [ ] %%note%%\n",
+            "list None tight=true @0..15\n  item task=Some(false)\n",
+        );
+    }
+
+    #[test]
+    fn an_escaped_backslash_does_not_escape_a_highlight() {
+        assert_outline(
+            "\\\\==a==\n",
+            "paragraph @0..8\n  \"\\\\\"\n  \"a\" highlight\n",
+        );
+    }
+
+    #[test]
+    fn a_tag_can_follow_markup_or_a_bracket() {
+        assert_outline(
+            "*#a* (#b)\n",
+            r##"paragraph @0..10
+  "#a" em tag
+  " ("
+  "#b" tag
+  ")"
+"##,
+        );
     }
 }

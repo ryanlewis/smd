@@ -141,12 +141,32 @@ fn osc66(scale: u8, width: u8, text: &str) -> String {
     format!("\x1b]66;s={scale}:w={width};{text}\x1b\\")
 }
 
+/// Erase the `rows` rows of `cols` cells from the cursor down, the lowest
+/// first, leaving the cursor where it was. kitty keeps the lower rows of a
+/// larger character when only its top row is written over, and draws a
+/// larger character that starts on one of those rows to the right of it, as
+/// when a heading moves down a row. Erasing a lower row removes all of it.
+fn erase(rows: u16, cols: u16) -> String {
+    let mut out = String::new();
+    if rows > 1 {
+        out.push_str(&format!("\x1b[{}B", rows - 1));
+    }
+    for row in (0..rows).rev() {
+        out.push_str(&format!("\x1b[{cols}X"));
+        if row > 0 {
+            out.push_str("\x1b[A");
+        }
+    }
+    out
+}
+
 /// Draw the heading lines in view as larger text: the first cell of each
-/// character holds its OSC 66 sequence, and the other cells it covers are
-/// left alone, as the terminal draws over them. `scroll` is the layout row
-/// at the top of `area`. The terminal cannot draw part of a character, so a
-/// line cut off by the bottom of `area` is drawn at the size of text, and
-/// one cut off by the top leaves only its blank rows in view.
+/// character holds its OSC 66 sequence, after an erase of the cells it
+/// covers (see [`erase`]), and the other cells are left alone, as the
+/// terminal draws over them. `scroll` is the layout row at the top of
+/// `area`. The terminal cannot draw part of a character, so a line cut off
+/// by the bottom of `area` is drawn at the size of text, and one cut off by
+/// the top leaves only its blank rows in view.
 pub fn draw_sized(buf: &mut Buffer, area: Rect, scroll: usize, lines: &[SizedLine]) {
     for line in lines {
         let s = u16::from(line.scale);
@@ -175,8 +195,9 @@ pub fn draw_sized(buf: &mut Buffer, area: Rect, scroll: usize, lines: &[SizedLin
                     buf[(x + dx, y + dy)].set_diff_option(CellDiffOption::Skip);
                 }
             }
+            let symbol = erase(s, cols) + &osc66(line.scale, cell.width, &cell.text);
             buf[(x, y)]
-                .set_symbol(&osc66(line.scale, cell.width, &cell.text))
+                .set_symbol(&symbol)
                 .set_diff_option(CellDiffOption::ForcedWidth(width));
         }
     }
@@ -808,9 +829,17 @@ mod tests {
         let mut buf = Buffer::empty(area);
         draw_sized(&mut buf, area, 0, &[line]);
         let forced = |n| CellDiffOption::ForcedWidth(NonZeroU16::new(n).unwrap());
-        assert_eq!(buf[(1, 1)].symbol(), "\x1b]66;s=2:w=1;A\x1b\\");
+        let erase = "\x1b[1B\x1b[2X\x1b[A\x1b[2X";
+        assert_eq!(
+            buf[(1, 1)].symbol(),
+            format!("{erase}\x1b]66;s=2:w=1;A\x1b\\")
+        );
         assert_eq!(buf[(1, 1)].diff_option, forced(2));
-        assert_eq!(buf[(3, 1)].symbol(), "\x1b]66;s=2:w=2;日\x1b\\");
+        let erase = "\x1b[1B\x1b[4X\x1b[A\x1b[4X";
+        assert_eq!(
+            buf[(3, 1)].symbol(),
+            format!("{erase}\x1b]66;s=2:w=2;日\x1b\\")
+        );
         assert_eq!(buf[(3, 1)].diff_option, forced(4));
         assert_eq!(buf[(7, 1)].diff_option, forced(4));
         // Every other cell of the blocks is left to the terminal.
@@ -821,6 +850,33 @@ mod tests {
         for (x, y) in [(0, 1), (0, 2), (11, 1), (1, 0), (1, 3)] {
             assert_eq!(buf[(x, y)].diff_option, CellDiffOption::None, "({x}, {y})");
         }
+    }
+
+    #[test]
+    fn a_sized_character_clears_its_block_before_it_is_drawn() {
+        use ratatui::backend::{Backend, CrosstermBackend};
+        // "An" twice the size moves down a row, as a heading does when an
+        // image above it is ready, so "Ma" starts on the lower row of "An".
+        let area = Rect::new(0, 0, 10, 4);
+        let frame = |line: SizedLine| {
+            let mut buf = Buffer::empty(area);
+            draw_sized(&mut buf, area, 0, &[line]);
+            buf
+        };
+        let before = frame(sized(0, 2, &[(0, 1, "A"), (2, 1, "n")]));
+        let after = frame(sized(1, 2, &[(0, 1, "M"), (2, 1, "a")]));
+        let mut bytes = Vec::new();
+        CrosstermBackend::new(&mut bytes)
+            .draw(before.diff(&after).into_iter())
+            .unwrap();
+        let bytes = String::from_utf8(bytes).unwrap();
+        // kitty keeps the lower row of "A" when only its top row is written
+        // over, and would draw "M" to the right of it. Each character
+        // first erases the rows it covers, the lowest first.
+        let m = "\x1b[2;1H\x1b[1B\x1b[2X\x1b[A\x1b[2X\x1b]66;s=2:w=1;M\x1b\\";
+        assert!(bytes.contains(m), "{bytes:?}");
+        let a = "\x1b[2;3H\x1b[1B\x1b[2X\x1b[A\x1b[2X\x1b]66;s=2:w=1;a\x1b\\";
+        assert!(bytes.contains(a), "{bytes:?}");
     }
 
     #[test]
@@ -836,8 +892,10 @@ mod tests {
         let area = Rect::new(2, 1, 10, 6);
         let mut buf = Buffer::empty(area);
         draw_sized(&mut buf, area, 0, &lines);
-        assert_eq!(buf[(2, 1)].symbol(), "\x1b]66;s=2:w=1;A\x1b\\");
-        assert_eq!(buf[(2, 4)].symbol(), "\x1b]66;s=3:w=1;B\x1b\\");
+        let a = "\x1b[1B\x1b[2X\x1b[A\x1b[2X\x1b]66;s=2:w=1;A\x1b\\";
+        assert_eq!(buf[(2, 1)].symbol(), a);
+        let b = "\x1b[2B\x1b[3X\x1b[A\x1b[3X\x1b[A\x1b[3X\x1b]66;s=3:w=1;B\x1b\\";
+        assert_eq!(buf[(2, 4)].symbol(), b);
         // A character past the right edge is left out.
         let mut buf = Buffer::empty(area);
         draw_sized(&mut buf, area, 0, &[sized(0, 2, &[(9, 1, "C")])]);

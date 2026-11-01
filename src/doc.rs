@@ -2659,4 +2659,10 @@ paragraph @40..47
 "##,
         );
     }
+
+    #[test]
+    fn comments_after_frontmatter_are_hidden() {
+        let doc = parse("---\na: b\n---\nx %%c%% y\n");
+        assert_eq!(doc.blocks[1].kind, BlockKind::Paragraph(vec![text("x  y")]));
+    }
 }

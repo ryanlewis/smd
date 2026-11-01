@@ -142,13 +142,15 @@ for note in *.md; do
   smd_pid=$(cat "$pid" 2>/dev/null || true)
   settle "$window" "$note" "$smd_pid" "$empty" || status=1
   if [ -f "$name.keys" ]; then
+    shown=$(pixels "$window")
     xdotool windowfocus --sync "$window"
-    while read -r line; do
+    # The last line may have no newline.
+    while read -r line || [ -n "$line" ]; do
       [ -n "$line" ] || continue
       # shellcheck disable=SC2086 # each line is xdotool's words
       xdotool $line
     done <"$name.keys"
-    settle "$window" "$note: after $name.keys" "$smd_pid" || status=1
+    settle "$window" "$note: after $name.keys" "$smd_pid" "$shown" || status=1
   fi
 
   if [ -s "$log" ]; then

@@ -50,6 +50,8 @@ pub struct Join {
     pub col: u16,
     /// Whether a space was dropped at the break, rather than a word broken.
     pub space: bool,
+    /// Where the text of the line above ends, when filler follows it.
+    pub end: Option<u16>,
 }
 
 /// A link and the cells its text takes, which may be on several lines.
@@ -305,9 +307,10 @@ fn contents(
             let colours = lang
                 .as_deref()
                 .and_then(|lang| highlight::highlight(ctx.syntaxes, lang, code));
+            let (colours, joins) = (colours.as_deref(), &mut ctx.layout.joins);
             match ctx.panel {
-                Some(bg) => code_panel(code, colours.as_deref(), bg, width, first, rest, out),
-                None => code_indented(code, colours.as_deref(), width, first, rest, out),
+                Some(bg) => code_panel(code, colours, bg, width, first, rest, out, joins),
+                None => code_indented(code, colours, width, first, rest, out, joins),
             }
         }
         BlockKind::Figure {
@@ -320,15 +323,18 @@ fn contents(
         // Without graphics an image block is never drawn, so it shows its
         // source as code.
         BlockKind::Figure { source, .. } if !graphics => {
-            preformatted(source, CODE, width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            preformatted(source, CODE, width, first, rest, out, joins);
         }
         BlockKind::Image { src, alt, .. } if !graphics => {
             let text = image_source(ctx.source, block, src, alt);
-            preformatted(&text, CODE, width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            preformatted(&text, CODE, width, first, rest, out, joins);
         }
         BlockKind::Figure { source, .. } => {
             let error = images::key(block).and_then(|key| ctx.images.error(&key));
-            figure(source, error, width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            figure(source, error, width, first, rest, out, joins);
         }
         BlockKind::Frontmatter(front) => {
             let joins = &mut ctx.layout.joins;
@@ -337,7 +343,8 @@ fn contents(
         }
         BlockKind::Html(html) => {
             let dim = Style::new().add_modifier(Modifier::DIM);
-            preformatted(html, dim, width, first, rest, out);
+            let joins = &mut ctx.layout.joins;
+            preformatted(html, dim, width, first, rest, out, joins);
         }
         BlockKind::Image { alt, .. } => {
             let text = note(format!("[image: {alt}]"));
@@ -502,7 +509,7 @@ fn frontmatter(
     let props = match &front.properties {
         Some(props) if !props.is_empty() => props,
         _ => {
-            preformatted(&front.raw, dim, width, first, rest, out);
+            preformatted(&front.raw, dim, width, first, rest, out, joins);
             return links;
         }
     };
@@ -514,7 +521,7 @@ fn frontmatter(
     for (i, (key, value)) in props.iter().enumerate() {
         let prefix = if i == 0 { first } else { rest };
         let key_first = if key.width() > column {
-            preformatted(key, dim, width, prefix, rest, out);
+            preformatted(key, dim, width, prefix, rest, out, joins);
             under.clone()
         } else {
             let pad = column - key.width() + 2;
@@ -524,7 +531,7 @@ fn frontmatter(
             )
         };
         if value.contains('\n') {
-            preformatted(value, dim, width, &key_first, &under, out);
+            preformatted(value, dim, width, &key_first, &under, out, joins);
         } else {
             let content = doc::value_inlines(value);
             links.extend(wrap(&content, dim, width, &key_first, &under, out, joins));
@@ -730,6 +737,7 @@ fn code_indented(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<Join>,
 ) {
     let indent = Span::raw("  ");
     let first = with(first, indent.clone());
@@ -737,6 +745,7 @@ fn code_indented(
     let mut lines = Lines::new(width, &first, &rest, out);
     lines.code(code, colours, Style::new());
     lines.finish_last();
+    joins.append(&mut lines.edges);
 }
 
 /// A table drawn as text in the width its prefix leaves. Returns where the
@@ -785,6 +794,7 @@ fn figure(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<Join>,
 ) {
     let first = match error {
         Some(error) => {
@@ -796,7 +806,7 @@ fn figure(
                 first,
                 rest,
                 out,
-                &mut Vec::new(),
+                joins,
             );
             rest
         }
@@ -809,6 +819,7 @@ fn figure(
         first,
         rest,
         out,
+        joins,
     );
 }
 
@@ -1126,6 +1137,7 @@ fn wrap(
 }
 
 /// Text shown as is, broken at the edge of the view rather than reflowed.
+/// Each line that carries on one broken at the edge goes in `joins`.
 fn preformatted(
     text: &str,
     style: Style,
@@ -1133,15 +1145,18 @@ fn preformatted(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<Join>,
 ) {
     let mut lines = Lines::new(width, first, rest, out);
     lines.preformatted(text, style);
     lines.finish_last();
+    joins.append(&mut lines.edges);
 }
 
 /// Code on a panel of colour `bg` reaching to the right edge, with a blank
 /// panel row above and below. There is no space inside the panel's left edge,
 /// so copied code has no added indent.
+#[allow(clippy::too_many_arguments)]
 fn code_panel(
     code: &str,
     colours: Option<&[Segments]>,
@@ -1150,6 +1165,7 @@ fn code_panel(
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
+    joins: &mut Vec<Join>,
 ) {
     let mut lines = Lines::new(width, first, rest, out);
     lines.pad = Some(Style::new().bg(bg));
@@ -1157,6 +1173,7 @@ fn code_panel(
     lines.code(code, colours, Style::new().bg(bg));
     lines.finish();
     lines.finish();
+    joins.append(&mut lines.edges);
 }
 
 /// `text` with its tabs turned to spaces, where it starts at column `col`,
@@ -1187,6 +1204,8 @@ struct Lines<'a> {
     emitted: usize,
     /// When set, each line is filled to the edge with spaces in this style.
     pad: Option<Style>,
+    /// Each line that carries on one `push_breaking` broke at the edge.
+    edges: Vec<Join>,
 }
 
 impl<'a> Lines<'a> {
@@ -1205,6 +1224,7 @@ impl<'a> Lines<'a> {
             used: 0,
             emitted: 0,
             pad: None,
+            edges: Vec::new(),
         }
     }
 
@@ -1295,12 +1315,20 @@ impl<'a> Lines<'a> {
             row: self.out.len(),
             col: spans_width(self.prefix()) as u16,
             space,
+            end: None,
         }
     }
 
     fn push_breaking(&mut self, s: &str, style: Style) {
         for piece in clusters(s) {
-            self.break_before(piece.width());
+            // A panel fills the gap a wide character leaves at the edge.
+            let end = self
+                .pad
+                .map(|_| (spans_width(self.prefix()) + self.used) as u16);
+            if self.break_before(piece.width()) {
+                let join = self.join(false);
+                self.edges.push(Join { end, ..join });
+            }
             self.push(piece, style);
         }
     }
@@ -1488,6 +1516,7 @@ mod tests {
             row: 3,
             col: 2,
             space: true,
+            end: None,
         };
         assert_eq!(layout.joins, [join]);
         let doc = parse("> # Going [to it](x.md)\n");
@@ -2408,6 +2437,15 @@ mod tests {
     }
 
     #[test]
+    fn a_code_panel_broken_before_a_wide_character_is_searched_without_its_filler() {
+        // One column is left for "界", so the panel fills it with a space.
+        let doc = parse(&format!("```\n{}界\n```\n", "x".repeat(9)));
+        let layout = layout(&doc, 10, &no_images(), Some(BG), None);
+        assert_eq!(crate::search::find("x界", &layout, &doc).len(), 1);
+        assert_eq!(crate::search::find("x 界", &layout, &doc), []);
+    }
+
+    #[test]
     fn a_figure_that_failed_shows_why_above_its_source() {
         let doc = parse("> ```mermaid\n> graph LR\n> ```\n");
         let BlockKind::Quote(inner) = &doc.blocks[0].kind else {
@@ -2436,6 +2474,10 @@ mod tests {
             narrow,
             vec!["│ mermaid: boom;", "│ showing the source", "│ graph LR"]
         );
+        // And the note is searched across its wrap.
+        let found = crate::search::find("boom; showing", &render(&doc, 20, &images), &doc);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rows(), 0..2);
     }
 
     fn highlighted(md: &str, width: u16, ready: bool) -> Vec<Line<'static>> {

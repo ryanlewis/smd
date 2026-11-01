@@ -188,6 +188,12 @@ pub fn find(term: &str, layout: &Layout, doc: &Document) -> Vec<Match> {
         };
         match joins.peek().filter(|j| j.row == row) {
             Some(join) => {
+                if let (Some(end), Some(last)) = (join.end, run.last().map(|d| d.row)) {
+                    while run
+                        .pop_if(|d| d.row == last && d.cols.start >= end)
+                        .is_some()
+                    {}
+                }
                 if join.space
                     && let Some(last) = run.last()
                 {
@@ -413,6 +419,23 @@ mod tests {
         for pair in words.windows(2) {
             assert_eq!(found(&md, &pair.join(" ")).len(), 1, "{pair:?}");
         }
+    }
+
+    #[test]
+    fn a_code_line_broken_at_the_edge_is_searched_across_the_break() {
+        // The edge splits "needle", with or without the panel's indent.
+        let md = format!("```\n{}needle\nfoo\nbar\n```\n", "x".repeat(36));
+        let m = found(&md, "needle");
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].cells.len(), 2);
+        assert_eq!(m[0].rows().len(), 2);
+        // No space is put back at the break.
+        assert_eq!(found(&md, "ne edle"), []);
+        assert_eq!(found(&md, "nee dle"), []);
+        // Separate lines of the code are still not joined.
+        assert_eq!(found(&md, "needlefoo"), []);
+        assert_eq!(found(&md, "needle foo"), []);
+        assert_eq!(found(&md, "foo bar"), []);
     }
 
     #[test]

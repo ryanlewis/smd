@@ -59,6 +59,9 @@ Keys:
   backspace, H, alt-left  go back
   L, alt-right            go forward
   /, n, N                 search, go to the next or previous match
+  r                       reload the file
+  5j, 42G                 a number first repeats a key; with g or G, goes to
+                          that line
   q, esc, ctrl-c          quit
 
 Click a link to follow it, a checkbox to tick it, and the toolbar's buttons to

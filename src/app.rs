@@ -57,6 +57,8 @@ pub struct View {
     prompt: Option<String>,
     /// The term searched for and where it is drawn.
     search: Search,
+    /// The number typed before a key, to repeat it or go to that line.
+    count: Option<usize>,
     /// The selected link or checkbox.
     selected: Option<Stop>,
     /// Whether checkboxes can be ticked: the config allows it and the file
@@ -95,6 +97,8 @@ pub enum Go {
     Fold(usize),
     /// Show a short message on the bottom row until the next key.
     Say(String),
+    /// Read the file again.
+    Reload,
 }
 
 /// The block at the top of the view, found again after the document is laid
@@ -151,6 +155,7 @@ impl View {
             notice: None,
             prompt: None,
             search: Search::default(),
+            count: None,
             selected: None,
             tasks: false,
             kept: Vec::new(),
@@ -199,9 +204,14 @@ impl View {
     /// it no longer has are deleted on the next flush.
     pub fn reload(&mut self, doc: Document) {
         // Such as the watcher seeing a checkbox this view already ticked.
-        if doc.source == self.doc.source {
-            return;
+        if doc.source != self.doc.source {
+            self.replace(doc);
         }
+    }
+
+    /// `reload` even when the text is the same, as an embedded note may
+    /// have changed.
+    fn replace(&mut self, doc: Document) {
         let anchor = self.anchor();
         let old = std::mem::replace(&mut self.doc, Rc::new(doc));
         let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
@@ -343,15 +353,18 @@ impl View {
         mut area: Rect,
         href: impl Fn(&Link) -> Option<String>,
     ) {
-        if let Some(notice) = self.prompt.as_ref().or(self.notice.as_ref())
-            && area.height > 0
-        {
+        // The bottom row, kept for the status when there is room for it.
+        // A message takes the row even when nothing else would fit.
+        let message = self.prompt.is_some() || self.notice.is_some();
+        let status = area.height > 1 || (area.height == 1 && message);
+        if status {
             area.height -= 1;
-            let row = Rect::new(area.x, area.y + area.height, area.width, 1);
-            let style = Style::new().add_modifier(Modifier::REVERSED);
-            frame.render_widget(Paragraph::new(notice.as_str()).style(style), row);
         }
         self.resize(area.width, area.height);
+        if status {
+            let row = Rect::new(area.x, area.y + area.height, area.width, 1);
+            self.draw_status(frame, row);
+        }
         let lines = &self.layout.lines;
         let end = (self.scroll + area.height as usize).min(lines.len());
         let visible = Text::from(lines[self.scroll..end].to_vec());
@@ -408,6 +421,36 @@ impl View {
                     hyperlink(&mut buf[(x, rect.y)], i, &url);
                 }
             }
+        }
+    }
+
+    /// Draw the status row: the prompt or notice on the left, and the
+    /// number typed so far and the page on the right.
+    fn draw_status(&self, frame: &mut Frame, row: Rect) {
+        let style = bar_style();
+        frame.render_widget(Paragraph::new("").style(style), row);
+        let mut right = self.page();
+        if let Some(count) = self.count {
+            right = format!("{count}  {right}");
+        }
+        let right = format!(" {right} ");
+        let right_width = right.width() as u16;
+        let room = row.width.saturating_sub(right_width);
+        // The message wins on a pane too narrow for both.
+        let left = self.prompt.as_ref().or(self.notice.as_ref());
+        let left_width = left.map_or(0, |l| l.width() as u16 + 1);
+        let (left_row, right_row) = if right_width <= row.width && left_width <= room {
+            let right_row = Rect::new(row.x + room, row.y, row.width - room, 1);
+            (Rect::new(row.x, row.y, room, 1), Some(right_row))
+        } else {
+            (row, None)
+        };
+        if let Some(left) = left {
+            let text = Paragraph::new(left.as_str()).style(style.add_modifier(Modifier::BOLD));
+            frame.render_widget(text, left_row);
+        }
+        if let Some(right_row) = right_row {
+            frame.render_widget(Paragraph::new(right).style(style), right_row);
         }
     }
 
@@ -474,21 +517,45 @@ impl View {
     }
 
     /// Do what an action says. Returns what the browser must do, if anything.
+    #[cfg(test)]
     pub fn act(&mut self, action: Action) -> Option<Go> {
+        self.act_counted(action, None)
+    }
+
+    /// Do what an action says, with the number typed before its key: a
+    /// scroll goes that many times as far, top and bottom go to that line,
+    /// and link selection moves that many times. Back, forward and the rest
+    /// ignore it here.
+    fn act_counted(&mut self, action: Action, count: Option<usize>) -> Option<Go> {
+        let times = count.unwrap_or(1);
         let page = (self.height as isize).max(1);
         let half = (page / 2).max(1);
+        let scroll = |v: &mut View, by: isize| v.scroll_by(by.saturating_mul(times as isize));
         match action {
             Action::Quit => return Some(Go::Quit),
-            Action::Down => self.scroll_by(1),
-            Action::Up => self.scroll_by(-1),
-            Action::HalfDown => self.scroll_by(half),
-            Action::HalfUp => self.scroll_by(-half),
-            Action::PageDown => self.scroll_by(page),
-            Action::PageUp => self.scroll_by(-page),
+            Action::Down => scroll(self, 1),
+            Action::Up => scroll(self, -1),
+            Action::HalfDown => scroll(self, half),
+            Action::HalfUp => scroll(self, -half),
+            Action::PageDown => scroll(self, page),
+            Action::PageUp => scroll(self, -page),
+            Action::Top | Action::Bottom if count.is_some() => {
+                self.scroll = (times - 1).min(self.max_scroll());
+            }
             Action::Top => self.scroll = 0,
             Action::Bottom => self.scroll = self.max_scroll(),
-            Action::NextLink => self.select_link(true),
-            Action::PrevLink => self.select_link(false),
+            Action::NextLink | Action::PrevLink => {
+                // Going round, more than once round is the same as less.
+                let round = self.stops().len().max(1);
+                let times = if times > round {
+                    times % round + round
+                } else {
+                    times
+                };
+                for _ in 0..times {
+                    self.select_link(action == Action::NextLink);
+                }
+            }
             Action::Follow => return Some(self.choose(self.selected?)),
             // Only a checkbox: a selected link stays where it is.
             Action::Toggle => match self.selected? {
@@ -500,6 +567,7 @@ impl View {
             Action::Search => self.start_search(),
             Action::NextMatch => return Some(self.next_match(true)),
             Action::PrevMatch => return Some(self.next_match(false)),
+            Action::Reload => return Some(Go::Reload),
         }
         None
     }
@@ -587,6 +655,19 @@ impl View {
             }
         }
         Go::Say(self.search.status(wrapped))
+    }
+
+    /// Where the view is as "page X/Y": the page its top line is on, and the
+    /// last page once the end is in view.
+    fn page(&self) -> String {
+        let height = (self.height as usize).max(1);
+        let pages = self.layout.lines.len().div_ceil(height).max(1);
+        let page = if self.scroll >= self.max_scroll() {
+            pages
+        } else {
+            self.scroll / height + 1
+        };
+        format!("page {page}/{pages}")
     }
 
     /// Open each shut block that holds the byte `at`, outermost first, so
@@ -843,6 +924,8 @@ pub struct Browser {
     ahead: Vec<Visited>,
     /// The notice on screen is about the last key, and goes at the next.
     passing: bool,
+    /// The notice it covers, such as the file being deleted, to show again.
+    covered: Option<String>,
     /// When the last key of a terminal reply arriving as keys came, while
     /// inside one.
     replying: Option<Instant>,
@@ -867,6 +950,7 @@ impl Browser {
             history: Vec::new(),
             ahead: Vec::new(),
             passing: false,
+            covered: None,
             replying: None,
             missed: None,
             clipboard: Box::new(io::stdout()),
@@ -886,8 +970,18 @@ impl Browser {
 
     /// Show a short message until the next key.
     fn say(&mut self, notice: String) {
+        if !self.passing {
+            self.covered = self.view.notice.take();
+        }
         self.view.set_notice(Some(notice));
         self.passing = true;
+    }
+
+    /// Take away a notice about the last key, showing the one it covered.
+    fn unsay(&mut self) {
+        if std::mem::take(&mut self.passing) {
+            self.view.set_notice(self.covered.take());
+        }
     }
 
     /// Handle a mouse event: a click on a link follows it, and the wheel
@@ -899,9 +993,7 @@ impl Browser {
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if event.modifiers.is_empty() => {
-                if std::mem::take(&mut self.passing) {
-                    self.view.set_notice(None);
-                }
+                self.unsay();
                 // The toolbar is the top row; the note is below it.
                 let Some(row) = event.row.checked_sub(1) else {
                     let x = event.column as usize;
@@ -929,13 +1021,19 @@ impl Browser {
         if self.reply(key) {
             return false;
         }
-        if std::mem::take(&mut self.passing) {
-            self.view.set_notice(None);
-        }
+        self.unsay();
         if self.view.search.typing {
             if let Some(go) = self.view.search_key(key) {
                 self.go(go);
             }
+            return false;
+        }
+        if self.count_digit(key) {
+            return false;
+        }
+        let count = self.view.count.take();
+        // Esc drops a number typed so far, rather than quitting.
+        if count.is_some() && key.code == KeyCode::Esc {
             return false;
         }
         // Esc leaves a search before it quits.
@@ -946,12 +1044,53 @@ impl Browser {
         let Some(action) = self.config.action(key) else {
             return false;
         };
-        match self.view.act(action) {
+        match self.view.act_counted(action, count) {
             Some(Go::Quit) => return true,
+            Some(go @ (Go::Back | Go::Forward)) => {
+                let times = count.unwrap_or(1).min(HISTORY_LIMIT);
+                for _ in 0..times {
+                    self.go(go.clone());
+                }
+            }
             Some(go) => self.go(go),
             None => {}
         }
         false
+    }
+
+    /// Take a digit key, not bound to an action, as part of the number typed
+    /// before a key. A number starts with 1 to 9. Returns true when it was
+    /// taken.
+    fn count_digit(&mut self, key: event::KeyEvent) -> bool {
+        let digit = match key.code {
+            KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => c.to_digit(10),
+            _ => None,
+        };
+        let Some(digit) = digit.filter(|_| self.config.action(key).is_none()) else {
+            return false;
+        };
+        let count = &mut self.view.count;
+        match *count {
+            None if digit == 0 => {}
+            None => *count = Some(digit as usize),
+            // More digits than this go nowhere a document can.
+            Some(n) if n >= COUNT_LIMIT / 10 => {}
+            Some(n) => *count = Some(n * 10 + digit as usize),
+        }
+        true
+    }
+
+    /// Read the file again by hand, as the watcher does when it changes.
+    fn reload(&mut self) {
+        match std::fs::read_to_string(&self.path) {
+            Ok(source) => {
+                self.view.replace(parse(&self.vault, &source, &self.path));
+                self.view.set_notice(None);
+                self.covered = None;
+                self.check_tasks();
+            }
+            Err(err) => self.say(format!("cannot reload: {err}: {}", self.path.display())),
+        }
     }
 
     /// Do what the view asks, other than quit.
@@ -964,6 +1103,7 @@ impl Browser {
             Go::Forward => self.forward(),
             Go::Fold(at) => self.view.fold(at),
             Go::Say(notice) => self.say(notice),
+            Go::Reload => self.reload(),
         }
     }
 
@@ -1173,10 +1313,7 @@ impl Browser {
     /// The toolbar: Back and Forward, dimmed when there is nowhere to go,
     /// then the note's name.
     fn toolbar(&self) -> Line<'static> {
-        let base = match theme::code_panel() {
-            Some(bg) => Style::new().bg(bg),
-            None => Style::new().add_modifier(Modifier::REVERSED),
-        };
+        let base = bar_style();
         let button = |label: &'static str, enabled: bool| {
             let style = if enabled {
                 base.add_modifier(Modifier::BOLD)
@@ -1230,6 +1367,7 @@ impl Browser {
         self.view.kept = kept;
         self.view.show(doc, folder(&path));
         self.view.set_notice(None);
+        self.covered = None;
         self.missed = None;
         if piped {
             self.watcher = Watcher::new(path.clone());
@@ -1258,6 +1396,15 @@ impl Browser {
             }
             WebLinks::Ignore => {}
         }
+    }
+}
+
+/// How the toolbar and the status row are drawn: on the code panel's
+/// colour, or reversed when there is none.
+fn bar_style() -> Style {
+    match theme::code_panel() {
+        Some(bg) => Style::new().bg(bg),
+        None => Style::new().add_modifier(Modifier::REVERSED),
     }
 }
 
@@ -1303,6 +1450,9 @@ const HISTORY_LIMIT: usize = 100;
 
 /// The longest pause between two keys of a terminal reply.
 const REPLY_GAP: Duration = Duration::from_millis(50);
+
+/// The number typed before a key stays below this.
+const COUNT_LIMIT: usize = 1_000_000;
 
 /// How far one step of the mouse wheel scrolls.
 const WHEEL_LINES: isize = 3;
@@ -1376,6 +1526,8 @@ fn run_browser<W: Write>(
                 && let Some(change) = browser.watcher.check()
             {
                 apply(&mut browser.view, &browser.path, &browser.vault, change);
+                // What the watcher saw is newer than a covered notice.
+                browser.covered = None;
                 // Its permissions may have changed too.
                 browser.check_tasks();
                 redraw = true;
@@ -1465,6 +1617,22 @@ mod tests {
     }
 
     #[test]
+    fn the_page_is_where_the_top_line_is_and_the_last_at_the_end() {
+        // 19 lines, 5 to a page.
+        let mut v = view(10);
+        assert_eq!(v.page(), "page 1/4");
+        v.scroll_by(4);
+        assert_eq!(v.page(), "page 1/4");
+        v.scroll_by(3);
+        assert_eq!(v.page(), "page 2/4");
+        v.act(Action::Bottom);
+        assert_eq!(v.page(), "page 4/4");
+        // An empty note, or one shorter than the view, is one page.
+        assert_eq!(view(0).page(), "page 1/1");
+        assert_eq!(view(1).page(), "page 1/1");
+    }
+
+    #[test]
     fn short_documents_do_not_scroll() {
         let mut v = view(1);
         press(&mut v, KeyCode::Char('G'));
@@ -1483,14 +1651,13 @@ mod tests {
     #[test]
     fn draw_reflows_on_resize() {
         let mut v = new_view("alpha beta gamma\n");
-        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
         terminal.draw(|f| v.draw(f)).unwrap();
         assert_eq!(v.layout.lines.len(), 1);
-        terminal.backend_mut().resize(6, 3);
+        terminal.backend_mut().resize(6, 4);
         terminal.draw(|f| v.draw(f)).unwrap();
-        terminal
-            .backend()
-            .assert_buffer_lines(["alpha ", "beta  ", "gamma "]);
+        let buf = terminal.backend().buffer();
+        assert_eq!(rows(buf)[..3], ["alpha ", "beta  ", "gamma "]);
     }
 
     #[test]
@@ -1542,7 +1709,7 @@ mod tests {
         let md = "top\n\n![a](a.png)\n\nend\n";
         let mut v = view_with_files("cells", md, &[("a.png", png(20, 40))]);
         v.receive_images();
-        let mut terminal = Terminal::new(TestBackend::new(6, 3)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(6, 4)).unwrap();
         terminal.draw(|f| v.draw(f)).unwrap();
         let id = v.layout.placements()[0].id;
         let first = terminal.backend().buffer().clone();
@@ -1705,14 +1872,19 @@ mod tests {
         terminal.draw(|f| v.draw(f)).unwrap();
         assert_eq!(v.height, 2);
         let buf = terminal.backend().buffer();
-        let row: String = (0..8).map(|x| buf[(x, 2)].symbol()).collect();
-        assert_eq!(row, "file del");
-        assert_eq!(buf[(0, 0)].symbol(), "o");
+        assert_eq!(rows(buf), ["one     ", "        ", "file del"]);
         apply(&mut v, Change::Changed("back\n".into()));
         terminal.draw(|f| v.draw(f)).unwrap();
-        terminal
-            .backend()
-            .assert_buffer_lines(["back    ", "        ", "        "]);
+        let buf = terminal.backend().buffer();
+        assert_eq!(rows(buf), ["back    ", "        ", "        "]);
+    }
+
+    /// The text of each row of `buf`.
+    fn rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        let area = buf.area;
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
     }
 
     #[test]
@@ -2379,6 +2551,142 @@ mod tests {
             dest: dest.into(),
             wiki: true,
         }
+    }
+
+    /// The bottom row of the screen after drawing `b` 30 wide and 8 high.
+    fn status_row(b: &mut Browser) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        rows(terminal.backend().buffer()).pop().unwrap()
+    }
+
+    fn press_all(b: &mut Browser, keys: &str) {
+        for c in keys.chars() {
+            enter(b, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn a_number_before_a_key_repeats_it_or_goes_to_that_line() {
+        let (mut b, dir) = browser("count", &[("a.md", &paragraphs(30))]);
+        assert_eq!(status_row(&mut b).trim(), "page 1/10");
+        press_all(&mut b, "5j");
+        assert_eq!(b.view.scroll, 5);
+        press_all(&mut b, "2k");
+        assert_eq!(b.view.scroll, 3);
+        // The line counts from 1, so line 42 is the 41st below the top.
+        press_all(&mut b, "42G");
+        assert_eq!(b.view.scroll, 41);
+        press_all(&mut b, "1g");
+        assert_eq!(b.view.scroll, 0);
+        // The number typed so far shows on the bottom row.
+        press_all(&mut b, "12");
+        assert!(status_row(&mut b).ends_with(" 12  page 1/10 "));
+        // Digits after it go on the end, until a key uses it.
+        press_all(&mut b, "3j");
+        assert_eq!(b.view.scroll, 53);
+        assert_eq!(b.view.count, None);
+        // Esc drops the number, and does not quit.
+        press_all(&mut b, "gg4");
+        assert!(!b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(b.view.count, None);
+        press_all(&mut b, "j");
+        assert_eq!(b.view.scroll, 1);
+        // A number does not start with 0, and is held below the limit.
+        press_all(&mut b, "0");
+        assert_eq!(b.view.count, None);
+        press_all(&mut b, "10");
+        assert_eq!(b.view.count, Some(10));
+        press_all(&mut b, &"9".repeat(12));
+        assert!(b.view.count.unwrap() < COUNT_LIMIT);
+        // Esc with no number still quits.
+        b.view.count = None;
+        assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn digits_typed_into_the_search_prompt_are_not_a_number() {
+        let (mut b, dir) = browser("count-search", &[("a.md", &paragraphs(30))]);
+        press_all(&mut b, "/12");
+        assert_eq!(b.view.count, None);
+        assert!(b.view.prompt.as_deref().unwrap().starts_with("/12"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_digit_bound_to_an_action_is_not_a_number() {
+        let (mut b, dir) = browser("count-bound", &[("a.md", &paragraphs(30))]);
+        b.config = Config::from_str("[keys]\ndown = [\"2\"]").unwrap();
+        press_all(&mut b, "2");
+        assert_eq!(b.view.scroll, 1);
+        assert_eq!(b.view.count, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn r_reloads_the_file_and_says_when_it_cannot() {
+        let (mut b, dir) = browser("reload", &[("a.md", "old\n")]);
+        std::fs::write(&b.path, "new\n").unwrap();
+        press_all(&mut b, "r");
+        assert_eq!(top(&b.view), "new");
+        std::fs::remove_file(&b.path).unwrap();
+        press_all(&mut b, "r");
+        assert_eq!(top(&b.view), "new");
+        assert!(status_row(&mut b).starts_with("cannot reload: "));
+        // The message goes at the next key.
+        press_all(&mut b, "j");
+        assert_eq!(status_row(&mut b).trim(), "page 1/1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn r_picks_up_a_change_to_an_embedded_note() {
+        let (mut b, dir) = browser("reload-embed", &[("a.md", "![[b]]\n"), ("b.md", "old\n")]);
+        std::fs::write(dir.join("b.md"), "new\n").unwrap();
+        press_all(&mut b, "r");
+        let text: Vec<String> = b.view.layout.lines.iter().map(|l| l.to_string()).collect();
+        assert!(text.iter().any(|l| l.contains("new")), "{text:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_reload_leaves_the_deleted_notice_after_the_next_key() {
+        let (mut b, dir) = browser("reload-deleted", &[("a.md", "text\n")]);
+        std::fs::remove_file(&b.path).unwrap();
+        apply(&mut b.view, &b.path, &b.vault, Change::Deleted);
+        press_all(&mut b, "r");
+        assert!(status_row(&mut b).starts_with("cannot reload: "));
+        press_all(&mut b, "j");
+        assert!(status_row(&mut b).starts_with("file deleted"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_message_shows_when_the_note_has_one_row() {
+        let (mut b, dir) = browser("one-row", &[("a.md", "[[Gone]]\n")]);
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        let mut terminal = Terminal::new(TestBackend::new(30, 2)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        let row = rows(terminal.backend().buffer()).pop().unwrap();
+        assert!(row.starts_with("no note found"), "{row:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_error_shows_on_the_bottom_row_until_the_next_key() {
+        let (mut b, dir) = browser("error", &[("a.md", "[[Gone]]\n")]);
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        let row = status_row(&mut b);
+        assert!(row.starts_with("no note found: Gone"), "{row:?}");
+        // The page is still shown when both fit.
+        assert!(row.ends_with(" page 1/1 "), "{row:?}");
+        // Any key clears it, even one that does nothing.
+        enter(&mut b, KeyCode::Char('z'));
+        assert_eq!(status_row(&mut b).trim(), "page 1/1");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

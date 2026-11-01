@@ -385,6 +385,7 @@ impl View {
         let end = (self.scroll + area.height as usize).min(lines.len());
         let visible = Text::from(lines[self.scroll..end].to_vec());
         frame.render_widget(Paragraph::new(visible), area);
+        crate::heading::draw_sized(frame.buffer_mut(), area, self.scroll, &self.layout.sized);
         // The cells of a link or checkbox that are in view.
         let scroll = self.scroll;
         let cells = |spot: &[(usize, std::ops::Range<u16>)]| -> Vec<Rect> {
@@ -811,9 +812,15 @@ fn heading_start(source: &str, blocks: &[doc::Block], wanted: &str) -> Option<us
 /// the shared id lets the terminal treat them as one link.
 fn hyperlink(cell: &mut Cell, id: usize, url: &str) {
     let text = cell.symbol();
-    // The second column of a wide character holds nothing to wrap.
-    let Some(width) = NonZeroU16::new(text.width() as u16) else {
-        return;
+    // The second column of a wide character holds nothing to wrap, nor do
+    // the cells under a heading drawn larger. Its first cell keeps its width.
+    let width = match cell.diff_option {
+        CellDiffOption::Skip => return,
+        CellDiffOption::ForcedWidth(width) => width,
+        _ => match NonZeroU16::new(text.width() as u16) {
+            Some(width) => width,
+            None => return,
+        },
     };
     let symbol = format!("\x1b]8;id=smd{id};{url}\x1b\\{text}\x1b]8;;\x1b\\");
     cell.set_symbol(&symbol);
@@ -1981,6 +1988,24 @@ mod tests {
     }
 
     #[test]
+    fn a_link_in_a_sized_heading_wraps_its_osc66_cell() {
+        let mut cell = Cell::new("\x1b]66;s=2:w=1;a\x1b\\");
+        let two = NonZeroU16::new(2).unwrap();
+        cell.set_diff_option(CellDiffOption::ForcedWidth(two));
+        hyperlink(&mut cell, 0, "https://e.com");
+        assert_eq!(
+            cell.symbol(),
+            "\x1b]8;id=smd0;https://e.com\x1b\\\x1b]66;s=2:w=1;a\x1b\\\x1b]8;;\x1b\\"
+        );
+        assert_eq!(cell.diff_option, CellDiffOption::ForcedWidth(two));
+        // The cells it covers are left alone.
+        let mut under = Cell::new(" ");
+        under.set_diff_option(CellDiffOption::Skip);
+        hyperlink(&mut under, 0, "https://e.com");
+        assert_eq!(under.symbol(), " ");
+    }
+
+    #[test]
     fn clicking_a_link_follows_it_and_the_wheel_scrolls() {
         let home = format!("go [[Plan]] now\n\n{}", paragraphs(6));
         let (mut b, dir) = browser("click", &[("HOME.md", &home), ("Plan.md", "# Plan\n")]);
@@ -2043,6 +2068,45 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(15, 5)).unwrap();
         terminal.draw(|f| v.draw(f)).unwrap();
         assert_eq!((v.width, v.left), (15, 0));
+    }
+
+    #[test]
+    fn a_sized_heading_is_drawn_where_max_width_moves_it() {
+        use crate::heading::{SizedCell, SizedLine};
+        let mut v = new_view("[A](https://e.com)\n");
+        v.max_width = Some(20);
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        let href = |link: &Link| Some(link.dest.clone());
+        terminal.draw(|f| v.draw_in(f, f.area(), href)).unwrap();
+        assert_eq!((v.width, v.left), (20, 20));
+        // Laid out as a heading twice the size: the layout is kept, as the
+        // width has not changed.
+        v.layout.sized.push(SizedLine {
+            row: 0,
+            scale: 2,
+            cells: vec![SizedCell {
+                col: 0,
+                width: 1,
+                text: "A".into(),
+            }],
+        });
+        v.layout.links[0].cells = vec![(0, 0..2), (1, 0..2)];
+        // The frame as drawn, with the cells the terminal is not sent.
+        let frame = terminal.draw(|f| v.draw_in(f, f.area(), href)).unwrap();
+        let buf = frame.buffer;
+        assert_eq!(
+            buf[(20, 0)].symbol(),
+            "\x1b]8;id=smd0;https://e.com\x1b\\\x1b]66;s=2:w=1;A\x1b\\\x1b]8;;\x1b\\"
+        );
+        let two = NonZeroU16::new(2).unwrap();
+        assert_eq!(buf[(20, 0)].diff_option, CellDiffOption::ForcedWidth(two));
+        for (x, y) in [(21, 0), (20, 1), (21, 1)] {
+            assert_eq!(buf[(x, y)].diff_option, CellDiffOption::Skip, "({x}, {y})");
+        }
+        assert_eq!(buf[(0, 0)].diff_option, CellDiffOption::None);
+        // A click on any of its cells finds the link.
+        assert!(matches!(v.stop_at(21, 1), Some(Stop::Link(0))));
+        assert!(v.stop_at(1, 1).is_none());
     }
 
     #[test]

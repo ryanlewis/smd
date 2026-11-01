@@ -8,7 +8,7 @@ A sexy markdown reader for the terminal that draws mermaid diagrams, maths and h
 
 - **Diagrams.** A ` ```mermaid ` code block is drawn as an image, by [merman](https://github.com/Latias94/merman).
 - **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image. Inline maths stays as text.
-- **Headings.** Headings are drawn as images in a real font, larger for higher levels, including colour emoji.
+- **Headings.** Headings are drawn larger for higher levels. In a terminal with kitty's [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/), such as kitty 0.40 or later, they are text the terminal draws larger, so you can select them and follow their links. Elsewhere they are images in a real font, including colour emoji.
 - **Images.** A paragraph that holds only a PNG, GIF (first frame), JPEG or SVG, such as `![diagram](diagram.png)` or an HTML `<img>`, is shown as the image. Local images are read from the markdown file's folder. Images from the web are fetched only when you turn them on (see [Images from the web](#images-from-the-web)).
 - **Code blocks.** Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours, on a panel a little lighter than the background (darker on a light one).
 - **Tables.** A table wider than the pane wraps its cells. A table with too many columns to wrap well is shown as one card per row, with a `Header: value` line for each cell.
@@ -52,7 +52,7 @@ $$
 
 ### Headings
 
-Headings are drawn as images in a larger font, with a colour for each level, and emoji in colour.
+Headings are drawn in a larger font, with a colour for each level, and emoji in colour. This screenshot shows them drawn as images; in kitty they are larger text instead.
 
 ```markdown
 # 🌦️ Weather station
@@ -144,6 +144,8 @@ Each sensor is checked against the reference station once a month. Back to [[Sta
 Images, diagrams, maths and headings need a terminal that supports the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) with Unicode placeholders. [Ghostty](https://ghostty.org) is the recommended terminal and the one smd is tested in. Other terminals with Unicode-placeholder support should work but have not been tested.
 
 smd asks the terminal what it supports at start-up. In a terminal without kitty graphics, or with `--no-graphics`, images, diagrams and maths are shown as their markdown source, and headings as styled text. Everything else works the same.
+
+smd also asks whether the terminal has the [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/), by drawing a space two columns wide and one twice the size and seeing where the cursor ends up. If it does, headings are drawn as larger text rather than images: three times the size for level 1 and twice for levels 2 and 3, smaller in a narrow pane. kitty has it from version 0.40; Ghostty does not yet. `--no-graphics` turns this off too.
 
 smd is developed on macOS, and its tests run on Linux.
 
@@ -325,6 +327,11 @@ max_width = 100
 # (the default) or "left".
 align = "centre"
 
+# How headings are drawn: "auto" (the default) for larger text when the
+# terminal can draw it and images when not, "image" for images always, or
+# "text" for text always, larger when the terminal can draw it.
+headings = "auto"
+
 # Keys for each action. Naming an action replaces its default keys.
 [keys]
 next_link = ["tab", "n"]
@@ -354,7 +361,7 @@ A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `b
 
 ## Limitations
 
-- Links in headings drawn as images cannot be selected or clicked yet.
+- Links in headings drawn as images cannot be selected or clicked. Headings are drawn as larger text, with links that work, only in terminals with the text sizing protocol. Ghostty does not have it yet, so it shows headings as images; set `headings = "text"` for plain text headings with working links.
 - Only the first frame of a GIF is shown.
 - SVGs are drawn by resvg, which covers most of SVG but not all of CSS. Text in an SVG is set in the diagram fonts (see [Fonts](#fonts)), whatever font it names.
 - Diagrams are drawn by merman, which follows mermaid closely but not exactly: a diagram may be laid out a little differently from mermaid's own, and a few that mermaid rejects are drawn. Set `mermaid = "mmdc"` to use mermaid-cli.

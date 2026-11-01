@@ -19,6 +19,8 @@
 //! # window is wider: "centre" or "left".
 //! max_width = 100
 //! align = "centre"
+//! # How headings are drawn: "auto", "image" or "text".
+//! headings = "auto"
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -33,6 +35,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::heading;
 use crate::mermaid::Renderer;
 use crate::theme::Rgb;
 
@@ -270,6 +273,8 @@ struct File {
     #[serde(default)]
     align: Align,
     #[serde(default)]
+    headings: heading::Mode,
+    #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
 
@@ -293,6 +298,8 @@ pub struct Config {
     pub max_width: Option<u16>,
     /// Where the text sits when the window is wider than `max_width`.
     pub align: Align,
+    /// How headings are drawn.
+    pub headings: heading::Mode,
     keys: HashMap<Key, Action>,
 }
 
@@ -378,6 +385,7 @@ impl Config {
             tasks: file.tasks,
             max_width: file.max_width,
             align: file.align,
+            headings: file.headings,
             keys,
         })
     }
@@ -568,6 +576,17 @@ mod tests {
             let err = Config::from_str(text).unwrap_err();
             assert!(err.contains(wanted), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn headings_are_auto_unless_set() {
+        assert_eq!(Config::default().headings, heading::Mode::Auto);
+        let c = Config::from_str("headings = \"image\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Image);
+        let c = Config::from_str("headings = \"text\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Text);
+        let err = Config::from_str("headings = \"big\"\n").unwrap_err();
+        assert!(err.contains("big"), "{err}");
     }
 
     fn key(code: KeyCode, ctrl: bool, alt: bool) -> Result<Key, String> {

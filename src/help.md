@@ -1,6 +1,6 @@
 # smd help
 
-Go back to leave this page and return to where you were. The keys below are the ones bound now, including any you changed in the config.
+Go back to leave this page and return to where you were. The table below shows the keys bound now, including any you changed in the config. The notes after it name the default keys.
 
 ## Keys
 
@@ -18,7 +18,7 @@ Press search and type a term. Matches are marked as you type, and the bottom row
 
 ## Links, Back and Forward
 
-Tab and Shift-Tab select links, checkboxes and folding titles; Enter follows a link, ticks a checkbox or folds a title. A link to another note opens it in smd, and Back returns to where you were. Web links and files smd does not show are opened with the system's opener. The toolbar's Back and Forward buttons can be clicked too.
+Tab and Shift-Tab select links, checkboxes and folding titles; Enter follows a link, ticks a checkbox or folds a title. A link to another note opens it in smd, and Back returns to where you were. Web links and files smd does not show are opened with the system's opener. With the mouse on, the toolbar's Back and Forward buttons can be clicked too.
 
 ## Tasks
 

@@ -38,20 +38,25 @@ fn table(config: &Config) -> String {
         let keys = if names.is_empty() {
             "none".to_string()
         } else {
-            names.iter().map(|n| code(n)).collect::<Vec<_>>().join(", ")
+            names.iter().map(|n| cell(n)).collect::<Vec<_>>().join(", ")
         };
         out.push_str(&format!(
             "| {keys} | {} | {} |\n",
-            code(&name(action)),
+            cell(&name(action)),
             what(action)
         ));
     }
     out
 }
 
-/// `text` as inline code, with a pipe escaped so it stays in its cell.
+/// `text` as inline code in a table cell, with a pipe escaped so it stays
+/// in its cell.
+fn cell(text: &str) -> String {
+    code(&text.replace('|', "\\|"))
+}
+
+/// `text` as inline code.
 fn code(text: &str) -> String {
-    let text = text.replace('|', "\\|");
     if text.contains('`') {
         format!("`` {text} ``")
     } else {
@@ -106,7 +111,7 @@ mod tests {
         let page = page(&Config::default());
         assert!(!page.contains("{keys}") && !page.contains("{config}"));
         for action in Action::ALL {
-            let row = format!("| {} | {} |", code(&name(action)), what(action));
+            let row = format!("| {} | {} |", cell(&name(action)), what(action));
             assert!(page.contains(&row), "the help has no row for {action:?}");
         }
         assert!(page.contains("| `?` | `help` | Show this page |"));
@@ -122,7 +127,8 @@ mod tests {
 
     #[test]
     fn a_pipe_or_backtick_key_stays_in_its_cell() {
-        assert_eq!(code("|"), "`\\|`");
+        assert_eq!(cell("|"), "`\\|`");
+        assert_eq!(code("a|b"), "`a|b`");
         assert_eq!(code("`"), "`` ` ``");
     }
 }

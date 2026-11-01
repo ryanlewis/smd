@@ -334,14 +334,16 @@ impl Config {
                 if given.is_none() && newer && named.contains(&key) {
                     continue;
                 }
-                if let Some(other) = keys.insert(key, action)
-                    && other != action
-                {
-                    return Err(format!(
-                        "key \"{name}\" is set for both {other:?} and {action:?}"
-                    ));
+                match keys.insert(key, action) {
+                    Some(other) if other != action => {
+                        return Err(format!(
+                            "key \"{name}\" is set for both {other:?} and {action:?}"
+                        ));
+                    }
+                    // The same key again, perhaps spelt another way.
+                    Some(_) => {}
+                    None => key_names.entry(action).or_default().push(name.to_string()),
                 }
-                key_names.entry(action).or_default().push(name.to_string());
             }
         }
         let code_background = match file.code_background.as_deref() {
@@ -459,6 +461,14 @@ mod tests {
         );
         assert!(c.key_names(Action::Help).is_empty());
         assert_eq!(Config::default().key_names(Action::Help), ["?"]);
+    }
+
+    #[test]
+    fn a_key_named_twice_is_listed_once() {
+        let c = Config::from_str("[keys]\ndown = [\"j\", \"j\"]\nback = [\"ctrl-o\", \"ctrl-O\"]")
+            .unwrap();
+        assert_eq!(c.key_names(Action::Down), ["j"]);
+        assert_eq!(c.key_names(Action::Back), ["ctrl-o"]);
     }
 
     #[test]

@@ -6,7 +6,9 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    CodeBlockKind, Event, LinkType, MetadataBlockKind, Options, Parser, Tag, TagEnd,
+};
 
 use crate::theme::Theme;
 
@@ -43,6 +45,9 @@ pub enum BlockKind {
         items: Vec<ListItem>,
     },
     Rule,
+    /// The YAML block at the very start of a note, between `---` lines, or
+    /// a TOML one between `+++` lines.
+    Frontmatter(Frontmatter),
     Html(String),
     /// A paragraph holding nothing but one image. Until the image is ready,
     /// the block is shown as its alt text.
@@ -59,6 +64,16 @@ pub enum BlockKind {
         kind: FigureKind,
         source: String,
     },
+}
+
+/// A frontmatter block's text between its delimiters, and its top-level
+/// properties when they could be read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frontmatter {
+    pub raw: String,
+    /// Each top-level key and its value, or `None` when the block is not the
+    /// simple YAML read here, and is shown as its raw text instead.
+    pub properties: Option<Vec<(String, String)>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,10 +240,135 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         | Options::ENABLE_WIKILINKS;
     let mut builder = Builder::new(source);
     builder.hide = theme.map(other_theme);
-    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
-        builder.event(event, range);
+    // The body is parsed without metadata blocks, which pulldown-cmark would
+    // find anywhere, not only at the start.
+    let start = match frontmatter(source) {
+        Some((block, span)) => {
+            let end = span.end;
+            builder.push_block(BlockKind::Frontmatter(block), span);
+            end
+        }
+        None => 0,
+    };
+    for (event, range) in Parser::new_ext(&source[start..], options).into_offset_iter() {
+        builder.event(event, range.start + start..range.end + start);
     }
     builder.finish()
+}
+
+/// The frontmatter block at the very start of `source`, and its span.
+fn frontmatter(source: &str) -> Option<(Frontmatter, Range<usize>)> {
+    if !source.starts_with("---") && !source.starts_with("+++") {
+        return None;
+    }
+    let options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
+    let mut events = Parser::new_ext(source, options).into_offset_iter();
+    let (Event::Start(Tag::MetadataBlock(kind)), span) = events.next()? else {
+        return None;
+    };
+    if span.start != 0 {
+        return None;
+    }
+    let mut raw = String::new();
+    for (event, _) in events {
+        match event {
+            Event::Text(text) => raw.push_str(&text),
+            _ => break,
+        }
+    }
+    let properties = match kind {
+        MetadataBlockKind::YamlStyle => properties(&raw),
+        MetadataBlockKind::PlusesStyle => None,
+    };
+    Some((Frontmatter { raw, properties }, span))
+}
+
+/// The top-level `key: value` lines of simple YAML. A list under a key,
+/// as `- item` lines or `[a, b]`, is joined with commas, and any other
+/// value under a key is kept as its text. `None` for anything else.
+fn properties(yaml: &str) -> Option<Vec<(String, String)>> {
+    // Each key, the text after it, and the lines under it.
+    let mut props: Vec<(String, String, Vec<&str>)> = Vec::new();
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indented = line.starts_with([' ', '\t']);
+        if indented || is_item(trimmed) {
+            let (_, after, under) = props.last_mut()?;
+            // A list may start at the key's column, but not after a value.
+            if !indented && !after.is_empty() {
+                return None;
+            }
+            under.push(line);
+            continue;
+        }
+        let (key, after) = trimmed.split_once(':')?;
+        if !after.is_empty() && !after.starts_with(' ') {
+            return None;
+        }
+        props.push((
+            unquote(key.trim()).to_string(),
+            after.trim().to_string(),
+            Vec::new(),
+        ));
+    }
+    let props = props.into_iter();
+    Some(
+        props
+            .map(|(k, after, under)| (k, value(&after, &under)))
+            .collect(),
+    )
+}
+
+fn is_item(line: &str) -> bool {
+    line == "-" || line.starts_with("- ")
+}
+
+/// A property's value from the text after its key and the lines under it.
+fn value(after: &str, under: &[&str]) -> String {
+    if under.is_empty() {
+        return match after.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+            Some(flow) if !flow.contains(['[', '{']) => list(flow.split(',')),
+            _ => unquote(after).to_string(),
+        };
+    }
+    if after.is_empty() && under.iter().all(|l| is_item(l.trim())) {
+        return list(under.iter().map(|l| &l.trim()[1..]));
+    }
+    let mut lines = dedent(under);
+    if !after.is_empty() {
+        lines.insert(0, after);
+    }
+    lines.join("\n")
+}
+
+/// List items joined with commas, without their quotes.
+fn list<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    items
+        .map(|i| unquote(i.trim()))
+        .filter(|i| !i.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Lines with the indent they share taken off.
+fn dedent<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let common = lines.iter().map(|l| indent(l)).min().unwrap_or(0);
+    lines.iter().map(|l| l[common..].trim_end()).collect()
+}
+
+/// A scalar without the quotes around it.
+fn unquote(s: &str) -> &str {
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
 }
 
 struct Builder<'a> {
@@ -1245,6 +1385,10 @@ mod tests {
                 BlockKind::Quote(_) => "quote".to_string(),
                 BlockKind::List { start, tight, .. } => format!("list {start:?} tight={tight}"),
                 BlockKind::Rule => "rule".to_string(),
+                BlockKind::Frontmatter(Frontmatter { raw, properties }) => match properties {
+                    Some(props) => format!("frontmatter {props:?}"),
+                    None => format!("frontmatter raw {raw:?}"),
+                },
                 BlockKind::Html(html) => format!("html {html:?}"),
                 BlockKind::Image { src, alt, wiki } => {
                     format!("image {src:?} alt={alt:?} wiki={wiki}")
@@ -1629,5 +1773,67 @@ rule @57..61
 rule @61..65
 "#,
         );
+    }
+
+    #[test]
+    fn frontmatter_at_the_start_is_read_as_properties() {
+        assert_outline(
+            "---\ntitle: \"A note\"\ntags:\n  - one\n  - 'two'\naliases: [a, b]\n---\n# Title\n",
+            r#"frontmatter [("title", "A note"), ("tags", "one, two"), ("aliases", "a, b")] @0..63
+heading 1 @64..72
+  "Title"
+"#,
+        );
+    }
+
+    #[test]
+    fn frontmatter_keeps_nested_values_as_text() {
+        let props = |md: &str| match &parse(md).blocks[0].kind {
+            BlockKind::Frontmatter(f) => f.properties.clone(),
+            other => panic!("expected frontmatter, got {other:?}"),
+        };
+        assert_eq!(
+            props("---\nauthor:\n  name: Ann\n  url: x\n# comment\nlist:\n- a\n- b\nempty:\n---\n"),
+            Some(vec![
+                ("author".into(), "name: Ann\nurl: x".into()),
+                ("list".into(), "a, b".into()),
+                ("empty".into(), "".into()),
+            ])
+        );
+        assert_eq!(props("---\nnot yaml\n---\n"), None);
+        assert_eq!(props("---\na: 1\n- b\n---\n"), None);
+        assert_eq!(props("+++\ntitle = \"x\"\n+++\n"), None);
+    }
+
+    #[test]
+    fn a_later_metadata_block_is_rules_and_a_heading() {
+        // Not at the very start, so not frontmatter.
+        assert_outline(
+            "text\n\n---\na: b\n---\n",
+            r#"paragraph @0..5
+  "text"
+rule @6..10
+heading 2 @10..19
+  "a: b"
+"#,
+        );
+        assert_outline(
+            "\n---\na: b\n---\n",
+            "rule @1..5\nheading 2 @5..14\n  \"a: b\"\n",
+        );
+        // Frontmatter, then a rule and setext heading of the body.
+        assert_outline(
+            "---\nk: v\n---\n---\na: b\n---\n",
+            r#"frontmatter [("k", "v")] @0..12
+rule @13..17
+heading 2 @17..26
+  "a: b"
+"#,
+        );
+    }
+
+    #[test]
+    fn an_unclosed_block_is_not_frontmatter() {
+        assert_outline("---\na: b\n", "rule @0..4\nparagraph @4..9\n  \"a: b\"\n");
     }
 }

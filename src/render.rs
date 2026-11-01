@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use syntect::parsing::SyntaxSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::doc::{Block, BlockKind, Document, FigureKind, Inline, InlineStyle, Link, ListItem};
+use crate::doc::{
+    Block, BlockKind, Document, FigureKind, Frontmatter, Inline, InlineStyle, Link, ListItem,
+};
 use crate::highlight::{self, Segments};
 use crate::images::{self, Images, Placement};
 use crate::kitty;
@@ -255,6 +257,7 @@ fn contents(
             let error = images::key(block).and_then(|key| ctx.images.error(&key));
             figure(source, error, width, first, rest, out);
         }
+        BlockKind::Frontmatter(front) => frontmatter(front, width, first, rest, out),
         BlockKind::Html(html) => {
             let dim = Style::new().add_modifier(Modifier::DIM);
             preformatted(html, dim, width, first, rest, out);
@@ -279,6 +282,46 @@ fn contents(
             tight,
             items,
         } => list(*start, *tight, items, width, first, rest, ctx),
+    }
+}
+
+/// A note's properties, dimmed, one `key  value` row each with the values
+/// lined up. A key too wide for its column has its value on the lines under
+/// it. Frontmatter that could not be read shows as its text.
+fn frontmatter(
+    front: &Frontmatter,
+    width: usize,
+    first: &[Span<'static>],
+    rest: &[Span<'static>],
+    out: &mut Vec<Line<'static>>,
+) {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let props = match &front.properties {
+        Some(props) if !props.is_empty() => props,
+        _ => return preformatted(&front.raw, dim, width, first, rest, out),
+    };
+    // The widest key that fits in a third of the view.
+    let most = width.saturating_sub(spans_width(rest)) / 3;
+    let keys = props.iter().map(|(k, _)| k.width());
+    let column = keys.filter(|&w| w <= most).max().unwrap_or(0);
+    let under = with(rest, Span::raw(" ".repeat(column + 2)));
+    for (i, (key, value)) in props.iter().enumerate() {
+        let prefix = if i == 0 { first } else { rest };
+        let key_first = if key.width() > column {
+            preformatted(key, dim, width, prefix, rest, out);
+            under.clone()
+        } else {
+            let pad = column - key.width() + 2;
+            with(
+                prefix,
+                Span::styled(format!("{key}{}", " ".repeat(pad)), dim),
+            )
+        };
+        if value.contains('\n') {
+            preformatted(value, dim, width, &key_first, &under, out);
+        } else {
+            wrap(&[note(value.clone())], dim, width, &key_first, &under, out);
+        }
     }
 }
 
@@ -1843,6 +1886,58 @@ graph TD
             lines
                 .iter()
                 .all(|l| l.spans.iter().all(|s| s.style.bg.is_none()))
+        );
+    }
+
+    #[test]
+    fn frontmatter_shows_as_dimmed_properties() {
+        let md = "---\ntitle: A note\ntags: [one, two]\nurl: https://x.org\n---\n# Title\n";
+        assert_eq!(
+            plain(md, 40),
+            vec![
+                "title  A note",
+                "tags   one, two",
+                "url    https://x.org",
+                "",
+                "Title",
+            ]
+        );
+        let layout = render(&parse(md), 40, &no_images());
+        assert!(layout.links.is_empty(), "{:?}", layout.links);
+        let key = &layout.lines[0].spans[0];
+        assert!(key.style.add_modifier.contains(Modifier::DIM), "{key:?}");
+    }
+
+    #[test]
+    fn frontmatter_values_wrap_under_their_column() {
+        let md = "---\nsummary: one two three four\nauthor:\n  name: Ann\n---\n";
+        assert_eq!(
+            plain(md, 21),
+            vec![
+                "summary  one two",
+                "         three four",
+                "author   name: Ann"
+            ]
+        );
+        // A key wider than a third of the view has its value under it.
+        let md = "---\na_very_long_key: v\nk: w\n---\n";
+        assert_eq!(plain(md, 30), vec!["a_very_long_key", "   v", "k  w"]);
+    }
+
+    #[test]
+    fn unreadable_frontmatter_shows_as_its_text() {
+        assert_eq!(
+            plain("---\njust words\n---\n\nAfter\n", 40),
+            vec!["just words", "", "After"]
+        );
+        assert_eq!(plain("+++\nt = 1\n+++\n", 40), vec!["t = 1"]);
+    }
+
+    #[test]
+    fn a_later_rule_and_heading_are_unchanged() {
+        assert_eq!(
+            plain("---\nk: v\n---\ntext\n\n---\n", 10),
+            vec!["k  v", "", "text", "", "──────────"]
         );
     }
 }

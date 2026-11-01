@@ -105,19 +105,26 @@ impl Anchor {
     /// before the edited bytes keeps its start and one that starts after them
     /// moves with them; one that starts inside them is lost.
     fn moved(self, old: &str, new: &str) -> Option<Anchor> {
-        let (old, new) = (old.as_bytes(), new.as_bytes());
-        let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-        let room = old.len().min(new.len()) - prefix;
-        let suffix = old.iter().rev().zip(new.iter().rev());
-        let suffix = suffix.take(room).take_while(|(a, b)| a == b).count();
-        let start = if self.start < prefix {
-            self.start
-        } else if self.start >= old.len() - suffix {
-            self.start + new.len() - old.len()
-        } else {
-            return None;
-        };
+        let start = moved(self.start, old, new)?;
         Some(Anchor { start, ..self })
+    }
+}
+
+/// Byte `at` of `old` in `new`, an edited copy of it: a byte before the
+/// edited bytes stays and one after them moves with them; one inside them
+/// is lost.
+fn moved(at: usize, old: &str, new: &str) -> Option<usize> {
+    let (old, new) = (old.as_bytes(), new.as_bytes());
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - prefix;
+    let suffix = old.iter().rev().zip(new.iter().rev());
+    let suffix = suffix.take(room).take_while(|(a, b)| a == b).count();
+    if at < prefix {
+        Some(at)
+    } else if at >= old.len() - suffix {
+        Some(at + new.len() - old.len())
+    } else {
+        None
     }
 }
 
@@ -159,6 +166,7 @@ impl View {
         let Some(start) = heading_start(&self.doc.blocks, wanted) else {
             return false;
         };
+        self.open_folds_around(start);
         if let Some(b) = self.layout.blocks.iter().find(|b| b.span.start == start) {
             self.scroll = b.rows.start.min(self.max_scroll());
         }
@@ -176,6 +184,11 @@ impl View {
         let anchor = self.anchor();
         let old = std::mem::replace(&mut self.doc, Rc::new(doc));
         let anchor = anchor.and_then(|a| a.moved(&old.source, &self.doc.source));
+        let flipped = std::mem::take(&mut self.flipped);
+        let flipped = flipped.into_iter();
+        self.flipped = flipped
+            .filter_map(|at| moved(at, &old.source, &self.doc.source))
+            .collect();
         self.selected = None;
         self.want_images();
         self.relayout(anchor);
@@ -363,11 +376,14 @@ impl View {
             return None;
         }
         let line = self.scroll + y as usize;
-        self.stops().into_iter().find(|&stop| {
-            self.cells(stop)
+        let hit = |stop: &Stop| {
+            self.cells(*stop)
                 .iter()
                 .any(|(row, cols)| *row == line && cols.contains(&x))
-        })
+        };
+        // A link in a folding title is under the title's stop too.
+        let stops = self.stops().into_iter().filter(hit);
+        stops.min_by_key(|stop| matches!(stop, Stop::Fold(_)))
     }
 
     /// The links, and the checkboxes when they can be ticked, in the order
@@ -442,6 +458,28 @@ impl View {
             Action::Forward => return Some(Go::Forward),
         }
         None
+    }
+
+    /// Open each shut block that holds the byte `at`, outermost first, so
+    /// what starts there is drawn.
+    fn open_folds_around(&mut self, at: usize) {
+        loop {
+            let layout = &self.layout;
+            let shut = layout.folds.iter().find(|f| {
+                !f.open
+                    && layout
+                        .blocks
+                        .iter()
+                        .any(|b| b.span.start == f.at && b.span.contains(&at))
+            });
+            let Some(fold) = shut else {
+                return;
+            };
+            if !self.flipped.remove(&fold.at) {
+                self.flipped.insert(fold.at);
+            }
+            self.relayout(None);
+        }
     }
 
     /// Fold the block starting at `at` open or shut, keeping its title on
@@ -647,6 +685,7 @@ struct Visited {
     doc: Rc<Document>,
     scroll: usize,
     selected: Option<Stop>,
+    flipped: HashSet<usize>,
 }
 
 /// The view and the note it shows, the way back, and what is needed to
@@ -913,6 +952,7 @@ impl Browser {
             doc: Rc::clone(&self.view.doc),
             scroll: self.view.scroll,
             selected: self.view.selected,
+            flipped: self.view.flipped.clone(),
         }
     }
 
@@ -924,7 +964,11 @@ impl Browser {
         if !showing && !self.open(visited.path.clone()) {
             return false;
         }
-        self.view.scroll = visited.scroll.min(self.view.max_scroll());
+        // Folds are kept by where they start, so only in the same text.
+        if self.view.doc.source == visited.doc.source {
+            self.view.flipped = visited.flipped.clone();
+        }
+        self.view.scroll = visited.scroll;
         self.view.selected = visited.selected;
         self.view.relayout(None);
         true
@@ -1653,6 +1697,37 @@ mod tests {
     }
 
     #[test]
+    fn back_comes_back_to_the_folds_as_they_were_left() {
+        let note = "> [!note]- Shut\n> go [[Plan]]\n\nafter [[Plan]]\n";
+        let (mut b, dir) = browser("fold-back", &[("HOME.md", note), ("Plan.md", "p\n")]);
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("Plan.md"));
+        b.back();
+        assert_eq!(b.view.layout.lines.len(), 4);
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_click_on_a_link_in_a_folding_title_follows_it() {
+        let note = "> [!note]- See [[Plan]]\n> body\n";
+        let (mut b, dir) = browser("fold-link", &[("HOME.md", note), ("Plan.md", "p\n")]);
+        // "│ ▸ ✎ See Plan": Plan is at columns 10 to 13.
+        b.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 11,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(b.path, dir.join("Plan.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_click_ticks_a_checkbox() {
         let (mut b, dir) = browser("tick-click", &[("HOME.md", "- [ ] one\n")]);
         let click = |column| MouseEvent {
@@ -1841,6 +1916,29 @@ mod tests {
         assert!(v.jump_to_heading("next-steps"));
         assert_eq!(top(&v), "Next steps");
         assert!(!v.jump_to_heading("nowhere"));
+    }
+
+    #[test]
+    fn jump_to_a_heading_in_a_shut_callout_opens_it() {
+        let md = format!(
+            "{0}> [!faq]- More\n> ## Details\n> text\n\n{0}",
+            paragraphs(10)
+        );
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        assert!(v.jump_to_heading("details"));
+        assert_eq!(top(&v), "│ Details");
+    }
+
+    #[test]
+    fn a_fold_stays_open_when_the_note_is_edited_above_it() {
+        let note = "> [!note]- Shut\n> body\n";
+        let mut v = new_view(note);
+        v.resize(20, 5);
+        v.fold(0);
+        assert_eq!(v.layout.lines.len(), 2);
+        v.reload(parse(&format!("new line\n\n{note}")));
+        assert_eq!(v.layout.lines.len(), 4);
     }
 
     /// A browser on `files` in a fresh vault, showing the first.

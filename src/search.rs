@@ -36,10 +36,11 @@ impl Search {
         !self.term.is_empty()
     }
 
-    /// Find the term again, as in a new layout.
+    /// Find the term again, as in a new layout. The matches may have moved
+    /// or changed in number, so none is current.
     pub fn refresh(&mut self, layout: &Layout, doc: &Document) {
         self.matches = find(&self.term, layout, doc);
-        self.current = self.current.filter(|&i| i < self.matches.len());
+        self.current = None;
     }
 
     /// The first match on or below row `top`, going round to the first of

@@ -309,15 +309,11 @@ fn properties(yaml: &str) -> Option<Vec<(String, String)>> {
             under.push(line);
             continue;
         }
-        let (key, after) = trimmed.split_once(':')?;
+        let (key, after) = split_key(trimmed)?;
         if !after.is_empty() && !after.starts_with(' ') {
             return None;
         }
-        props.push((
-            unquote(key.trim()).to_string(),
-            after.trim().to_string(),
-            Vec::new(),
-        ));
+        props.push((key.to_string(), after.trim().to_string(), Vec::new()));
     }
     let props = props
         .into_iter()
@@ -329,8 +325,23 @@ fn is_item(line: &str) -> bool {
     line == "-" || line.starts_with("- ")
 }
 
+/// A line's key, without quotes, and the text after its colon.
+fn split_key(line: &str) -> Option<(&str, &str)> {
+    for q in ['"', '\''] {
+        if let Some(rest) = line.strip_prefix(q) {
+            let (key, after) = rest.split_once(q)?;
+            return Some((key, after.strip_prefix(':')?));
+        }
+    }
+    let (key, after) = line.split_once(':')?;
+    Some((key.trim(), after))
+}
+
 /// A property's value from the text after its key and the lines under it.
+/// A block scalar, `|` or `>`, keeps or folds its lines, and a plain value
+/// going on under its key is joined with spaces.
 fn value(after: &str, under: &[&str]) -> String {
+    let after = strip_comment(after);
     if under.is_empty() {
         let flow = after.strip_prefix('[').and_then(|v| v.strip_suffix(']'));
         return match flow.and_then(flow_items) {
@@ -341,17 +352,38 @@ fn value(after: &str, under: &[&str]) -> String {
     if after.is_empty() && under.iter().all(|l| is_item(l.trim())) {
         return list(under.iter().map(|l| &l.trim()[1..]));
     }
-    let mut lines = dedent(under);
-    if !after.is_empty() {
-        lines.insert(0, after);
+    let lines = dedent(under);
+    match after {
+        "" | "|" | "|-" | "|+" => lines.join("\n"),
+        ">" | ">-" | ">+" => lines.join(" "),
+        _ => {
+            let words = std::iter::once(after).chain(lines.iter().map(|l| l.trim()));
+            unquote(&words.collect::<Vec<_>>().join(" ")).to_string()
+        }
     }
-    lines.join("\n")
 }
 
-/// List items joined with commas, without their quotes.
+/// A value without a `# comment` after it, outside quotes.
+fn strip_comment(value: &str) -> &str {
+    let mut quote = None;
+    let mut prev = ' ';
+    for (i, c) in value.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if matches!(prev, ' ' | '[' | ',') => quote = Some(c),
+            (None, '#') if prev.is_whitespace() => return value[..i].trim_end(),
+            _ => {}
+        }
+        prev = c;
+    }
+    value
+}
+
+/// List items joined with commas, without their quotes or comments.
 fn list<'a>(items: impl Iterator<Item = &'a str>) -> String {
     items
-        .map(|i| unquote(i.trim()))
+        .map(|i| unquote(strip_comment(i.trim())))
         .filter(|i| !i.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
@@ -395,6 +427,57 @@ fn unquote(s: &str) -> &str {
         }
     }
     s
+}
+
+/// A property's value as inline text, with its wiki links, `[[name]]` or
+/// `[[name|text]]`, and web addresses as links.
+pub fn value_inlines(value: &str) -> Vec<Inline> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    let push = |out: &mut Vec<Inline>, text: &str, link: Option<Link>| {
+        if !text.is_empty() {
+            out.push(Inline::Text {
+                text: text.to_string(),
+                style: InlineStyle {
+                    link,
+                    ..InlineStyle::default()
+                },
+            });
+        }
+    };
+    loop {
+        let at = ["[[", "https://", "http://"]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min();
+        let Some(at) = at else { break };
+        push(&mut out, &rest[..at], None);
+        rest = &rest[at..];
+        if let Some(inner) = rest.strip_prefix("[[")
+            && let Some(end) = inner.find("]]")
+        {
+            let (name, text) = inner[..end]
+                .split_once('|')
+                .unwrap_or((&inner[..end], &inner[..end]));
+            let link = Link {
+                dest: link_dest(name, true).into_owned(),
+                wiki: true,
+            };
+            push(&mut out, text, Some(link));
+            rest = &inner[end + 2..];
+        } else if rest.starts_with("[[") {
+            push(&mut out, "[[", None);
+            rest = &rest[2..];
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            // The comma between list items is not part of the address.
+            let url = rest[..end].trim_end_matches(',');
+            push(&mut out, url, Some(url.into()));
+            rest = &rest[url.len()..];
+        }
+    }
+    push(&mut out, rest, None);
+    out
 }
 
 struct Builder<'a> {
@@ -1878,7 +1961,7 @@ heading 2 @17..26
         // A `#` line under a key is its text, not a comment.
         assert_eq!(
             props("---\nnotes: |\n  # Heading\n  body\n---\n"),
-            one("notes", "|\n# Heading\nbody")
+            one("notes", "# Heading\nbody")
         );
         // Quoted flow list items keep their brackets and commas.
         assert_eq!(
@@ -1892,5 +1975,30 @@ heading 2 @17..26
         assert_eq!(props("---\nx: [a, [b]]\n---\n"), one("x", "[a, [b]]"));
         // A byte order mark before the block.
         assert_eq!(props("\u{feff}---\nk: v\n---\n"), one("k", "v"));
+    }
+
+    #[test]
+    fn frontmatter_scalars_comments_and_quoted_keys() {
+        let props = |md: &str| match &parse(md).blocks[0].kind {
+            BlockKind::Frontmatter(f) => f.properties.clone(),
+            other => panic!("expected frontmatter, got {other:?}"),
+        };
+        let one = |k: &str, v: &str| Some(vec![(k.to_string(), v.to_string())]);
+        assert_eq!(
+            props("---\ndescription: >\n  A long\n  summary\n---\n"),
+            one("description", "A long summary")
+        );
+        assert_eq!(
+            props("---\nsummary: one two\n  three four\n---\n"),
+            one("summary", "one two three four")
+        );
+        assert_eq!(
+            props("---\ntags: [a, b] # todo\n---\n"),
+            one("tags", "a, b")
+        );
+        assert_eq!(props("---\ntitle: x # draft\n---\n"), one("title", "x"));
+        assert_eq!(props("---\ntitle: \"a # b\"\n---\n"), one("title", "a # b"));
+        assert_eq!(props("---\ntag: c#\n---\n"), one("tag", "c#"));
+        assert_eq!(props("---\n\"a: b\": c\n---\n"), one("a: b", "c"));
     }
 }

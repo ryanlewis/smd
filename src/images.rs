@@ -557,12 +557,10 @@ pub fn decode_remote(data: Vec<u8>) -> Result<Png, String> {
     }
 }
 
-/// Whether `data` is an SVG: an `<svg` tag near the start, past any XML
-/// declaration, comments or doctype.
+/// Whether `data` is an SVG: an `<svg` tag, past any XML declaration,
+/// comments or doctype, however long. Raster images are told apart first.
 fn looks_like_svg(data: &[u8]) -> bool {
-    data[..data.len().min(4096)]
-        .windows(4)
-        .any(|w| w == b"<svg")
+    data.windows(4).any(|w| w == b"<svg")
 }
 
 /// The images an SVG may draw.
@@ -1006,6 +1004,14 @@ pub mod tests {
     fn a_web_image_with_svg_in_its_metadata_is_not_an_svg() {
         let data = [png(2, 2), b"tEXt<svg xmlns".to_vec()].concat();
         assert_eq!(decode_remote(data).unwrap().width, 2);
+    }
+
+    #[test]
+    fn a_web_svg_with_a_long_prologue_is_an_svg() {
+        let comment = format!("<!-- {} -->\n", "licence text ".repeat(400));
+        let data = [comment.into_bytes(), svg_bytes(5, 3, "")].concat();
+        assert!(data.len() > 5000);
+        assert_eq!(decode_remote(data).unwrap().width, 10);
     }
 
     #[test]

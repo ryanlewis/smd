@@ -157,7 +157,13 @@ impl<'de> Deserialize<'de> for Action {
         Action::ALL
             .into_iter()
             .find(|a| a.name() == name)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown action \"{name}\"")))
+            .ok_or_else(|| {
+                let names: Vec<&str> = Action::ALL.into_iter().map(Action::name).collect();
+                let names = names.join(", ");
+                serde::de::Error::custom(format!(
+                    "unknown action \"{name}\", expected one of {names}"
+                ))
+            })
     }
 }
 
@@ -640,6 +646,7 @@ mod tests {
             ("[keys]\nback = [\"hyper-x\"]\n", "unknown key"),
             ("[keys]\nback = [\"j\"]\n", "set for both down and back"),
             ("[keys]\nfly = [\"x\"]\n", "fly"),
+            ("[keys]\nnextlink = [\"x\"]\n", "one of quit, down, up"),
             ("colour = 1\n", "colour"),
             ("web_links = \"shout\"\n", "shout"),
             ("mermaid = \"chrome\"\n", "chrome"),

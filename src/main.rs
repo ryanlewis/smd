@@ -283,11 +283,18 @@ fn set_panic_hook(uploaded: images::Uploaded, mouse: bool) {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    exit_code(smd(args), &mut io::stderr())
+    let result = smd(args);
+    // A run that failed because a stop signal came ends by that signal, as
+    // one that did not fail does, and prints nothing: after SIGHUP the
+    // terminal is gone.
+    if let Some(signal) = app::stop_signal() {
+        app::raise(signal);
+    }
+    exit_code(result, &mut io::stderr())
 }
 
 fn smd(args: Args) -> Result<(), Failure> {
-    // Until the terminal is set up, SIGTERM, SIGHUP and Ctrl-C end smd at
+    // Until the terminal is set up, SIGTERM, SIGHUP and SIGINT end smd at
     // once; after, they end the loop below, so the terminal is restored.
     app::stop_on_signals();
     let config = loaded(config::Config::load())?;
@@ -314,8 +321,10 @@ fn smd(args: Args) -> Result<(), Failure> {
     };
     let vault = vault::Vault::for_file(&path);
     app::stop_later();
+    let probe_objects = images::Uploaded::default();
+    app::remove_on_stop(probe_objects.clone());
     // Asked before the terminal is set up, while nothing else reads its replies.
-    let probe = (!args.no_graphics).then(kitty::probe);
+    let probe = (!args.no_graphics).then(|| kitty::probe(&probe_objects));
     // A signal during the probe ends smd once the probe has put the terminal
     // back.
     if let Some(signal) = app::stop_signal() {

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
 
+use crate::images::Uploaded;
 use crate::theme::{self, Theme};
 use diacritics::DIACRITICS;
 
@@ -171,12 +172,17 @@ pub struct Probe {
 ///
 /// The shared memory query names a one-pixel object made here. The terminal
 /// removes it once read; it is removed here too, for a terminal that did not
-/// read it, such as one on the other end of ssh.
-pub fn probe() -> Probe {
+/// read it, such as one on the other end of ssh. It is noted in `objects`
+/// while it exists, so it can be removed if smd is stopped while stuck here.
+pub fn probe(objects: &Uploaded) -> Probe {
     let object = shm::create(&SHM_PIXEL).ok();
+    if let Some(name) = &object {
+        objects.set_object(name, true);
+    }
     let reply = query(object.as_deref()).unwrap_or_default();
     if let Some(name) = &object {
         shm::unlink(name);
+        objects.set_object(name, false);
     }
     Probe {
         cell: parse_cell_reply(&reply)
@@ -352,7 +358,7 @@ fn read_chunk(fd: libc::c_int, left: Duration) -> Option<Vec<u8>> {
 
 /// Whether the last system call failed because a signal interrupted it.
 #[cfg(unix)]
-fn interrupted() -> bool {
+pub fn interrupted() -> bool {
     io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
 }
 

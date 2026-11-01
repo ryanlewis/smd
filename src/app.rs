@@ -7,8 +7,8 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -1640,10 +1640,13 @@ pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<(
     result.and(deleted)
 }
 
-/// Set to SIGTERM or SIGHUP when one arrives, else 0. The run loop sees it
-/// and ends as if the reader had quit, so the terminal is restored and the
-/// images removed.
+/// Set to the first SIGTERM, SIGHUP or SIGINT that arrives, else 0. The run
+/// loop sees it and ends as if the reader had quit, so the terminal is
+/// restored and the images removed.
 static STOP: AtomicI32 = AtomicI32::new(0);
+
+/// How many stop signals have arrived since `stop_later`.
+static SIGNALS: AtomicUsize = AtomicUsize::new(0);
 
 /// The signal that asked smd to stop, if one did.
 pub fn stop_signal() -> Option<i32> {
@@ -1676,8 +1679,13 @@ static STDIN_HINT: AtomicBool = AtomicBool::new(false);
 /// makes sure smd ends (see `make_sure_smd_ends`). -1 when there is none.
 static WAKE: AtomicI32 = AtomicI32::new(-1);
 
-/// The shared memory objects to remove if smd is stuck when asked to stop.
-static OBJECTS: OnceLock<images::Uploaded> = OnceLock::new();
+/// The shared memory objects to remove if smd is stuck when asked to stop:
+/// the probe's and the images'.
+static OBJECTS: Mutex<Vec<images::Uploaded>> = Mutex::new(Vec::new());
+
+/// The signals that stop smd.
+#[cfg(unix)]
+const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
 
 /// How long the terminal may go without taking any output, after a stop
 /// signal, before smd is taken to be stuck writing to it and is ended.
@@ -1698,7 +1706,21 @@ pub fn stdin_hint(showing: bool) {
 /// Remove the objects `uploaded` holds if a stop signal cannot end the run
 /// loop, as when smd is stuck writing to a terminal that does not read.
 pub fn remove_on_stop(uploaded: images::Uploaded) {
-    let _ = OBJECTS.set(uploaded);
+    match OBJECTS.lock() {
+        Ok(mut objects) => objects.push(uploaded),
+        Err(poisoned) => poisoned.into_inner().push(uploaded),
+    }
+}
+
+/// Remove every object `remove_on_stop` was given.
+fn remove_objects() {
+    let objects = match OBJECTS.lock() {
+        Ok(objects) => objects,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for uploaded in objects.iter() {
+        uploaded.remove_objects();
+    }
 }
 
 /// Make SIGTERM and SIGHUP end smd cleanly, and Ctrl-C too while smd waits
@@ -1707,17 +1729,9 @@ pub fn remove_on_stop(uploaded: images::Uploaded) {
 /// after clearing the stdin hint if it shows.
 #[cfg(unix)]
 pub fn stop_on_signals() {
-    if let Some(read) = wake_pipe() {
-        let _ = std::thread::Builder::new()
-            .name("stop".into())
-            .spawn(move || make_sure_smd_ends(read));
-    }
-    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+    for signal in STOP_SIGNALS {
         if !ignored(signal) {
-            handle(
-                signal,
-                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
-            );
+            handle(signal, true);
         }
     }
 }
@@ -1725,14 +1739,22 @@ pub fn stop_on_signals() {
 #[cfg(not(unix))]
 pub fn stop_on_signals() {}
 
-/// From now on a stop signal ends the run loop rather than smd at once, and
-/// Ctrl-C is left to the terminal: it is a key while the terminal is raw.
+/// From now on a stop signal ends the run loop rather than smd at once. A
+/// second one has the thread in `make_sure_smd_ends` remove the shared
+/// memory objects and end smd without waiting, and a third ends smd with
+/// SIGKILL, in case even that is stuck. SIGINT is handled too: Ctrl-C is a
+/// key while the terminal is raw, so it comes only from `kill`.
 #[cfg(unix)]
 pub fn stop_later() {
-    if !ignored(libc::SIGINT) {
-        handle(libc::SIGINT, libc::SIG_DFL);
-    }
+    // Without the thread, a second signal ends smd at once, as the default.
+    let once = !start_stop_thread();
+    // Before the handlers change, so none of them raises a signal it handles.
     AT_ONCE.store(false, Ordering::Relaxed);
+    for signal in STOP_SIGNALS {
+        if !ignored(signal) {
+            handle(signal, once);
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -1761,7 +1783,13 @@ extern "C" fn on_signal(signal: libc::c_int) {
         unsafe { libc::raise(signal) };
         return;
     }
-    STOP.store(signal, Ordering::Relaxed);
+    // Before the count, so the thread woken by a second signal sees it.
+    let _ = STOP.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed);
+    if SIGNALS.fetch_add(1, Ordering::Relaxed) >= 2 {
+        // SAFETY: raise is async-signal safe, and SIGKILL cannot be handled.
+        unsafe { libc::raise(libc::SIGKILL) };
+        return;
+    }
     let wake = WAKE.load(Ordering::Relaxed);
     if wake >= 0 {
         // SAFETY: writes one byte from a local; the pipe does not block.
@@ -1781,32 +1809,36 @@ fn ignored(signal: libc::c_int) -> bool {
     }
 }
 
-/// Handle `signal` with `handler`, a function or `SIG_DFL`.
+/// Handle `signal` with `on_signal`. With `once`, the default action comes
+/// back as the handler runs, so a second signal ends smd at once.
 #[cfg(unix)]
-fn handle(signal: libc::c_int, handler: libc::sighandler_t) {
+fn handle(signal: libc::c_int, once: bool) {
     // SAFETY: a zeroed sigaction is valid; the handler is async-signal
     // safe. SA_RESTART keeps other system calls from failing with EINTR.
-    // SA_RESETHAND makes a second signal stop smd at once.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = handler;
-        action.sa_flags = libc::SA_RESTART | libc::SA_RESETHAND;
+        action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        if once {
+            action.sa_flags |= libc::SA_RESETHAND;
+        }
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(signal, &action, std::ptr::null_mut());
     }
 }
 
-/// A pipe for the stop signal to wake a thread with. Its write end, which
-/// never blocks, goes to `WAKE`; the read end is returned. Neither is passed
-/// on to child processes.
+/// Start the thread in `make_sure_smd_ends`, with a pipe for the stop
+/// signal to wake it with. The pipe's write end, which never blocks, goes
+/// to `WAKE`. Neither end is passed on to child processes: none are started
+/// before this. False when the pipe or the thread cannot be made.
 #[cfg(unix)]
-fn wake_pipe() -> Option<libc::c_int> {
+fn start_stop_thread() -> bool {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: pipe writes two descriptors into fds; fcntl only changes
     // flags on them.
     unsafe {
         if libc::pipe(fds.as_mut_ptr()) != 0 {
-            return None;
+            return false;
         }
         for fd in fds {
             libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
@@ -1814,72 +1846,126 @@ fn wake_pipe() -> Option<libc::c_int> {
         let flags = libc::fcntl(fds[1], libc::F_GETFL);
         libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
-    WAKE.store(fds[1], Ordering::Relaxed);
-    Some(fds[0])
+    let read = fds[0];
+    let started = std::thread::Builder::new()
+        .name("stop".into())
+        .spawn(move || make_sure_smd_ends(read))
+        .is_ok();
+    if started {
+        WAKE.store(fds[1], Ordering::Relaxed);
+    } else {
+        // SAFETY: both descriptors are ours and nothing else has them.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+    started
 }
 
 /// Wait on `read` for a stop signal, then end smd here if the terminal takes
-/// no output for `STOP_GRACE`: smd is then stuck writing to it. While the
-/// terminal takes output, even slowly as over ssh, smd is busy rather than
-/// stuck, as with a large document to lay out, and the run loop is left to
-/// end it and restore the terminal. Only the shared memory objects are
-/// removed, as the terminal cannot be written to. Their lock is never held
-/// across a write, so this does not wait on a stuck thread.
+/// no output for `STOP_GRACE`, as smd is then stuck writing to it, or at
+/// once on a second signal. While the terminal takes output, even slowly as
+/// over ssh, smd is busy rather than stuck, as with a large document to lay
+/// out, and the run loop is left to end it and restore the terminal. Only
+/// the shared memory objects are removed, as the terminal cannot be written
+/// to. Their lock is never held across a write, so this does not wait on a
+/// stuck thread.
 #[cfg(unix)]
 fn make_sure_smd_ends(read: libc::c_int) {
-    let mut byte = 0u8;
     loop {
-        // SAFETY: reads at most one byte into a local.
-        let n = unsafe { libc::read(read, (&raw mut byte).cast(), 1) };
-        if n == 1 {
-            break;
+        match woken(read, None, None) {
+            Ok(Woken::Signal) => break,
+            Err(_) if kitty::interrupted() => {}
+            _ => return,
         }
-        if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return;
     }
     loop {
-        match takes_output(libc::STDOUT_FILENO, STOP_GRACE) {
-            Ok(true) => std::thread::sleep(STOP_RECHECK),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+        match woken(read, Some(libc::STDOUT_FILENO), Some(STOP_GRACE)) {
+            Ok(Woken::Output) => {
+                if let Ok(Woken::Signal) = woken(read, None, Some(STOP_RECHECK)) {
+                    break;
+                }
+            }
+            Err(_) if kitty::interrupted() => {}
             _ => break,
         }
     }
-    if let Some(objects) = OBJECTS.get() {
-        objects.remove_objects();
-    }
+    remove_objects();
     if let Some(signal) = stop_signal() {
         raise(signal);
     }
 }
 
-/// Whether a write to `fd` would go through within `wait` rather than wait
-/// longer. Asked with select, as poll on macOS does not work with terminals.
+/// What `woken` saw first.
 #[cfg(unix)]
-fn takes_output(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
-    let mut wait = libc::timeval {
+#[derive(Debug, PartialEq)]
+enum Woken {
+    /// A stop signal wrote to the pipe; its byte has been read.
+    Signal,
+    /// A write to the descriptor waited on would go through.
+    Output,
+    /// Neither, in the time given.
+    Neither,
+}
+
+/// Wait up to `wait`, or with none for ever, for a byte on `read` or, when
+/// given, for a write to `out` to go through. Asked with select, as poll on
+/// macOS does not work with terminals.
+#[cfg(unix)]
+fn woken(read: libc::c_int, out: Option<libc::c_int>, wait: Option<Duration>) -> io::Result<Woken> {
+    let mut timeval = wait.map(|wait| libc::timeval {
         tv_sec: wait.as_secs() as libc::time_t,
         tv_usec: wait.subsec_micros() as libc::suseconds_t,
-    };
-    // SAFETY: a zeroed fd_set is valid and fd is below FD_SETSIZE; select
-    // only looks at the descriptor and writes to the set and the timeval.
-    let ready = unsafe {
-        let mut set: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut set);
-        libc::FD_SET(fd, &mut set);
-        libc::select(
-            fd + 1,
+    });
+    let timeout = timeval
+        .as_mut()
+        .map_or(std::ptr::null_mut(), |t| t as *mut libc::timeval);
+    // SAFETY: zeroed fd_sets are valid and both descriptors are below
+    // FD_SETSIZE; select only looks at them and writes to the sets and the
+    // timeval.
+    let (readable, writable) = unsafe {
+        let mut reads: libc::fd_set = std::mem::zeroed();
+        let mut writes: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut reads);
+        libc::FD_ZERO(&mut writes);
+        libc::FD_SET(read, &mut reads);
+        let mut top = read;
+        if let Some(out) = out {
+            libc::FD_SET(out, &mut writes);
+            top = top.max(out);
+        }
+        let ready = libc::select(
+            top + 1,
+            &mut reads,
+            &mut writes,
             std::ptr::null_mut(),
-            &mut set,
-            std::ptr::null_mut(),
-            &mut wait,
+            timeout,
+        );
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        (
+            libc::FD_ISSET(read, &reads),
+            out.is_some_and(|out| libc::FD_ISSET(out, &writes)),
         )
     };
-    if ready < 0 {
-        return Err(io::Error::last_os_error());
+    if readable {
+        let mut byte = 0u8;
+        // SAFETY: reads at most one byte into a local.
+        let n = unsafe { libc::read(read, (&raw mut byte).cast(), 1) };
+        return match n {
+            1 => Ok(Woken::Signal),
+            // The write end is gone, so no signal can come.
+            0 => Ok(Woken::Neither),
+            _ => Err(io::Error::last_os_error()),
+        };
     }
-    Ok(ready > 0)
+    Ok(if writable {
+        Woken::Output
+    } else {
+        Woken::Neither
+    })
 }
 
 /// Where the run loop gets the terminal's events and the time, so a test
@@ -4325,22 +4411,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_is_taken_until_the_reader_stops_reading() {
-        // A pipe nobody reads stands in for a terminal that stopped reading.
-        let mut fds = [0; 2];
-        let wait = Duration::from_millis(20);
-        // SAFETY: pipe writes two descriptors into fds; fcntl only sets a
-        // flag; the writes are from a local; both descriptors are ours and
-        // closed once.
+        // A pipe nobody reads stands in for a terminal that stopped reading,
+        // and another for the stop signal's.
+        let mut out = [0; 2];
+        let mut wake = [0; 2];
+        let wait = Some(Duration::from_millis(20));
+        // SAFETY: pipe writes two descriptors into each array; fcntl only
+        // sets a flag; the writes are from locals; the descriptors are ours
+        // and closed once.
         unsafe {
-            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
-            let flags = libc::fcntl(fds[1], libc::F_GETFL);
-            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
-            assert!(takes_output(fds[1], wait).unwrap());
+            assert_eq!(libc::pipe(out.as_mut_ptr()), 0);
+            assert_eq!(libc::pipe(wake.as_mut_ptr()), 0);
+            let flags = libc::fcntl(out[1], libc::F_GETFL);
+            libc::fcntl(out[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            assert_eq!(woken(wake[0], Some(out[1]), wait).unwrap(), Woken::Output);
             let chunk = [0u8; 4096];
-            while libc::write(fds[1], chunk.as_ptr().cast(), chunk.len()) > 0 {}
-            assert!(!takes_output(fds[1], wait).unwrap());
-            libc::close(fds[0]);
-            libc::close(fds[1]);
+            while libc::write(out[1], chunk.as_ptr().cast(), chunk.len()) > 0 {}
+            assert_eq!(woken(wake[0], Some(out[1]), wait).unwrap(), Woken::Neither);
+            assert_eq!(woken(wake[0], None, wait).unwrap(), Woken::Neither);
+            // A signal wakes it, even while output is taken, and only once.
+            libc::read(out[0], [0u8; 4096].as_mut_ptr().cast(), 4096);
+            libc::write(wake[1], [1u8].as_ptr().cast(), 1);
+            assert_eq!(woken(wake[0], Some(out[1]), wait).unwrap(), Woken::Signal);
+            assert_eq!(woken(wake[0], None, wait).unwrap(), Woken::Neither);
+            // With the write end gone, no signal can come.
+            libc::close(wake[1]);
+            assert_eq!(woken(wake[0], None, None).unwrap(), Woken::Neither);
+            for fd in [out[0], out[1], wake[0]] {
+                libc::close(fd);
+            }
         }
     }
 }

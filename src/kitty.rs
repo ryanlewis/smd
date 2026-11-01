@@ -348,11 +348,26 @@ fn read_chunk(fd: libc::c_int, left: Duration) -> Option<Vec<u8>> {
 
 /// Whether `fd` has input waiting, or has ended, within `wait`. Asked with
 /// select, as poll on macOS does not work with terminals, and the replies
-/// come on /dev/tty when the markdown is piped in.
+/// come on /dev/tty when the markdown is piped in. A descriptor too high for
+/// select is asked with poll.
 #[cfg(unix)]
 pub(crate) fn readable(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
-    if !(0..libc::FD_SETSIZE as libc::c_int).contains(&fd) {
+    if fd < 0 {
         return Err(io::ErrorKind::InvalidInput.into());
+    }
+    if fd >= libc::FD_SETSIZE as libc::c_int {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = wait.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(ready > 0);
     }
     let mut wait = libc::timeval {
         tv_sec: wait.as_secs() as libc::time_t,
@@ -825,6 +840,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn read_chunk_reads_a_descriptor_too_high_for_select() {
+        // A parent that leaves many descriptors open can give /dev/tty one at
+        // or above FD_SETSIZE, which select cannot wait on.
+        let high = libc::FD_SETSIZE as libc::c_int + 10;
+        // SAFETY: a zeroed rlimit is valid; getrlimit and setrlimit only
+        // read and write it.
+        unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            if limit.rlim_cur <= high as libc::rlim_t {
+                limit.rlim_cur = limit.rlim_max.min(high as libc::rlim_t + 1);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+        let pipe = Pipe::new(b"\x1b[?62c", true);
+        // SAFETY: duplicates an open descriptor onto an unused number.
+        if unsafe { libc::dup2(pipe.read, high) } != high {
+            return; // The limit cannot be raised here.
+        }
+        let chunk = read_chunk(high, REPLY_TIMEOUT);
+        // SAFETY: high was opened just above and is closed once.
+        unsafe { libc::close(high) };
+        assert_eq!(chunk.as_deref(), Some(&b"\x1b[?62c"[..]));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn read_chunk_gives_up_when_nothing_comes() {
         let pipe = Pipe::new(b"", false);
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
@@ -889,11 +931,14 @@ mod tests {
             &mut Vec::new(),
             scripted(&chunks, &mut waits),
             LONG_GRACE,
-            LONG_GRACE,
+            LONG_GRACE / 2,
             GRAPHICS_GRACE,
             None,
         );
         assert_eq!(reply, b"\x1b[6;16;8t\x1b[?62c");
+        // DA1 was read in the late wait, and every reply was read.
+        assert!(waits[2] <= LONG_GRACE / 2);
+        assert!(waits.len() <= chunks.len() + 1);
         // After DA1, the wait for a graphics reply is the real grace.
         assert!(waits[chunks.len()..].iter().all(|&w| w <= GRAPHICS_GRACE));
     }
@@ -969,7 +1014,8 @@ mod tests {
             None,
         );
         assert_eq!(reply, b"\x1b[?62c");
-        // Once DA1 is in, no read is given longer than the grace.
+        // Once DA1 is in, one read at most, given no longer than the grace.
+        assert!(waits.len() <= chunks.len() + 1);
         assert!(waits[chunks.len()..].iter().all(|&w| w <= GRAPHICS_GRACE));
     }
 

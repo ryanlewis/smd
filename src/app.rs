@@ -2117,9 +2117,12 @@ mod tests {
         // The frame as drawn, with the cells the terminal is not sent.
         let frame = terminal.draw(|f| v.draw_in(f, f.area(), href)).unwrap();
         let buf = frame.buffer;
+        let erase = "\x1b[1B\x1b[2X\x1b[A\x1b[2X";
         assert_eq!(
             buf[(20, 0)].symbol(),
-            "\x1b]8;id=smd0;https://e.com\x1b\\\x1b]66;s=2:w=1;A\x1b\\\x1b]8;;\x1b\\"
+            format!(
+                "\x1b]8;id=smd0;https://e.com\x1b\\{erase}\x1b]66;s=2:w=1;A\x1b\\\x1b]8;;\x1b\\"
+            )
         );
         let two = NonZeroU16::new(2).unwrap();
         assert_eq!(buf[(20, 0)].diff_option, CellDiffOption::ForcedWidth(two));

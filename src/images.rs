@@ -434,6 +434,11 @@ pub fn wanted_in(blocks: &[Block], base: &Path, out: &mut Vec<(Key, Job)>) {
                     wanted_in(&item.blocks, base, out);
                 }
             }
+            BlockKind::Definition { definitions, .. } => {
+                for details in definitions {
+                    wanted_in(details, base, out);
+                }
+            }
             _ => {}
         }
     }

@@ -18,7 +18,7 @@
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
-//! next_link = ["tab", "n"]
+//! next_link = ["tab", "o"]
 //! back = ["backspace", "h"]
 //! ```
 
@@ -51,6 +51,9 @@ pub enum Action {
     Toggle,
     Back,
     Forward,
+    Search,
+    NextMatch,
+    PrevMatch,
 }
 
 impl Action {
@@ -72,6 +75,9 @@ impl Action {
             Action::Toggle => &["x"],
             Action::Back => &["backspace", "H", "alt-left"],
             Action::Forward => &["L", "alt-right"],
+            Action::Search => &["/"],
+            Action::NextMatch => &["n"],
+            Action::PrevMatch => &["N"],
         }
     }
 
@@ -84,7 +90,7 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 15] = [
+    const ALL: [Action; 18] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -100,6 +106,9 @@ impl Action {
         Action::Toggle,
         Action::Back,
         Action::Forward,
+        Action::Search,
+        Action::NextMatch,
+        Action::PrevMatch,
     ];
 }
 

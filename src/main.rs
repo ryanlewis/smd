@@ -315,7 +315,15 @@ fn smd(args: Args) -> Result<(), Failure> {
     }
     let result = app::run(&mut terminal, browser);
     set_mouse(&mut io::stdout(), mouse, false);
-    ratatui::restore();
+    match app::stop_signal() {
+        // After SIGHUP the terminal is gone and an error about it cannot be
+        // printed, so none is. smd then ends by the signal it was sent.
+        Some(signal) => {
+            let _ = ratatui::try_restore();
+            app::raise(signal);
+        }
+        None => ratatui::restore(),
+    }
     finished(result)
 }
 

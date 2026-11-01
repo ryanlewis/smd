@@ -54,6 +54,7 @@ pub enum Action {
     Search,
     NextMatch,
     PrevMatch,
+    Reload,
 }
 
 impl Action {
@@ -78,6 +79,7 @@ impl Action {
             Action::Search => &["/"],
             Action::NextMatch => &["n"],
             Action::PrevMatch => &["N"],
+            Action::Reload => &["r"],
         }
     }
 
@@ -90,7 +92,7 @@ impl Action {
             .collect()
     }
 
-    const ALL: [Action; 18] = [
+    const ALL: [Action; 19] = [
         Action::Quit,
         Action::Down,
         Action::Up,
@@ -109,6 +111,7 @@ impl Action {
         Action::Search,
         Action::NextMatch,
         Action::PrevMatch,
+        Action::Reload,
     ];
 }
 
@@ -298,7 +301,7 @@ impl Config {
         }
     }
 
-    fn from_str(text: &str) -> Result<Config, String> {
+    pub(crate) fn from_str(text: &str) -> Result<Config, String> {
         let file: File = toml::from_str(text).map_err(|e| e.message().to_string())?;
         let mut keys = HashMap::new();
         // The search keys came after configs were written that may use

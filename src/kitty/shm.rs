@@ -149,8 +149,15 @@ mod tests {
         assert!(fd >= 0);
         // SAFETY: fd was just opened and nothing else owns it.
         let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-        assert_eq!(file.metadata().unwrap().len(), data.len() as u64);
-        // SAFETY: maps the whole object to read, unmapped right after.
+        let len = file.metadata().unwrap().len();
+        // macOS rounds the size up to a whole page.
+        if cfg!(target_os = "linux") {
+            assert_eq!(len, data.len() as u64);
+        } else {
+            assert!(len >= data.len() as u64, "{len}");
+        }
+        // SAFETY: maps the first data.len() bytes to read, unmapped right
+        // after.
         let read = unsafe {
             use std::os::fd::AsRawFd;
             let ptr = libc::mmap(

@@ -208,12 +208,12 @@ Diagram labels and text in SVG images use Trebuchet MS or Verdana on macOS, and 
 ## Usage
 
 ```sh
-smd [--no-graphics] [--remote-images | --no-remote-images] [FILE]
+smd [--no-graphics] [--remote-images | --no-remote-images] [--max-width COLS] [FILE]
 ```
 
-With no file, smd opens the `home` note from the config, unless markdown is piped in. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
+With no file, smd opens the `home` note from the config, unless markdown is piped in. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says, and `--max-width` sets [`max_width`](#config) for one run. `smd --help` lists the options and the main keys.
 
-smd also reads markdown piped into it, or from stdin when the file is `-`:
+smd also reads markdown piped into it, or from stdin when the file is `-` (for a file named `-`, write `./-`):
 
 ```sh
 gh pr view --json body -q .body | smd
@@ -274,7 +274,7 @@ Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]`
 
 An embedded note, `![[Note]]`, on a line of its own, shows that note's content in a frame, under the note's name, which links to it. `![[Note#Heading]]` shows only that heading's section, and `![[Note#^block]]` shows the whole note. The embedded note's frontmatter is left out. Links inside an embed lead where they would from the embedded note, and its tasks cannot be ticked. An embed in the middle of a sentence, one that cannot be found, a loop, or one nested more than three deep is shown as a link.
 
-A quote that starts with a callout or GitHub alert type, such as `> [!note]` or `> [!WARNING] Title`, is drawn as a callout: a coloured bar, a title line with a small mark, then the body. An unknown type is drawn as a note, and with no title the type's name is used. Put `-` after the type, `> [!faq]-`, to start it folded shut, or `+` to start it open; then select the title with Tab and press Enter, or click it, to fold or unfold it. An HTML `<details>` block folds the same way, with its `<summary>` as the title, and starts shut unless it has the `open` attribute.
+A quote that starts with a callout or GitHub alert type, such as `> [!note]` or `> [!WARNING] Title`, is drawn as a callout: a coloured bar, a title line with a small mark, then the body. An unknown type is drawn as a note, and with no title the type's name is used. Put `-` after the type, `> [!faq]-`, to start it folded shut, or `+` to start it open; then select the title with Tab and press Enter, or click it, to fold or unfold it. An HTML `<details>` block folds the same way, with its `<summary>` as the title, and starts shut unless it has the `open` attribute. In an embedded note, these are always shown open.
 
 Frontmatter at the top of a note is shown as a small dimmed panel, one `key  value` row per top-level key. Lists are joined with commas, and links in a value can be followed. Frontmatter that is not simple `key: value` lines, and TOML `+++` frontmatter, is shown as its raw lines, dimmed.
 
@@ -326,6 +326,7 @@ mermaid = "builtin"
 # The widest the text gets, in columns, so lines stay easy to read in a
 # wide window. Without it (the default), the text fills the window.
 # Code blocks, tables, images and headings keep to it too.
+# `--max-width` overrides it for one run.
 max_width = 100
 
 # Where the text sits when the window is wider than max_width: "centre"

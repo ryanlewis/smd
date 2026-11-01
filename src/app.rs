@@ -1082,6 +1082,11 @@ impl Browser {
 
     /// Read the file again by hand, as the watcher does when it changes.
     fn reload(&mut self) {
+        // The path of a note read from stdin is made up.
+        if self.piped {
+            self.say("nothing to reload".into());
+            return;
+        }
         match std::fs::read_to_string(&self.path) {
             Ok(source) => {
                 self.view.replace(parse(&self.vault, &source, &self.path));
@@ -2128,6 +2133,18 @@ mod tests {
         assert_eq!(b.path, path);
         assert!(b.piped && !b.view.tasks);
         assert_eq!(b.view.doc.source, source);
+    }
+
+    #[test]
+    fn r_on_a_note_read_from_stdin_says_there_is_nothing_to_reload() {
+        let (b, dir) = browser("reload-piped", &[("stdin", "piped\n")]);
+        let mut b = b.piped();
+        // A file of the same name is not read in its place.
+        std::fs::write(&b.path, "on disk\n").unwrap();
+        press_all(&mut b, "r");
+        assert_eq!(top(&b.view), "piped");
+        assert!(status_row(&mut b).starts_with("nothing to reload"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -284,77 +284,69 @@ fn contents(
     ctx: &mut Ctx,
 ) {
     let graphics = ctx.images.graphics();
-    let out = &mut ctx.layout.lines;
+    let layout = &mut ctx.layout;
     match &block.kind {
         BlockKind::Paragraph(content) => {
-            let joins = &mut ctx.layout.joins;
-            let links = wrap(content, Style::default(), width, first, rest, out, joins);
-            ctx.layout.links.extend(links);
+            let links = wrap(content, Style::default(), width, first, rest, layout);
+            layout.links.extend(links);
         }
         BlockKind::Heading { level, content } => {
             let prefix = spans_width(first).max(spans_width(rest));
             let scale = heading::scale(*level, width.saturating_sub(prefix));
             if scale > 1 {
-                sized_heading(content, *level, scale, width, first, rest, &mut ctx.layout);
+                sized_heading(content, *level, scale, width, first, rest, layout);
             } else {
-                let joins = &mut ctx.layout.joins;
                 let style = heading_style(*level);
-                let links = wrap(content, style, width, first, rest, out, joins);
-                ctx.layout.links.extend(links);
+                let links = wrap(content, style, width, first, rest, layout);
+                layout.links.extend(links);
             }
         }
         BlockKind::Code { lang, code } => {
             let colours = lang
                 .as_deref()
                 .and_then(|lang| highlight::highlight(ctx.syntaxes, lang, code));
-            let (colours, joins) = (colours.as_deref(), &mut ctx.layout.joins);
+            let colours = colours.as_deref();
             match ctx.panel {
-                Some(bg) => code_panel(code, colours, bg, width, first, rest, out, joins),
-                None => code_indented(code, colours, width, first, rest, out, joins),
+                Some(bg) => code_panel(code, colours, bg, width, first, rest, layout),
+                None => code_indented(code, colours, width, first, rest, layout),
             }
         }
         BlockKind::Figure {
             kind: FigureKind::Table,
             source,
         } => {
-            let links = table(source, width, first, rest, out);
-            ctx.layout.links.extend(links);
+            let links = table(source, width, first, rest, &mut layout.lines);
+            layout.links.extend(links);
         }
         // Without graphics an image block is never drawn, so it shows its
         // source as code.
         BlockKind::Figure { source, .. } if !graphics => {
-            let joins = &mut ctx.layout.joins;
-            preformatted(source, CODE, width, first, rest, out, joins);
+            preformatted(source, CODE, width, first, rest, layout);
         }
         BlockKind::Image { src, alt, .. } if !graphics => {
             let text = image_source(ctx.source, block, src, alt);
-            let joins = &mut ctx.layout.joins;
-            preformatted(&text, CODE, width, first, rest, out, joins);
+            preformatted(&text, CODE, width, first, rest, layout);
         }
         BlockKind::Figure { source, .. } => {
             let error = images::key(block).and_then(|key| ctx.images.error(&key));
-            let joins = &mut ctx.layout.joins;
-            figure(source, error, width, first, rest, out, joins);
+            figure(source, error, width, first, rest, layout);
         }
         BlockKind::Frontmatter(front) => {
-            let joins = &mut ctx.layout.joins;
-            let links = frontmatter(front, width, first, rest, out, joins);
-            ctx.layout.links.extend(links);
+            let links = frontmatter(front, width, first, rest, layout);
+            layout.links.extend(links);
         }
         BlockKind::Html(html) => {
             let dim = Style::new().add_modifier(Modifier::DIM);
-            let joins = &mut ctx.layout.joins;
-            preformatted(html, dim, width, first, rest, out, joins);
+            preformatted(html, dim, width, first, rest, layout);
         }
         BlockKind::Image { alt, .. } => {
             let text = note(format!("[image: {alt}]"));
-            let joins = &mut ctx.layout.joins;
-            wrap(&[text], Style::default(), width, first, rest, out, joins);
+            wrap(&[text], Style::default(), width, first, rest, layout);
         }
         BlockKind::Rule => {
             let avail = width.saturating_sub(spans_width(first)).max(1);
             let rule = Span::styled("─".repeat(avail), Style::new().add_modifier(Modifier::DIM));
-            emit(first, vec![rule], out);
+            emit(first, vec![rule], &mut layout.lines);
         }
         BlockKind::Quote(inner) => {
             let bar = Span::styled("│ ", Style::new().fg(Color::DarkGray));
@@ -409,12 +401,12 @@ fn sized_heading(
     let s = usize::from(scale);
     let prefix = spans_width(first).max(spans_width(rest));
     let avail = (width.saturating_sub(prefix) / s).max(1);
-    let (mut wrapped, mut joins) = (Vec::new(), Vec::new());
+    let mut wrapped = Layout::default();
     let style = heading_style(level);
-    let links = wrap(content, style, avail, &[], &[], &mut wrapped, &mut joins);
+    let links = wrap(content, style, avail, &[], &[], &mut wrapped);
     let left = |i: usize| spans_width(if i == 0 { first } else { rest });
     let mut rows = Vec::new();
-    for (i, line) in wrapped.into_iter().enumerate() {
+    for (i, line) in wrapped.lines.into_iter().enumerate() {
         let row = layout.lines.len();
         rows.push(row);
         let mut col = left(i);
@@ -449,7 +441,7 @@ fn sized_heading(
         }
         layout.sized.push(heading::SizedLine { row, scale, cells });
     }
-    layout.joins.extend(joins.into_iter().map(|j| Join {
+    layout.joins.extend(wrapped.joins.into_iter().map(|j| Join {
         row: rows[j.row],
         col: left(j.row) as u16,
         ..j
@@ -501,15 +493,14 @@ fn frontmatter(
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
-    out: &mut Vec<Line<'static>>,
-    joins: &mut Vec<Join>,
+    layout: &mut Layout,
 ) -> Vec<LinkSpot> {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let mut links = Vec::new();
     let props = match &front.properties {
         Some(props) if !props.is_empty() => props,
         _ => {
-            preformatted(&front.raw, dim, width, first, rest, out, joins);
+            preformatted(&front.raw, dim, width, first, rest, layout);
             return links;
         }
     };
@@ -521,7 +512,7 @@ fn frontmatter(
     for (i, (key, value)) in props.iter().enumerate() {
         let prefix = if i == 0 { first } else { rest };
         let key_first = if key.width() > column {
-            preformatted(key, dim, width, prefix, rest, out, joins);
+            preformatted(key, dim, width, prefix, rest, layout);
             under.clone()
         } else {
             let pad = column - key.width() + 2;
@@ -531,10 +522,10 @@ fn frontmatter(
             )
         };
         if value.contains('\n') {
-            preformatted(value, dim, width, &key_first, &under, out, joins);
+            preformatted(value, dim, width, &key_first, &under, layout);
         } else {
             let content = doc::value_inlines(value);
-            links.extend(wrap(&content, dim, width, &key_first, &under, out, joins));
+            links.extend(wrap(&content, dim, width, &key_first, &under, layout));
         }
     }
     links
@@ -601,8 +592,7 @@ fn fold_title(
     let mut content = vec![note(lead)];
     content.extend_from_slice(title);
     let row = ctx.layout.lines.len();
-    let (out, joins) = (&mut ctx.layout.lines, &mut ctx.layout.joins);
-    let links = wrap(&content, style, width, first, rest, out, joins);
+    let links = wrap(&content, style, width, first, rest, &mut ctx.layout);
     ctx.layout.links.extend(links);
     // A block in an embedded note is not a stop, as its start is in the
     // other note.
@@ -665,8 +655,7 @@ fn embed(
     };
     let top = with(first, Span::styled("╭─ ", dim));
     let under = with(rest, Span::styled("│  ", dim));
-    let (out, joins) = (&mut ctx.layout.lines, &mut ctx.layout.joins);
-    let links = wrap(&[title], dim, width, &top, &under, out, joins);
+    let links = wrap(&[title], dim, width, &top, &under, &mut ctx.layout);
     ctx.layout.links.extend(links);
     let bar = with(rest, Span::styled("│ ", dim));
     let mut inner = Ctx {
@@ -703,8 +692,7 @@ fn definition(
     if term.is_empty() {
         lead = &after_first;
     } else {
-        let (out, joins) = (&mut ctx.layout.lines, &mut ctx.layout.joins);
-        let links = wrap(term, bold, width, first, rest, out, joins);
+        let links = wrap(term, bold, width, first, rest, &mut ctx.layout);
         ctx.layout.links.extend(links);
     }
     for (i, details) in definitions.iter().enumerate() {
@@ -736,16 +724,14 @@ fn code_indented(
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
-    out: &mut Vec<Line<'static>>,
-    joins: &mut Vec<Join>,
+    layout: &mut Layout,
 ) {
     let indent = Span::raw("  ");
     let first = with(first, indent.clone());
     let rest = with(rest, indent);
-    let mut lines = Lines::new(width, &first, &rest, out);
+    let mut lines = Lines::new(width, &first, &rest, layout);
     lines.code(code, colours, Style::new());
     lines.finish_last();
-    joins.append(&mut lines.edges);
 }
 
 /// A table drawn as text in the width its prefix leaves. Returns where the
@@ -793,8 +779,7 @@ fn figure(
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
-    out: &mut Vec<Line<'static>>,
-    joins: &mut Vec<Join>,
+    layout: &mut Layout,
 ) {
     let first = match error {
         Some(error) => {
@@ -805,8 +790,7 @@ fn figure(
                 width,
                 first,
                 rest,
-                out,
-                joins,
+                layout,
             );
             rest
         }
@@ -818,8 +802,7 @@ fn figure(
         width,
         first,
         rest,
-        out,
-        joins,
+        layout,
     );
 }
 
@@ -1095,16 +1078,15 @@ pub(crate) fn breaks_at(c: char) -> bool {
 }
 
 /// Fill lines greedily with inline content, breaking at spaces, and put
-/// each line that carries on the one before in `joins`. Returns where the
-/// links in it landed.
+/// each line that carries on the one before in the layout's joins. Returns
+/// where the links in it landed.
 fn wrap(
     content: &[Inline],
     base: Style,
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
-    out: &mut Vec<Line<'static>>,
-    joins: &mut Vec<Join>,
+    layout: &mut Layout,
 ) -> Vec<LinkSpot> {
     let (units, links) = units(content, base);
     let mut spots: Vec<LinkSpot> = links
@@ -1114,7 +1096,7 @@ fn wrap(
             cells: Vec::new(),
         })
         .collect();
-    let mut lines = Lines::new(width, first, rest, out);
+    let mut lines = Lines::new(width, first, rest, layout);
     // The space before the next word, held back until it is known whether
     // the word fits on the line after it.
     let mut space: Option<(Style, Option<usize>)> = None;
@@ -1129,7 +1111,7 @@ fn wrap(
                     space = Some((style, link));
                 }
             }
-            Unit::Word(segments) => lines.word(&segments, space.take(), &mut spots, joins),
+            Unit::Word(segments) => lines.word(&segments, space.take(), &mut spots),
         }
     }
     lines.finish_last();
@@ -1137,26 +1119,24 @@ fn wrap(
 }
 
 /// Text shown as is, broken at the edge of the view rather than reflowed.
-/// Each line that carries on one broken at the edge goes in `joins`.
+/// Each line that carries on one broken at the edge goes in the layout's
+/// joins.
 fn preformatted(
     text: &str,
     style: Style,
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
-    out: &mut Vec<Line<'static>>,
-    joins: &mut Vec<Join>,
+    layout: &mut Layout,
 ) {
-    let mut lines = Lines::new(width, first, rest, out);
+    let mut lines = Lines::new(width, first, rest, layout);
     lines.preformatted(text, style);
     lines.finish_last();
-    joins.append(&mut lines.edges);
 }
 
 /// Code on a panel of colour `bg` reaching to the right edge, with a blank
 /// panel row above and below. There is no space inside the panel's left edge,
 /// so copied code has no added indent.
-#[allow(clippy::too_many_arguments)]
 fn code_panel(
     code: &str,
     colours: Option<&[Segments]>,
@@ -1164,16 +1144,14 @@ fn code_panel(
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
-    out: &mut Vec<Line<'static>>,
-    joins: &mut Vec<Join>,
+    layout: &mut Layout,
 ) {
-    let mut lines = Lines::new(width, first, rest, out);
+    let mut lines = Lines::new(width, first, rest, layout);
     lines.pad = Some(Style::new().bg(bg));
     lines.finish();
     lines.code(code, colours, Style::new().bg(bg));
     lines.finish();
     lines.finish();
-    joins.append(&mut lines.edges);
 }
 
 /// `text` with its tabs turned to spaces, where it starts at column `col`,
@@ -1204,8 +1182,8 @@ struct Lines<'a> {
     emitted: usize,
     /// When set, each line is filled to the edge with spaces in this style.
     pad: Option<Style>,
-    /// Each line that carries on one `push_breaking` broke at the edge.
-    edges: Vec<Join>,
+    /// Each line that carries on the text of the one before.
+    joins: &'a mut Vec<Join>,
 }
 
 impl<'a> Lines<'a> {
@@ -1213,18 +1191,18 @@ impl<'a> Lines<'a> {
         width: usize,
         first: &'a [Span<'static>],
         rest: &'a [Span<'static>],
-        out: &'a mut Vec<Line<'static>>,
+        layout: &'a mut Layout,
     ) -> Self {
         Lines {
             width,
             first,
             rest,
-            out,
+            out: &mut layout.lines,
             current: Vec::new(),
             used: 0,
             emitted: 0,
             pad: None,
-            edges: Vec::new(),
+            joins: &mut layout.joins,
         }
     }
 
@@ -1267,19 +1245,18 @@ impl<'a> Lines<'a> {
 
     /// Push a word, after `space` when it fits on the line after it and on a
     /// new line when not. A word longer than a whole line is broken anywhere.
-    /// Each new line it starts goes in `joins`.
+    /// Each new line it starts is a join.
     fn word(
         &mut self,
         segments: &[Segment],
         space: Option<(Style, Option<usize>)>,
         spots: &mut [LinkSpot],
-        joins: &mut Vec<Join>,
     ) {
         let width: usize = segments.iter().map(|(s, ..)| s.width()).sum();
         if let Some((style, link)) = space {
             if self.used + 1 + width > self.avail() {
                 self.finish();
-                joins.push(self.join(true));
+                self.joins.push(self.join(true));
             } else {
                 self.push_link(" ", style, link, spots);
             }
@@ -1289,7 +1266,7 @@ impl<'a> Lines<'a> {
             if breaking {
                 for piece in clusters(s) {
                     if self.break_before(piece.width()) {
-                        joins.push(self.join(false));
+                        self.joins.push(self.join(false));
                     }
                     self.push_link(piece, *style, *link, spots);
                 }
@@ -1327,7 +1304,7 @@ impl<'a> Lines<'a> {
                 .map(|_| (spans_width(self.prefix()) + self.used) as u16);
             if self.break_before(piece.width()) {
                 let join = self.join(false);
-                self.edges.push(Join { end, ..join });
+                self.joins.push(Join { end, ..join });
             }
             self.push(piece, style);
         }

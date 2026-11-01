@@ -315,6 +315,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "filedescriptor",
  "mio",
  "parking_lot",
  "rustix",
@@ -603,6 +604,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "filedescriptor"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e40758ed24c9b2eeb76c35fb0aebc66c626084edd827e07e1552279814c6682d"
+dependencies = [
+ "libc",
+ "thiserror 1.0.69",
+ "winapi",
 ]
 
 [[package]]
@@ -959,7 +971,7 @@ checksum = "72f14c90e40a6133f4805b83542a7ed7364f56070b447f56e7f4e90297122209"
 dependencies = [
  "hashbrown",
  "portable-atomic",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1060,7 +1072,7 @@ dependencies = [
  "mime",
  "precomputed-hash",
  "selectors",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1081,7 +1093,7 @@ dependencies = [
  "indexmap",
  "libm",
  "rustc-hash",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1103,7 +1115,7 @@ dependencies = [
  "merman-export",
  "merman-render",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1116,7 +1128,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1130,7 +1142,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.21",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -1153,7 +1165,7 @@ dependencies = [
  "ryu-js",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.21",
  "unicode-general-category",
  "unicode-segmentation",
  "unicode-width",
@@ -1186,7 +1198,7 @@ dependencies = [
  "rustybuzz",
  "sha2",
  "svgtypes",
- "thiserror",
+ "thiserror 2.0.21",
  "tiny-skia 0.12.0",
  "ttf-parser",
  "unicase",
@@ -1218,7 +1230,7 @@ dependencies = [
  "serde",
  "serde_json",
  "svgtypes",
- "thiserror",
+ "thiserror 2.0.21",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -1628,7 +1640,7 @@ dependencies = [
  "palette",
  "serde",
  "strum",
- "thiserror",
+ "thiserror 2.0.21",
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width",
@@ -2090,6 +2102,7 @@ version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "clap",
+ "crossterm",
  "emojis",
  "gif",
  "imagesize",
@@ -2221,8 +2234,17 @@ dependencies = [
  "regex-syntax",
  "serde",
  "serde_derive",
- "thiserror",
+ "thiserror 2.0.21",
  "walkdir",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
 ]
 
 [[package]]
@@ -2231,7 +2253,18 @@ version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.21",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

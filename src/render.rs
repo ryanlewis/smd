@@ -589,6 +589,9 @@ fn fold_title(
     rest: &[Span<'static>],
     ctx: &mut Ctx,
 ) -> bool {
+    // A block in an embedded note cannot fold, as it would need a stop in
+    // the note shown, where its start is not. So its body is always shown.
+    let fold = fold.filter(|_| ctx.embedded.is_none());
     let open = fold.is_none_or(|open| open != ctx.flipped.contains(&at));
     let mut lead = String::new();
     if fold.is_some() {
@@ -604,10 +607,7 @@ fn fold_title(
     let (out, joins) = (&mut ctx.layout.lines, &mut ctx.layout.joins);
     let links = wrap(&content, style, width, first, rest, out, joins);
     ctx.layout.links.extend(links);
-    // A block in an embedded note is not a stop, as its start is in the
-    // other note.
     if fold.is_some()
-        && ctx.embedded.is_none()
         && let Some(line) = ctx.layout.lines.get(row)
     {
         let from = spans_width(first) as u16;

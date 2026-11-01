@@ -599,7 +599,7 @@ fn raster_image(data: Vec<u8>) -> Result<Png, String> {
     if data.starts_with(b"GIF8") {
         gif(&data)
     } else if data.starts_with(b"\xff\xd8\xff") {
-        jpeg(&data)
+        jpeg(&data, usize::MAX)
     } else {
         Png::new(data)
     }
@@ -612,11 +612,7 @@ pub fn decode_remote(data: Vec<u8>) -> Result<Png, String> {
     let raster = [b"GIF8".as_slice(), b"\xff\xd8\xff", b"\x89PNG"];
     if raster.iter().any(|magic| data.starts_with(magic)) {
         if data.starts_with(b"\xff\xd8\xff") {
-            // The decoder makes room for every pixel the header claims.
-            let (w, h) = jpeg_size(&data)?;
-            if w * h > GIF_MAX_PIXELS {
-                return Err("JPEG too large".into());
-            }
+            return jpeg(&data, GIF_MAX_PIXELS);
         }
         raster_image(data)
     } else if data.starts_with(b"\x1f\x8b") {
@@ -860,10 +856,17 @@ fn svg_fonts() -> &'static Arc<Database> {
     })
 }
 
-/// A JPEG in the colours the decoder gives.
-fn jpeg(data: &[u8]) -> Result<Png, String> {
+/// A JPEG in the colours the decoder gives, refused before it is decoded
+/// if its header claims more than `max_pixels`, as the decoder makes room
+/// for every pixel the header claims.
+fn jpeg(data: &[u8], max_pixels: usize) -> Result<Png, String> {
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     let mut decoder = zune_jpeg::JpegDecoder::new(io::Cursor::new(data));
+    decoder.decode_headers().map_err(|e| format!("JPEG: {e}"))?;
+    let info = decoder.info().ok_or("JPEG has no size")?;
+    if usize::from(info.width) * usize::from(info.height) > max_pixels {
+        return Err("JPEG too large".into());
+    }
     let pixels = decoder.decode().map_err(|e| format!("JPEG: {e}"))?;
     let info = decoder.info().ok_or("JPEG has no size")?;
     let color = match decoder.output_colorspace() {

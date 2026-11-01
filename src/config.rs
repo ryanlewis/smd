@@ -40,8 +40,7 @@ use crate::mermaid::Renderer;
 use crate::theme::Rgb;
 
 /// What the reader can do from the keyboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Quit,
     Down,
@@ -66,6 +65,32 @@ pub enum Action {
 }
 
 impl Action {
+    /// The action's name as the config's `[keys]` and the help write it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Action::Quit => "quit",
+            Action::Down => "down",
+            Action::Up => "up",
+            Action::HalfDown => "half_down",
+            Action::HalfUp => "half_up",
+            Action::PageDown => "page_down",
+            Action::PageUp => "page_up",
+            Action::Top => "top",
+            Action::Bottom => "bottom",
+            Action::NextLink => "next_link",
+            Action::PrevLink => "prev_link",
+            Action::Follow => "follow",
+            Action::Toggle => "toggle",
+            Action::Back => "back",
+            Action::Forward => "forward",
+            Action::Search => "search",
+            Action::NextMatch => "next_match",
+            Action::PrevMatch => "prev_match",
+            Action::Reload => "reload",
+            Action::Help => "help",
+        }
+    }
+
     /// The keys an action has when the config does not name it.
     fn defaults(self) -> &'static [&'static str] {
         match self {
@@ -124,6 +149,16 @@ impl Action {
         Action::Reload,
         Action::Help,
     ];
+}
+
+impl<'de> Deserialize<'de> for Action {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Action, D::Error> {
+        let name = String::deserialize(d)?;
+        Action::ALL
+            .into_iter()
+            .find(|a| a.name() == name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown action \"{name}\"")))
+    }
 }
 
 /// What following a web link does.
@@ -367,7 +402,9 @@ impl Config {
                 match keys.insert(key, action) {
                     Some(other) if other != action => {
                         return Err(format!(
-                            "key \"{name}\" is set for both {other:?} and {action:?}"
+                            "key \"{name}\" is set for both {} and {}",
+                            other.name(),
+                            action.name()
                         ));
                     }
                     // The same key again, perhaps spelt another way.
@@ -601,7 +638,7 @@ mod tests {
     fn mistakes_are_errors() {
         for (text, wanted) in [
             ("[keys]\nback = [\"hyper-x\"]\n", "unknown key"),
-            ("[keys]\nback = [\"j\"]\n", "both"),
+            ("[keys]\nback = [\"j\"]\n", "set for both down and back"),
             ("[keys]\nfly = [\"x\"]\n", "fly"),
             ("colour = 1\n", "colour"),
             ("web_links = \"shout\"\n", "shout"),

@@ -40,6 +40,9 @@ struct Args {
     /// Do not fetch images from the web, whatever the config says
     #[arg(long, overrides_with = "remote_images")]
     no_remote_images: bool,
+    /// The widest the text gets, in columns, whatever the config says
+    #[arg(long, value_name = "COLS", value_parser = clap::value_parser!(u16).range(1..))]
+    max_width: Option<u16>,
     /// The markdown file, or `-` for stdin; with none, stdin when markdown
     /// is piped in, else the `home` note from the config
     file: Option<PathBuf>,
@@ -290,7 +293,8 @@ fn smd(args: Args) -> Result<(), Failure> {
     // Until the terminal is set up, SIGTERM, SIGHUP and Ctrl-C end smd at
     // once; after, they end the loop below, so the terminal is restored.
     app::stop_on_signals();
-    let config = loaded(config::Config::load())?;
+    let mut config = loaded(config::Config::load())?;
+    config.max_width = args.max_width.or(config.max_width);
     let picked = pick_source(args.file, config.home.clone(), is_piped(libc::STDIN_FILENO));
     let picked = picked.unwrap_or_else(|message| {
         Args::command()
@@ -477,6 +481,19 @@ mod tests {
             args.no_remote_images,
             false
         ));
+    }
+
+    #[test]
+    fn max_width_is_a_number_of_columns_more_than_0() {
+        let args = Args::parse_from(["smd", "--max-width", "80", "a.md"]);
+        assert_eq!(args.max_width, Some(80));
+        assert_eq!(Args::parse_from(["smd", "a.md"]).max_width, None);
+        for bad in ["0", "wide", "-3"] {
+            assert!(
+                Args::try_parse_from(["smd", "--max-width", bad]).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

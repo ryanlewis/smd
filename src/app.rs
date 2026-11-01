@@ -880,11 +880,16 @@ impl View {
             return;
         };
         self.selected = Some(links[next]);
-        // Bring it into view, a little way down the page when that moves it.
+        // Bring it into view, a little way down the page when that moves it,
+        // and all of it when it fits, as a heading drawn larger takes rows.
         let row = row(next);
-        if !self.in_view().contains(&row) {
+        let last = self.cells(links[next]).last().map_or(row, |c| c.0);
+        let view = self.in_view();
+        if !view.contains(&row) || !view.contains(&last) {
+            let down = (last + 1).saturating_sub(self.height as usize);
             self.scroll = row
                 .saturating_sub(self.height as usize / 3)
+                .max(down.min(row))
                 .min(self.max_scroll());
         }
     }
@@ -2488,6 +2493,22 @@ mod tests {
         v.act(Action::Down);
         tab(&mut v);
         assert_eq!(v.selected, Some(Stop::Link(2)));
+    }
+
+    #[test]
+    fn tab_brings_all_of_a_tall_link_into_view() {
+        let md = format!("{}[A](https://e.com)\n\n{}", paragraphs(4), paragraphs(10));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        // Laid out as a heading three times the size, the link takes three
+        // rows, and only its first is in view.
+        let row = v.layout.links[0].cells[0].0;
+        v.layout.links[0].cells = (row..row + 3).map(|r| (r, 0..3)).collect();
+        v.scroll = row - 4;
+        v.act(Action::NextLink);
+        assert_eq!(v.selected, Some(Stop::Link(0)));
+        let view = v.in_view();
+        assert!(view.contains(&row) && view.contains(&(row + 2)), "{view:?}");
     }
 
     #[test]

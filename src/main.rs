@@ -198,8 +198,10 @@ fn read_stdin() -> io::Result<String> {
     }
     let read = io::read_to_string(io::stdin());
     if hint {
-        app::stdin_hint(false);
+        // Cleared first, so a signal before the hint is noted gone clears
+        // it again rather than not at all.
         eprint!("{}", app::CLEAR_LINE);
+        app::stdin_hint(false);
     }
     read
 }

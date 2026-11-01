@@ -1644,10 +1644,13 @@ static WAKE: AtomicI32 = AtomicI32::new(-1);
 /// The shared memory objects to remove if smd is stuck when asked to stop.
 static OBJECTS: OnceLock<images::Uploaded> = OnceLock::new();
 
-/// How long the run loop has to end smd after a stop signal before smd is
-/// ended without it. Enough for the loop to see the signal and clean up, and
-/// for the terminal probe to time out.
+/// How long the terminal may go without taking any output, after a stop
+/// signal, before smd is taken to be stuck writing to it and is ended.
 const STOP_GRACE: Duration = Duration::from_secs(1);
+
+/// How often to look again whether the terminal takes output while smd is
+/// busy rather than stuck after a stop signal.
+const STOP_RECHECK: Duration = Duration::from_millis(100);
 
 /// What clears the stdin hint: back to the line's start, then erase it.
 pub const CLEAR_LINE: &str = "\r\x1b[K";
@@ -1780,11 +1783,13 @@ fn wake_pipe() -> Option<libc::c_int> {
     Some(fds[0])
 }
 
-/// Wait on `read` for a stop signal, give the run loop `STOP_GRACE` to end
-/// smd, then end it here: smd may be stuck writing to a terminal that does
-/// not read. Only the shared memory objects are removed, as the terminal
-/// cannot be written to. Their lock is never held across a write, so this
-/// does not wait on a stuck thread.
+/// Wait on `read` for a stop signal, then end smd here if the terminal takes
+/// no output for `STOP_GRACE`: smd is then stuck writing to it. While the
+/// terminal takes output, even slowly as over ssh, smd is busy rather than
+/// stuck, as with a large document to lay out, and the run loop is left to
+/// end it and restore the terminal. Only the shared memory objects are
+/// removed, as the terminal cannot be written to. Their lock is never held
+/// across a write, so this does not wait on a stuck thread.
 #[cfg(unix)]
 fn make_sure_smd_ends(read: libc::c_int) {
     let mut byte = 0u8;
@@ -1799,13 +1804,47 @@ fn make_sure_smd_ends(read: libc::c_int) {
         }
         return;
     }
-    std::thread::sleep(STOP_GRACE);
+    loop {
+        match takes_output(libc::STDOUT_FILENO, STOP_GRACE) {
+            Ok(true) => std::thread::sleep(STOP_RECHECK),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            _ => break,
+        }
+    }
     if let Some(objects) = OBJECTS.get() {
         objects.remove_objects();
     }
     if let Some(signal) = stop_signal() {
         raise(signal);
     }
+}
+
+/// Whether a write to `fd` would go through within `wait` rather than wait
+/// longer. Asked with select, as poll on macOS does not work with terminals.
+#[cfg(unix)]
+fn takes_output(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
+    let mut wait = libc::timeval {
+        tv_sec: wait.as_secs() as libc::time_t,
+        tv_usec: wait.subsec_micros() as libc::suseconds_t,
+    };
+    // SAFETY: a zeroed fd_set is valid and fd is below FD_SETSIZE; select
+    // only looks at the descriptor and writes to the set and the timeval.
+    let ready = unsafe {
+        let mut set: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut set);
+        libc::FD_SET(fd, &mut set);
+        libc::select(
+            fd + 1,
+            std::ptr::null_mut(),
+            &mut set,
+            std::ptr::null_mut(),
+            &mut wait,
+        )
+    };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ready > 0)
 }
 
 /// Where the run loop gets the terminal's events and the time, so a test
@@ -4204,5 +4243,27 @@ mod tests {
         assert!(ignored(libc::SIGUSR2));
         unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
         assert!(!ignored(libc::SIGUSR2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_is_taken_until_the_reader_stops_reading() {
+        // A pipe nobody reads stands in for a terminal that stopped reading.
+        let mut fds = [0; 2];
+        let wait = Duration::from_millis(20);
+        // SAFETY: pipe writes two descriptors into fds; fcntl only sets a
+        // flag; the writes are from a local; both descriptors are ours and
+        // closed once.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let flags = libc::fcntl(fds[1], libc::F_GETFL);
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            assert!(takes_output(fds[1], wait).unwrap());
+            let chunk = [0u8; 4096];
+            while libc::write(fds[1], chunk.as_ptr().cast(), chunk.len()) > 0 {}
+            assert!(!takes_output(fds[1], wait).unwrap());
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 }

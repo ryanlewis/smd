@@ -7,6 +7,7 @@ use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
 use crate::doc::{Block, BlockKind, Document, Inline};
+use crate::heading::SizedLine;
 use crate::render::Layout;
 
 /// One place the term is drawn.
@@ -145,9 +146,26 @@ pub fn find(term: &str, layout: &Layout, doc: &Document) -> Vec<Match> {
             }
             continue;
         }
-        in_line(line, &wanted, ignore, row, &mut out);
+        match layout.sized.iter().find(|l| l.row == row) {
+            Some(sized) => in_sized(sized, &wanted, ignore, &mut out),
+            None => in_line(line, &wanted, ignore, row, &mut out),
+        }
     }
     out
+}
+
+/// The matches of `wanted` on a heading line drawn larger, whose characters
+/// the layout spaced out, by the columns they cover.
+fn in_sized(line: &SizedLine, wanted: &[char], ignore: bool, out: &mut Vec<Match>) {
+    let mut chars: Vec<(char, u16)> = Vec::new();
+    for cell in &line.cells {
+        chars.extend(cell.text.chars().map(|c| (fold(c, ignore), cell.col)));
+    }
+    let end = line
+        .cells
+        .last()
+        .map_or(0, |c| c.col + u16::from(line.scale) * u16::from(c.width));
+    in_chars(&chars, end, wanted, line.row, out);
 }
 
 /// The matches of `wanted` on one drawn line, by column. Matches do not
@@ -162,6 +180,12 @@ fn in_line(line: &Line, wanted: &[char], ignore: bool, row: usize, out: &mut Vec
             col = col.saturating_add(c.width().unwrap_or(0) as u16);
         }
     }
+    in_chars(&chars, col, wanted, row, out);
+}
+
+/// The matches of `wanted` in `chars`, each with the column it starts at,
+/// on a line whose last character ends at column `col`.
+fn in_chars(chars: &[(char, u16)], col: u16, wanted: &[char], row: usize, out: &mut Vec<Match>) {
     let mut i = 0;
     while i + wanted.len() <= chars.len() {
         if chars[i..i + wanted.len()]
@@ -225,6 +249,36 @@ mod tests {
             row,
             cols: Some(cols),
         }
+    }
+
+    #[test]
+    fn a_sized_heading_matches_by_its_characters() {
+        use crate::heading::SizedCell;
+        use ratatui::text::Line;
+        // "Go 日" twice the size, spaced out, after a quote bar.
+        let cell = |col, width, text: &str| SizedCell {
+            col,
+            width,
+            text: text.into(),
+        };
+        let layout = Layout {
+            lines: vec![Line::raw("> G o   日  "), Line::raw(">")],
+            sized: vec![SizedLine {
+                row: 0,
+                scale: 2,
+                cells: vec![
+                    cell(2, 1, "G"),
+                    cell(4, 1, "o"),
+                    cell(6, 1, " "),
+                    cell(8, 2, "日"),
+                ],
+            }],
+            ..Layout::default()
+        };
+        let doc = doc::parse("> ## Go 日\n");
+        assert_eq!(find("go", &layout, &doc), vec![at(0, 2..6)]);
+        assert_eq!(find("o 日", &layout, &doc), vec![at(0, 4..12)]);
+        assert_eq!(find("g o", &layout, &doc), vec![]);
     }
 
     #[test]

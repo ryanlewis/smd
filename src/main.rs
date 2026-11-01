@@ -285,6 +285,8 @@ fn smd(args: Args) -> Result<(), Failure> {
     let probe = (!args.no_graphics).then(kitty::probe);
     let look = Look::new(probe, config.code_background);
     apply(&look);
+    let text_sizing = probe.is_some_and(|p| p.text_sizing);
+    heading::set_drawn(heading::choose(config.headings, text_sizing));
     mermaid::set_renderer(config.mermaid);
     remote::set_enabled(remote_images(
         args.remote_images,
@@ -423,6 +425,7 @@ mod tests {
             theme,
             background,
             graphics,
+            text_sizing: false,
         }
     }
 

@@ -126,10 +126,13 @@ pub struct Probe {
     pub background: Option<theme::Rgb>,
     /// The terminal answered the kitty graphics query.
     pub graphics: bool,
+    /// The terminal draws text larger with the text sizing protocol (OSC 66).
+    pub text_sizing: bool,
 }
 
 /// Ask the terminal for its background colour with `OSC 11`, its cell size
-/// with `CSI 16 t` and whether it knows the kitty graphics protocol.
+/// with `CSI 16 t`, whether it knows the kitty graphics protocol and whether
+/// it can draw larger text (see [`TEXT_SIZING_QUERIES`]).
 ///
 /// The queries end with `CSI c` (DA1). Terminals answer in order, and nearly
 /// all answer DA1, so the DA1 reply ends the wait: a terminal that sends it
@@ -148,6 +151,7 @@ pub fn probe() -> Probe {
         theme: theme::parse_background_reply(&reply),
         background: theme::parse_background_colour(&reply),
         graphics: parse_graphics_reply(&reply),
+        text_sizing: parse_text_sizing_reply(&reply),
     }
 }
 
@@ -164,9 +168,20 @@ fn cell_size(size: ratatui::crossterm::terminal::WindowSize) -> Option<(u16, u16
     (cell.0 > 0 && cell.1 > 0).then_some(cell)
 }
 
+/// The text sizing protocol's own test, as its spec describes: from the
+/// top left, the cursor's place (`CSI 6 n`), then its place after a space
+/// drawn two columns wide (`w=2`), then after a space drawn twice the size
+/// (`s=2`). A terminal that draws both moves the cursor two columns each
+/// time; one that does not know OSC 66, such as Ghostty, which reads it and
+/// drops it, does not.
+const TEXT_SIZING_QUERIES: &str =
+    "\x1b[H\x1b[6n\x1b]66;w=2; \x1b\\\x1b[6n\x1b]66;s=2; \x1b\\\x1b[6n";
+
 /// The queries, in the order the replies are read.
 fn queries() -> String {
-    format!("\x1b]11;?\x1b\\\x1b[16t\x1b_Gi={QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c")
+    format!(
+        "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi={QUERY_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\{TEXT_SIZING_QUERIES}\x1b[c"
+    )
 }
 
 /// The terminal's replies to the start-up queries, read until the DA1 reply.
@@ -321,6 +336,28 @@ fn parse_graphics_reply(buf: &[u8]) -> bool {
     })
 }
 
+/// Whether the replies to [`TEXT_SIZING_QUERIES`] say the terminal draws
+/// larger text: the first three cursor reports are each two columns on from
+/// the last.
+fn parse_text_sizing_reply(buf: &[u8]) -> bool {
+    let cols = cursor_columns(buf);
+    matches!(cols[..], [a, b, c, ..] if b == a + 2 && c == b + 2)
+}
+
+/// The columns in the cursor reports, `CSI row ; col R`, in `buf`.
+fn cursor_columns(buf: &[u8]) -> Vec<u32> {
+    let text = String::from_utf8_lossy(buf);
+    text.split("\x1b[")
+        .skip(1)
+        .filter_map(|reply| {
+            let (row, rest) = reply.split_once(';')?;
+            let (col, _) = rest.split_once('R')?;
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            (digits(row) && digits(col)).then(|| col.parse().ok())?
+        })
+        .collect()
+}
+
 /// Find the reply to `CSI 16 t`, `CSI 6 ; height ; width t`, in what the
 /// terminal sent back.
 fn parse_cell_reply(buf: &[u8]) -> Option<(u16, u16)> {
@@ -439,8 +476,45 @@ mod tests {
     fn queries_end_with_da1() {
         assert_eq!(
             queries(),
-            "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c"
+            "\x1b]11;?\x1b\\\x1b[16t\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
+             \x1b[H\x1b[6n\x1b]66;w=2; \x1b\\\x1b[6n\x1b]66;s=2; \x1b\\\x1b[6n\x1b[c"
         );
+    }
+
+    #[test]
+    fn text_sizing_is_found_by_where_the_cursor_moved() {
+        // kitty: two columns for w=2, two more for s=2, among the others.
+        let kitty = b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[6;34;17t\x1b_Gi=31;OK\x1b\\\
+                      \x1b[1;1R\x1b[1;3R\x1b[1;5R\x1b[?62;22c";
+        assert!(parse_text_sizing_reply(kitty));
+        // Split across reads, as replies can be.
+        let (buf, _) = replies(&[b"\x1b[1;1R\x1b[1", b";3R\x1b[1;5", b"R\x1b[?62c"]);
+        assert!(parse_text_sizing_reply(&buf));
+    }
+
+    #[test]
+    fn text_sizing_is_not_found_without_both_moves() {
+        let no = [
+            // Ghostty reads OSC 66 and drops it: the cursor stays put.
+            &b"\x1b[6;34;17t\x1b_Gi=31;OK\x1b\\\x1b[1;1R\x1b[1;1R\x1b[1;1R\x1b[?1;2c"[..],
+            // Widths but not sizes, as foot has.
+            b"\x1b[1;1R\x1b[1;3R\x1b[1;4R\x1b[?62c",
+            // The space printed as plain text.
+            b"\x1b[1;1R\x1b[1;2R\x1b[1;3R\x1b[?62c",
+            // No cursor reports, or too few.
+            b"\x1b[6;34;17t\x1b[?62c",
+            b"\x1b[1;1R\x1b[1;3R",
+            b"",
+        ];
+        for reply in no {
+            assert!(!parse_text_sizing_reply(reply), "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_reports_are_told_from_other_replies() {
+        let buf = b"\x1b[6;34;17t\x1b[?62;22c\x1b[12;40R\x1b[;3R\x1b[1;xR\x1b[2;7R";
+        assert_eq!(cursor_columns(buf), vec![40, 7]);
     }
 
     #[test]

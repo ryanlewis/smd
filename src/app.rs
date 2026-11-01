@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame, Terminal};
 
-use crate::config::{Action, Config, Tasks, WebLinks};
+use crate::config::{Action, Align, Config, Tasks, WebLinks};
 use crate::doc::{self, BlockKind, Document, Inline, Link};
 use crate::embed;
 use crate::help;
@@ -47,6 +47,11 @@ pub struct View {
     layout: Layout,
     /// Width the lines were laid out for; zero before the first layout.
     width: u16,
+    /// The widest the text gets, and where it sits in a wider window.
+    max_width: Option<u16>,
+    align: Align,
+    /// How far right of the view's left edge the text was last drawn.
+    left: u16,
     /// Whether the lines were laid out with the syntaxes for code.
     highlighted: bool,
     height: u16,
@@ -152,6 +157,9 @@ impl View {
             images,
             layout: Layout::default(),
             width: 0,
+            max_width: None,
+            align: Align::Centre,
+            left: 0,
             highlighted: false,
             height: 0,
             scroll: 0,
@@ -363,15 +371,24 @@ impl View {
         if status {
             area.height -= 1;
         }
+        // The text keeps to `max_width`, at the left or in the middle.
+        let width = self.max_width.map_or(area.width, |m| m.min(area.width));
+        self.left = match self.align {
+            Align::Centre => (area.width - width) / 2,
+            Align::Left => 0,
+        };
+        // The status row keeps the whole width.
+        let row = Rect::new(area.x, area.y + area.height, area.width, 1);
+        let area = Rect::new(area.x + self.left, area.y, width, area.height);
         self.resize(area.width, area.height);
         if status {
-            let row = Rect::new(area.x, area.y + area.height, area.width, 1);
             self.draw_status(frame, row);
         }
         let lines = &self.layout.lines;
         let end = (self.scroll + area.height as usize).min(lines.len());
         let visible = Text::from(lines[self.scroll..end].to_vec());
         frame.render_widget(Paragraph::new(visible), area);
+        crate::heading::draw_sized(frame.buffer_mut(), area, self.scroll, &self.layout.sized);
         // The cells of a link or checkbox that are in view.
         let scroll = self.scroll;
         let cells = |spot: &[(usize, std::ops::Range<u16>)]| -> Vec<Rect> {
@@ -462,6 +479,7 @@ impl View {
         if y >= self.height {
             return None;
         }
+        let x = x.checked_sub(self.left).filter(|&x| x < self.width)?;
         let line = self.scroll + y as usize;
         let hit = |stop: &Stop| {
             self.cells(*stop)
@@ -798,9 +816,15 @@ fn heading_start(source: &str, blocks: &[doc::Block], wanted: &str) -> Option<us
 /// the shared id lets the terminal treat them as one link.
 fn hyperlink(cell: &mut Cell, id: usize, url: &str) {
     let text = cell.symbol();
-    // The second column of a wide character holds nothing to wrap.
-    let Some(width) = NonZeroU16::new(text.width() as u16) else {
-        return;
+    // The second column of a wide character holds nothing to wrap, nor do
+    // the cells under a heading drawn larger. Its first cell keeps its width.
+    let width = match cell.diff_option {
+        CellDiffOption::Skip => return,
+        CellDiffOption::ForcedWidth(width) => width,
+        _ => match NonZeroU16::new(text.width() as u16) {
+            Some(width) => width,
+            None => return,
+        },
     };
     let symbol = format!("\x1b]8;id=smd{id};{url}\x1b\\{text}\x1b]8;;\x1b\\");
     cell.set_symbol(&symbol);
@@ -960,6 +984,8 @@ impl Browser {
             clipboard: Box::new(io::stdout()),
             opener: open_with_system,
         };
+        browser.view.max_width = browser.config.max_width;
+        browser.view.align = browser.config.align;
         browser.check_tasks();
         browser
     }
@@ -1985,6 +2011,24 @@ mod tests {
     }
 
     #[test]
+    fn a_link_in_a_sized_heading_wraps_its_osc66_cell() {
+        let mut cell = Cell::new("\x1b]66;s=2:w=1;a\x1b\\");
+        let two = NonZeroU16::new(2).unwrap();
+        cell.set_diff_option(CellDiffOption::ForcedWidth(two));
+        hyperlink(&mut cell, 0, "https://e.com");
+        assert_eq!(
+            cell.symbol(),
+            "\x1b]8;id=smd0;https://e.com\x1b\\\x1b]66;s=2:w=1;a\x1b\\\x1b]8;;\x1b\\"
+        );
+        assert_eq!(cell.diff_option, CellDiffOption::ForcedWidth(two));
+        // The cells it covers are left alone.
+        let mut under = Cell::new(" ");
+        under.set_diff_option(CellDiffOption::Skip);
+        hyperlink(&mut under, 0, "https://e.com");
+        assert_eq!(under.symbol(), " ");
+    }
+
+    #[test]
     fn clicking_a_link_follows_it_and_the_wheel_scrolls() {
         let home = format!("go [[Plan]] now\n\n{}", paragraphs(6));
         let (mut b, dir) = browser("click", &[("HOME.md", &home), ("Plan.md", "# Plan\n")]);
@@ -2010,6 +2054,122 @@ mod tests {
         assert_eq!(b.path, dir.join("HOME.md"));
         assert_eq!(b.view.selected, Some(Stop::Link(0)));
         b.mouse(click(BACK_BUTTON.width() as u16 + 2, 0));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_width_keeps_the_text_narrow_at_the_left_or_in_the_middle() {
+        let md = format!("{}\n\n```\n{}\n```\n", "word ".repeat(40), "x".repeat(50));
+        for (align, left) in [(Align::Centre, 20), (Align::Left, 0)] {
+            let mut v = new_view(&md);
+            v.max_width = Some(20);
+            v.align = align;
+            let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+            terminal.draw(|f| v.draw(f)).unwrap();
+            assert_eq!((v.width, v.left), (20, left));
+            assert!(v.layout.lines.iter().all(|l| l.width() <= 20));
+            let buf = terminal.backend().buffer();
+            // Every row but the status row at the bottom.
+            for y in 0..11 {
+                let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                let (before, rest) = row.split_at(left as usize);
+                let (_, after) = rest.split_at(20);
+                assert!(
+                    before.trim().is_empty() && after.trim().is_empty(),
+                    "{row:?}"
+                );
+            }
+            let first: String = (left..left + 20)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect();
+            assert!(first.starts_with("word word"), "{first:?}");
+        }
+        // A narrower window than the limit uses all of it.
+        let mut v = new_view(&md);
+        v.max_width = Some(20);
+        let mut terminal = Terminal::new(TestBackend::new(15, 5)).unwrap();
+        terminal.draw(|f| v.draw(f)).unwrap();
+        assert_eq!((v.width, v.left), (15, 0));
+    }
+
+    #[test]
+    fn a_sized_heading_is_drawn_where_max_width_moves_it() {
+        use crate::heading::{SizedCell, SizedLine};
+        let mut v = new_view("[A](https://e.com)\n");
+        v.max_width = Some(20);
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        let href = |link: &Link| Some(link.dest.clone());
+        terminal.draw(|f| v.draw_in(f, f.area(), href)).unwrap();
+        assert_eq!((v.width, v.left), (20, 20));
+        // Laid out as a heading twice the size: the layout is kept, as the
+        // width has not changed.
+        v.layout.sized.push(SizedLine {
+            row: 0,
+            scale: 2,
+            cells: vec![SizedCell {
+                col: 0,
+                width: 1,
+                text: "A".into(),
+            }],
+        });
+        v.layout.links[0].cells = vec![(0, 0..2), (1, 0..2)];
+        // The frame as drawn, with the cells the terminal is not sent.
+        let frame = terminal.draw(|f| v.draw_in(f, f.area(), href)).unwrap();
+        let buf = frame.buffer;
+        assert_eq!(
+            buf[(20, 0)].symbol(),
+            "\x1b]8;id=smd0;https://e.com\x1b\\\x1b]66;s=2:w=1;A\x1b\\\x1b]8;;\x1b\\"
+        );
+        let two = NonZeroU16::new(2).unwrap();
+        assert_eq!(buf[(20, 0)].diff_option, CellDiffOption::ForcedWidth(two));
+        for (x, y) in [(21, 0), (20, 1), (21, 1)] {
+            assert_eq!(buf[(x, y)].diff_option, CellDiffOption::Skip, "({x}, {y})");
+        }
+        assert_eq!(buf[(0, 0)].diff_option, CellDiffOption::None);
+        // A click on any of its cells finds the link.
+        assert!(matches!(v.stop_at(21, 1), Some(Stop::Link(0))));
+        assert!(v.stop_at(1, 1).is_none());
+    }
+
+    #[test]
+    fn a_click_finds_a_link_moved_by_max_width() {
+        let (mut b, dir) = browser(
+            "narrow",
+            &[("HOME.md", "go [[Plan]] now\n"), ("Plan.md", "# Plan\n")],
+        );
+        b.view.max_width = Some(20);
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        assert_eq!(b.view.left, 20);
+        // The status row keeps the whole width: the page sits at its right end.
+        let buf = terminal.backend().buffer();
+        let status: String = (0..60).map(|x| buf[(x, 5)].symbol().to_string()).collect();
+        assert!(status.trim_end().len() > 50, "{status:?}");
+        assert_eq!(buf[(0, 5)].style(), buf[(59, 5)].style());
+        // A search match is marked where its text is drawn.
+        for code in "/now".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            enter(&mut b, code);
+        }
+        terminal.draw(|f| b.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let marked: Vec<(u16, String)> = (0..60)
+            .filter(|&x| buf[(x, 1)].bg == Color::Yellow)
+            .map(|x| (x, buf[(x, 1)].symbol().to_string()))
+            .collect();
+        let (xs, text): (Vec<u16>, String) = marked.into_iter().unzip();
+        assert_eq!(text, "now");
+        assert!(xs.iter().all(|x| (20..40).contains(x)), "{xs:?}");
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Where the link would be without the limit, nothing happens.
+        b.mouse(click(4));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        b.mouse(click(24));
         assert_eq!(b.path, dir.join("Plan.md"));
         let _ = std::fs::remove_dir_all(&dir);
     }

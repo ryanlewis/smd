@@ -15,6 +15,12 @@
 //! # Whether images on the web (http and https) are fetched and shown.
 //! # `--remote-images` and `--no-remote-images` override it.
 //! remote_images = false
+//! # The widest the text gets, in columns, and where it sits when the
+//! # window is wider: "centre" or "left".
+//! max_width = 100
+//! align = "centre"
+//! # How headings are drawn: "auto", "image" or "text".
+//! headings = "auto"
 //!
 //! # Keys for each action. Naming an action replaces its default keys.
 //! [keys]
@@ -29,6 +35,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
+use crate::heading;
 use crate::mermaid::Renderer;
 use crate::theme::Rgb;
 
@@ -144,6 +151,18 @@ pub enum Tasks {
     ReadOnly,
 }
 
+/// Where the text sits when the window is wider than `max_width`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Align {
+    /// In the middle of the window.
+    #[default]
+    #[serde(alias = "center")]
+    Centre,
+    /// At the left edge.
+    Left,
+}
+
 /// The named keys, as the config spells them in lower case.
 const NAMED_KEYS: &[(&str, KeyCode)] = &[
     ("enter", KeyCode::Enter),
@@ -254,6 +273,11 @@ struct File {
     mermaid: Renderer,
     #[serde(default)]
     tasks: Tasks,
+    max_width: Option<u16>,
+    #[serde(default)]
+    align: Align,
+    #[serde(default)]
+    headings: heading::Mode,
     #[serde(default)]
     keys: HashMap<Action, Vec<String>>,
 }
@@ -274,6 +298,12 @@ pub struct Config {
     pub mermaid: Renderer,
     /// Whether task checkboxes can be ticked.
     pub tasks: Tasks,
+    /// The widest the text gets, in columns; none for the whole window.
+    pub max_width: Option<u16>,
+    /// Where the text sits when the window is wider than `max_width`.
+    pub align: Align,
+    /// How headings are drawn.
+    pub headings: heading::Mode,
     keys: HashMap<Key, Action>,
     /// Each action's keys, named as the config or the defaults write them.
     names: HashMap<Action, Vec<String>>,
@@ -352,6 +382,9 @@ impl Config {
             })?),
             None => None,
         };
+        if file.max_width == Some(0) {
+            return Err("max_width must be more than 0".to_string());
+        }
         Ok(Config {
             home: file.home.as_deref().map(expand_home),
             web_links: file.web_links,
@@ -360,6 +393,9 @@ impl Config {
             remote_images: file.remote_images,
             mermaid: file.mermaid,
             tasks: file.tasks,
+            max_width: file.max_width,
+            align: file.align,
+            headings: file.headings,
             keys,
             names: key_names,
         })
@@ -449,6 +485,19 @@ mod tests {
         assert_eq!(c.code_background, None);
         assert!(c.mouse);
         assert!(!c.remote_images);
+        assert_eq!(c.max_width, None);
+        assert_eq!(c.align, Align::Centre);
+    }
+
+    #[test]
+    fn max_width_and_align_are_read() {
+        let c = Config::from_str("max_width = 80\nalign = \"left\"").unwrap();
+        assert_eq!(c.max_width, Some(80));
+        assert_eq!(c.align, Align::Left);
+        let c = Config::from_str("align = \"center\"").unwrap();
+        assert_eq!(c.align, Align::Centre);
+        assert!(Config::from_str("max_width = 0").is_err());
+        assert!(Config::from_str("align = \"right\"").is_err());
     }
 
     #[test]
@@ -564,6 +613,17 @@ mod tests {
             let err = Config::from_str(text).unwrap_err();
             assert!(err.contains(wanted), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn headings_are_auto_unless_set() {
+        assert_eq!(Config::default().headings, heading::Mode::Auto);
+        let c = Config::from_str("headings = \"image\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Image);
+        let c = Config::from_str("headings = \"text\"\n").unwrap();
+        assert_eq!(c.headings, heading::Mode::Text);
+        let err = Config::from_str("headings = \"big\"\n").unwrap_err();
+        assert!(err.contains("big"), "{err}");
     }
 
     fn key(code: KeyCode, ctrl: bool, alt: bool) -> Result<Key, String> {

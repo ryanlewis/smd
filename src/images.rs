@@ -21,12 +21,18 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use resvg::usvg::fontdb::Database;
 
 use crate::doc::{Block, BlockKind, FigureKind};
 use crate::theme;
 use crate::{heading, kitty, maths, mermaid, raster, remote};
+
+/// How long a shared memory object sent to the terminal is left for it to
+/// read. The terminal reads it as soon as it gets the command and removes it;
+/// one still there after this was never read and is removed here.
+const SHARED_MEMORY_KEEP: Duration = Duration::from_secs(10);
 
 /// What an image is made from. Two blocks with the same key share one image.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -168,6 +174,10 @@ pub struct Images {
     /// Uploaded images that left the document, to delete on the next flush.
     deleted: Vec<u32>,
     uploaded: Uploaded,
+    /// Send image data through shared memory rather than as base64.
+    shared_memory: bool,
+    /// Shared memory objects sent to the terminal, and when.
+    objects: Vec<(String, Instant)>,
     tx: Sender<(Key, Result<Png, String>)>,
     rx: Receiver<(Key, Result<Png, String>)>,
 }
@@ -187,6 +197,8 @@ impl Images {
                 + 1,
             deleted: Vec::new(),
             uploaded: Uploaded::default(),
+            shared_memory: false,
+            objects: Vec::new(),
             tx,
             rx,
         }
@@ -206,6 +218,13 @@ impl Images {
 
     pub fn graphics(&self) -> bool {
         self.graphics
+    }
+
+    /// Send image data through shared memory, which the terminal said it
+    /// can read. Without it, or when an object cannot be made, the data goes
+    /// as base64.
+    pub fn use_shared_memory(&mut self, on: bool) {
+        self.shared_memory = on;
     }
 
     /// The images this store has in the terminal.
@@ -339,7 +358,15 @@ impl Images {
             };
             if let Some(data) = png.take() {
                 self.uploaded.set(entry.id, true);
-                kitty::upload(out, entry.id, &data)?;
+                let object = self.shared_memory.then(|| kitty::shm::create(&data).ok());
+                match object.flatten() {
+                    Some(name) => {
+                        // Tracked first, so it is removed even if the write fails.
+                        self.objects.push((name.clone(), Instant::now()));
+                        kitty::upload_shared(out, entry.id, &name, data.len())?;
+                    }
+                    None => kitty::upload(out, entry.id, &data)?,
+                }
                 sent = true;
             }
             if entry.placed != Some((p.cols, p.rows)) {
@@ -351,13 +378,28 @@ impl Images {
         if sent {
             out.flush()?;
         }
+        self.unlink_objects(Instant::now(), SHARED_MEMORY_KEEP);
         Ok(())
+    }
+
+    /// Remove the shared memory objects sent `keep` or longer before `now`.
+    /// Most are gone already: the terminal removes each it reads.
+    fn unlink_objects(&mut self, now: Instant, keep: Duration) {
+        self.objects.retain(|(name, sent)| {
+            let keep = now.saturating_duration_since(*sent) < keep;
+            if !keep {
+                kitty::shm::unlink(name);
+            }
+            keep
+        });
     }
 
     /// Delete every uploaded image from the terminal, as on exit.
     pub fn delete_all(&mut self, out: &mut impl Write) -> io::Result<()> {
         self.want(Vec::new());
-        self.flush(out, &[])
+        let flushed = self.flush(out, &[]);
+        self.unlink_objects(Instant::now(), Duration::ZERO);
+        flushed
     }
 }
 
@@ -1491,6 +1533,115 @@ pub mod tests {
             commands(out),
             vec![format!("\x1b_Ga=p,U=1,i={id},p=1,c=5,r=1,q=2")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_memory_uploads_name_an_object_removed_on_exit() {
+        let mut images = Images::new((10, 20));
+        images.use_shared_memory(true);
+        let data = png(100, 40);
+        images.request(file_key("a.png"), job(data.clone()));
+        settle(&mut images);
+        let id = images.ready(&file_key("a.png")).unwrap().id;
+        let mut out = Vec::new();
+        images
+            .flush(
+                &mut out,
+                &[Placement {
+                    id,
+                    cols: 10,
+                    rows: 2,
+                }],
+            )
+            .unwrap();
+        let [(name, _)] = images.objects.as_slice() else {
+            panic!("one object: {:?}", images.objects);
+        };
+        let name = name.clone();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "\x1b_Ga=t,f=100,t=s,S={},i={id},q=2;{}\x1b\\\
+                 \x1b_Ga=p,U=1,i={id},p=1,c=10,r=2,q=2\x1b\\",
+                data.len(),
+                kitty::base64(name.as_bytes())
+            )
+        );
+        // No terminal read it here: it is still there until exit.
+        let open = || {
+            let c_name = std::ffi::CString::new(name.as_str()).unwrap();
+            // SAFETY: c_name is a valid C string; the descriptor is closed.
+            unsafe {
+                let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0 as libc::c_uint);
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+                fd >= 0
+            }
+        };
+        assert!(open());
+        images.delete_all(&mut Vec::new()).unwrap();
+        assert!(images.objects.is_empty());
+        assert!(!open());
+    }
+
+    /// A writer that fails every write, as when the terminal has gone.
+    struct Gone;
+
+    impl Write for Gone {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_object_whose_upload_failed_is_still_removed() {
+        let mut images = Images::new((10, 20));
+        images.use_shared_memory(true);
+        images.request(file_key("a.png"), job(png(10, 20)));
+        settle(&mut images);
+        let id = images.ready(&file_key("a.png")).unwrap().id;
+        let at = [Placement {
+            id,
+            cols: 1,
+            rows: 1,
+        }];
+        assert!(images.flush(&mut Gone, &at).is_err());
+        assert_eq!(images.objects.len(), 1, "the object is not tracked");
+        images.delete_all(&mut Vec::new()).unwrap();
+        assert!(images.objects.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unread_objects_are_removed_after_a_while() {
+        let mut images = Images::new((10, 20));
+        let old = kitty::shm::create(b"old").unwrap();
+        let new = kitty::shm::create(b"new").unwrap();
+        // No Instant is made by subtracting: soon after boot that fails.
+        let sent = Instant::now();
+        let later = sent + SHARED_MEMORY_KEEP / 2;
+        images.objects = vec![(old.clone(), sent), (new.clone(), later)];
+        images.unlink_objects(sent + SHARED_MEMORY_KEEP, SHARED_MEMORY_KEEP);
+        assert_eq!(images.objects, vec![(new.clone(), later)]);
+        // Nothing sent just now is removed.
+        images.unlink_objects(later, SHARED_MEMORY_KEEP);
+        assert_eq!(images.objects.len(), 1);
+        images.unlink_objects(later, Duration::ZERO);
+        assert!(images.objects.is_empty());
+        // Both are gone.
+        for name in [old, new] {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            // SAFETY: c_name is a valid C string; the descriptor is closed.
+            let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0 as libc::c_uint) };
+            assert!(fd < 0);
+        }
     }
 
     #[test]

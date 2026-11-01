@@ -147,6 +147,8 @@ smd asks the terminal what it supports at start-up. In a terminal without kitty 
 
 smd also asks whether the terminal has the [text sizing protocol](https://sw.kovidgoyal.net/kitty/text-sizing-protocol/), by drawing a space two columns wide and one twice the size and seeing where the cursor ends up. If it does, headings are drawn as larger text rather than images: three times the size for level 1 and twice for levels 2 and 3, smaller in a narrow pane. kitty has it from version 0.40; Ghostty does not yet. `--no-graphics` turns this off too.
 
+When the terminal runs on the same machine as smd, images are passed to it through shared memory, which is faster for large images than sending them through the terminal. Over ssh, or when the terminal cannot read shared memory, they are sent through the terminal as before.
+
 smd is developed on macOS, and its tests run on Linux.
 
 ## Install

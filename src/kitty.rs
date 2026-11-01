@@ -66,6 +66,13 @@ pub fn upload(out: &mut impl Write, id: u32, png: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Make the terminal draw the screen again without changing it: show the
+/// cursor and hide it again, as it is always hidden.
+pub fn repaint(out: &mut impl Write) -> io::Result<()> {
+    out.write_all(b"\x1b[?25h\x1b[?25l")?;
+    out.flush()
+}
+
 /// Send a PNG of `len` bytes held in the shared memory object `name` to the
 /// terminal under `id`, as [`upload`] does. The terminal reads the object and
 /// removes it.

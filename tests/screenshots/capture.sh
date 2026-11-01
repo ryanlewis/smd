@@ -100,14 +100,6 @@ for note in *.md; do
   settle "$window" "$note: kitty" || status=1
   touch "$go"
   settle "$window" "$note" || status=1
-  # kitty does not repaint cells when an image arrives after the cells that
-  # show it were drawn, so they stay blank until something else changes.
-  # Hiding and showing the window makes it repaint everything.
-  timeout 10 xdotool windowunmap --sync "$window" windowmap --sync "$window" || {
-    echo "$note: cannot hide and show the window" >&2
-    status=1
-  }
-  settle "$window" "$note" || status=1
 
   if [ -s "$log" ]; then
     echo "$note: smd wrote:" >&2

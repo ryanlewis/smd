@@ -843,14 +843,19 @@ mod tests {
         // the outer terminal: it is read here, not by the key reader.
         let pipe = Pipe::new(b"\x1b[6;16;8t\x1b[?62;22c", false);
         let write = pipe.write.unwrap();
+        let t0 = Instant::now();
         let terminal = std::thread::spawn(move || {
             std::thread::sleep(GRAPHICS_GRACE / 4);
+            let wrote = t0.elapsed();
             let reply = b"\x1b_Gi=31;OK\x1b\\";
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, reply.as_ptr().cast(), reply.len()) };
+            wrote
         });
         let reply = exchange(&mut Vec::new(), pipe.read, REPLY_TIMEOUT, None);
-        terminal.join().unwrap();
+        let done = t0.elapsed();
+        let wrote = terminal.join().unwrap();
+        eprintln!("DEBUG {}: wrote at {wrote:?}, exchange done at {done:?}, reply {:?}", "a_graphics_reply_after_da1_is_read", String::from_utf8_lossy(&reply));
         assert!(parse_graphics_reply(&reply));
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
     }
@@ -862,15 +867,20 @@ mod tests {
         // memory one last. The wait goes on until it is read.
         let pipe = Pipe::new(b"\x1b[?62;22c\x1b_Gi=31;OK\x1b\\", false);
         let write = pipe.write.unwrap();
+        let t0 = Instant::now();
         let terminal = std::thread::spawn(move || {
             std::thread::sleep(GRAPHICS_GRACE / 4);
+            let wrote = t0.elapsed();
             let reply = b"\x1b_Gi=32;OK\x1b\\";
             // SAFETY: writes the reply from a live buffer to an open pipe.
             unsafe { libc::write(write, reply.as_ptr().cast(), reply.len()) };
+            wrote
         });
         let mut out = Vec::new();
         let reply = exchange(&mut out, pipe.read, REPLY_TIMEOUT, Some("/smd-1-0"));
-        terminal.join().unwrap();
+        let done = t0.elapsed();
+        let wrote = terminal.join().unwrap();
+        eprintln!("DEBUG {}: wrote at {wrote:?}, exchange done at {done:?}, reply {:?}", "a_shared_memory_reply_after_da1_is_read", String::from_utf8_lossy(&reply));
         assert!(parse_shm_reply(&reply));
         assert_eq!(read_chunk(pipe.read, Duration::from_millis(1)), None);
         assert_eq!(

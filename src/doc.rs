@@ -813,6 +813,10 @@ impl<'a> Builder<'a> {
             .any(|c| c.start <= range.start && range.end <= c.end)
         {
             self.top().left_out = true;
+            // A callout's title still ends at its line.
+            if matches!(event, Event::SoftBreak | Event::HardBreak) {
+                self.ends_title(range.end);
+            }
             return;
         }
         // A table is kept whole as source text, so skip its contents.
@@ -1130,6 +1134,8 @@ impl<'a> Builder<'a> {
         top.other_inline = false;
         top.images.clear();
         top.display_math.clear();
+        // A highlight does not go on past the title.
+        top.end_highlight();
         let inlines = std::mem::take(&mut top.inlines);
         self.take_title(inlines, marker);
         true
@@ -2664,5 +2670,57 @@ paragraph @40..47
     fn comments_after_frontmatter_are_hidden() {
         let doc = parse("---\na: b\n---\nx %%c%% y\n");
         assert_eq!(doc.blocks[1].kind, BlockKind::Paragraph(vec![text("x  y")]));
+    }
+
+    #[test]
+    fn callout_titles_and_bodies_take_highlights_and_hide_comments() {
+        assert_outline(
+            "> [!tip] A ==big== %%secret%% deal\n> body ==b== %%c%%\n\n> [!note] T\n> %%x%%\n",
+            "\
+callout Tip fold=None @0..54
+  title
+    \"A \"
+    \"big\" highlight
+    \"  deal\"
+  paragraph @35..54
+    \"body \"
+    \"b\" highlight
+    \" \"
+callout Note fold=None @55..75
+  title
+    \"T\"
+",
+        );
+    }
+
+    #[test]
+    fn a_highlight_left_open_in_a_callout_title_ends_with_it() {
+        assert_outline(
+            "> [!tip] *a* b ==c\n> d\n",
+            "\
+callout Tip fold=None @0..23
+  title
+    \"a\" em
+    \" b \"
+    \"==\"
+    \"c\"
+  paragraph @19..23
+    \"d\"
+",
+        );
+    }
+
+    #[test]
+    fn a_comment_across_a_callout_title_line_keeps_the_body_apart() {
+        assert_outline(
+            "> [!tip] T %%c\n> d%% body\n",
+            "\
+callout Tip fold=None @0..26
+  title
+    \"T\"
+  paragraph @15..26
+    \" body\"
+",
+        );
     }
 }

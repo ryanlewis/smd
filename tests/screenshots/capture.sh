@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-Xvfb "$display" -screen 0 1920x1440x24 -dpi 96 -nolisten tcp &
+Xvfb "$display" -screen 0 1920x1440x24 -dpi 96 -nolisten tcp 2>"$work/xvfb.log" &
 xvfb=$!
 export DISPLAY=$display
 for _ in $(seq 50); do
@@ -62,7 +62,10 @@ settle() {
       return 1
     fi
     sleep 1
-    now=$(pixels "$1")
+    now=$(pixels "$1") || {
+      echo "$2: cannot capture the window" >&2
+      return 1
+    }
     if [ "$now" = "$last" ]; then same=$((same + 1)); else same=0; fi
     last=$now
   done
@@ -85,7 +88,9 @@ for note in *.md; do
     "$smd" "$note" "$log" "$go" &
   kitty=$!
 
-  window=$(timeout 30 xdotool search --sync --class "$class" | head -n1) || {
+  # kitty also makes windows that are never shown; only the shown one
+  # holds the terminal.
+  window=$(timeout 30 xdotool search --sync --onlyvisible --class "$class" | head -n1) || {
     echo "$note: no kitty window appeared" >&2
     status=1
     kill "$kitty" 2>/dev/null || true
@@ -98,7 +103,10 @@ for note in *.md; do
   # kitty does not repaint cells when an image arrives after the cells that
   # show it were drawn, so they stay blank until something else changes.
   # Hiding and showing the window makes it repaint everything.
-  xdotool windowunmap --sync "$window" windowmap --sync "$window"
+  timeout 10 xdotool windowunmap --sync "$window" windowmap --sync "$window" || {
+    echo "$note: cannot hide and show the window" >&2
+    status=1
+  }
   settle "$window" "$note" || status=1
 
   if [ -s "$log" ]; then

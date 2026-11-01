@@ -4,6 +4,7 @@
 //! block (a figure, or a heading) for an image and still reach its source.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use pulldown_cmark::{
@@ -398,8 +399,29 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         .into_iter()
         .map(|c| c.start + start..c.end + start)
         .collect();
-    for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
-        builder.event(event, range.start + start..range.end + start);
+    let events = || {
+        Parser::new_ext(body, options)
+            .into_offset_iter()
+            .map(move |(event, range)| (event, range.start + start..range.end + start))
+    };
+    if source.contains("[^") {
+        let comments = &builder.comments;
+        // A definition counts when its label is not in a comment, as its
+        // range can run past the comment's end.
+        let shown = events().filter(|(event, range)| {
+            let range = match event {
+                Event::Start(Tag::FootnoteDefinition(_)) => range.start..range.start + 1,
+                _ => range.clone(),
+            };
+            !in_comment(comments, &range)
+        });
+        builder.numbered = footnote_order(shown);
+        builder.numbers = (builder.numbered.iter().enumerate())
+            .map(|(i, (label, _))| (label.clone(), i + 1))
+            .collect();
+    }
+    for (event, range) in events() {
+        builder.event(event, range);
     }
     builder.finish()
 }
@@ -629,6 +651,70 @@ pub fn value_inlines(value: &str) -> Vec<Inline> {
     out
 }
 
+/// The footnotes a reader can reach, by folded label, in the order they are
+/// numbered, with where each is first referenced: those referenced outside
+/// a footnote (a table too), in order, then those referenced only from a
+/// footnote numbered before them. A label defined twice keeps the first.
+fn footnote_order<'a>(
+    events: impl Iterator<Item = (Event<'a>, Range<usize>)>,
+) -> Vec<(String, usize)> {
+    let mut outside = Vec::new();
+    // The references in each footnote's definition.
+    let mut inside: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    // The definition being read, or `Some(None)` for one defined before.
+    let mut defining: Option<Option<String>> = None;
+    for (event, range) in events {
+        match event {
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                let label = fold(&label);
+                defining = Some((!inside.contains_key(&label)).then(|| label.clone()));
+                inside.entry(label).or_default();
+            }
+            Event::End(TagEnd::FootnoteDefinition) => defining = None,
+            Event::FootnoteReference(label) => {
+                let reference = (fold(&label), range.start);
+                match &defining {
+                    None => outside.push(reference),
+                    Some(Some(def)) => inside.entry(def.clone()).or_default().push(reference),
+                    Some(None) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut order: Vec<(String, usize)> = Vec::new();
+    let add = |refs: &[(String, usize)], order: &mut Vec<(String, usize)>| {
+        for (label, at) in refs {
+            if inside.contains_key(label) && !order.iter().any(|(l, _)| l == label) {
+                order.push((label.clone(), *at));
+            }
+        }
+    };
+    add(&outside, &mut order);
+    let mut i = 0;
+    while let Some((label, _)) = order.get(i) {
+        let refs = inside[label].clone();
+        add(&refs, &mut order);
+        i += 1;
+    }
+    order
+}
+
+/// A footnote label folded for matching, close to the Unicode case folding
+/// pulldown-cmark matches labels with.
+fn fold(label: &str) -> String {
+    let mut out = String::new();
+    for c in label.chars() {
+        match c {
+            'ß' | 'ẞ' => out.push_str("ss"),
+            'ς' => out.push('σ'),
+            'ſ' => out.push('s'),
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
 struct Builder<'a> {
     source: &'a str,
     stack: Vec<Frame>,
@@ -650,13 +736,12 @@ struct Builder<'a> {
     embeds: Vec<bool>,
     /// Obsidian comments, which are hidden.
     comments: Vec<Range<usize>>,
-    /// Each footnote referenced, by its label in lower case, in the order
-    /// of first reference, which numbers it from 1, and where that
-    /// reference is.
-    referenced: Vec<(String, usize)>,
-    /// Each footnote's definition: its label in lower case, its blocks and
-    /// where it is. A label defined twice keeps the first.
-    definitions: Vec<(String, Vec<Block>, Range<usize>)>,
+    /// The footnotes to list, from [`footnote_order`], and each one's number.
+    numbered: Vec<(String, usize)>,
+    numbers: HashMap<String, usize>,
+    /// Each footnote's definition by folded label: its blocks and where it
+    /// is. A label defined twice keeps the first.
+    definitions: HashMap<String, (Vec<Block>, Range<usize>)>,
 }
 
 struct Frame {
@@ -678,6 +763,8 @@ struct Frame {
     /// A `==` highlight opened and not yet closed: where it starts in
     /// `inlines`, and the style the `==` had.
     highlight: Option<(usize, InlineStyle)>,
+    /// Whether a footnote's definition in it was moved to the end.
+    held_footnote: bool,
 }
 
 enum FrameKind {
@@ -718,6 +805,7 @@ impl Frame {
             other_inline: false,
             left_out: false,
             highlight: None,
+            held_footnote: false,
         }
     }
 
@@ -798,8 +886,9 @@ impl<'a> Builder<'a> {
             hidden: 0,
             embeds: Vec::new(),
             comments: Vec::new(),
-            referenced: Vec::new(),
-            definitions: Vec::new(),
+            numbered: Vec::new(),
+            numbers: HashMap::new(),
+            definitions: HashMap::new(),
         }
     }
 
@@ -822,18 +911,15 @@ impl<'a> Builder<'a> {
     /// a list numbered as their references are. Each ends with a link back
     /// to its first reference. Returns the anchors for both.
     fn footnotes(&mut self, blocks: &mut Vec<Block>) -> Vec<(String, usize)> {
-        if self.referenced.is_empty() {
-            return Vec::new();
-        }
         let end = self.source.len();
         let mut anchors = Vec::new();
         let mut items = Vec::new();
-        for (i, (label, at)) in self.referenced.iter().enumerate() {
+        for (i, (label, at)) in self.numbered.iter().enumerate() {
             let n = i + 1;
-            let Some(i) = self.definitions.iter().position(|d| d.0 == *label) else {
+            // Always there: only a footnote defined is numbered.
+            let Some((mut def, range)) = self.definitions.remove(label) else {
                 continue;
             };
-            let (_, mut def, range) = self.definitions.swap_remove(i);
             anchors.push((format!("fnref:{n}"), *at));
             anchors.push((
                 format!("fn:{n}"),
@@ -891,15 +977,11 @@ impl<'a> Builder<'a> {
     }
 
     /// A reference to a footnote, shown as its number, `[1]`, linked to the
-    /// footnote.
+    /// footnote. One with no number, in a footnote not listed, is text.
     fn footnote_reference(&mut self, label: &str, range: Range<usize>) {
-        let label = label.to_lowercase();
-        let n = match self.referenced.iter().position(|(l, _)| *l == label) {
-            Some(i) => i + 1,
-            None => {
-                self.referenced.push((label, range.start));
-                self.referenced.len()
-            }
+        let Some(&n) = self.numbers.get(&fold(label)) else {
+            self.text(&format!("[^{label}]"), self.style(), range);
+            return;
         };
         let style = InlineStyle {
             link: Some(Link::from(format!("#fn:{n}").as_str())),
@@ -934,11 +1016,7 @@ impl<'a> Builder<'a> {
 
     fn event(&mut self, event: Event, range: Range<usize>) {
         // Whatever is all inside a comment is hidden.
-        if self
-            .comments
-            .iter()
-            .any(|c| c.start <= range.start && range.end <= c.end)
-        {
+        if in_comment(&self.comments, &range) {
             self.top().left_out = true;
             // A callout's title still ends at its line.
             if matches!(event, Event::SoftBreak | Event::HardBreak) {
@@ -1054,7 +1132,7 @@ impl<'a> Builder<'a> {
                 task: None,
                 mark: None,
             },
-            Tag::FootnoteDefinition(label) => FrameKind::Footnote(label.to_lowercase()),
+            Tag::FootnoteDefinition(label) => FrameKind::Footnote(fold(&label)),
             _ => return None,
         })
     }
@@ -1171,12 +1249,11 @@ impl<'a> Builder<'a> {
                 return;
             }
             FrameKind::Footnote(label) => {
-                // A quote or list item that held only this goes too.
-                self.top().left_out = true;
+                self.top().held_footnote = true;
                 frame.flush_inlines();
-                if !self.definitions.iter().any(|d| d.0 == label) {
-                    self.definitions.push((label, frame.blocks, span));
-                }
+                self.definitions
+                    .entry(label)
+                    .or_insert((frame.blocks, span));
                 return;
             }
             FrameKind::Heading(_) if frame.left_out && !frame.other_inline => return,
@@ -1206,7 +1283,8 @@ impl<'a> Builder<'a> {
             }
             FrameKind::Quote(None) => {
                 frame.flush_inlines();
-                if emptied(&frame) {
+                // A quote that held only footnotes goes too.
+                if emptied(&frame) || (frame.held_footnote && frame.blocks.is_empty()) {
                     return;
                 }
                 BlockKind::Quote(frame.blocks)
@@ -1495,6 +1573,13 @@ fn tag_len(text: &str) -> usize {
         true => 0,
         false => len,
     }
+}
+
+/// Whether `range` is all inside one of `comments`.
+fn in_comment(comments: &[Range<usize>], range: &Range<usize>) -> bool {
+    comments
+        .iter()
+        .any(|c| c.start <= range.start && range.end <= c.end)
 }
 
 /// Obsidian comments, `%%hidden%%`, inline or across lines, as byte ranges
@@ -2450,6 +2535,106 @@ paragraph @21..62
         assert_eq!(doc.blocks.len(), 1);
         assert!(doc.anchors.is_empty());
         assert_outline("Text[^1].\n", "paragraph @0..10\n  \"Text[^1].\"\n");
+    }
+
+    /// The text of each footnote listed at the end, in order.
+    fn listed(md: &str) -> Vec<String> {
+        let blocks = parse(md).blocks;
+        let Some(Block {
+            kind: BlockKind::List { items, .. },
+            span,
+        }) = blocks.last()
+        else {
+            return Vec::new();
+        };
+        if span.start != md.len() {
+            return Vec::new();
+        }
+        let mut out = String::new();
+        for item in items {
+            outline_blocks(&item.blocks, 0, &mut out);
+            out.push('|');
+        }
+        let words = |s: &str| {
+            s.lines()
+                .filter_map(|l| l.trim().strip_prefix('"')?.split('"').next())
+                .collect::<String>()
+        };
+        out.split_terminator('|').map(words).collect()
+    }
+
+    #[test]
+    fn footnotes_in_footnotes_come_after_those_in_the_note() {
+        let md = "A[^x].\n\n[^x]: see[^y]\n\n[^y]: Y.\n\nB[^z].\n\n[^z]: Z.\n";
+        assert_eq!(listed(md), ["see[3] ↩", "Z. ↩", "Y. ↩"]);
+        // One referenced only from a footnote not listed is not listed.
+        let md = "Unused[^u]\n\n[^v]: see[^w]\n\n[^w]: W.\n";
+        assert_eq!(
+            kinds(md),
+            vec![BlockKind::Paragraph(vec![text("Unused[^u]")])]
+        );
+    }
+
+    #[test]
+    fn footnote_anchors_after_frontmatter_point_into_the_whole_source() {
+        let md = "---\ntitle: x\n---\nSaid[^n] and[^m].\n\n[^m]: Em.\n\n[^n]: En.\n";
+        let doc = parse(md);
+        let at = |name| &doc.source[doc.anchor(name).unwrap()..][..4];
+        assert_eq!(at("fnref:1"), "[^n]");
+        assert_eq!(at("fnref:2"), "[^m]");
+        assert_eq!(at("fn:1"), "En.\n");
+        assert_eq!(at("fn:2"), "Em.\n");
+        assert_eq!(listed(md), ["En. ↩", "Em. ↩"]);
+    }
+
+    #[test]
+    fn a_footnote_referenced_only_in_a_comment_is_not_listed() {
+        let md = "Text %%[^1]%% here[^2].\n\n[^1]: Hidden.\n\n[^2]: Shown.\n";
+        assert_eq!(listed(md), ["Shown. ↩"]);
+        let doc = parse(md);
+        let BlockKind::Paragraph(inlines) = &doc.blocks[0].kind else {
+            panic!("{:?}", doc.blocks);
+        };
+        let shown: String = inlines
+            .iter()
+            .map(|i| match i {
+                Inline::Text { text, .. } => text.as_str(),
+                Inline::Break => "\n",
+            })
+            .collect();
+        assert_eq!(shown, "Text  here[1].");
+        // A definition in a comment is not listed either.
+        assert_eq!(
+            listed("A[^1].\n\n%%\n[^1]: Hidden.\n%%\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_tag_in_a_footnote_is_still_a_tag() {
+        let md = "A[^1].\n\n[^1]: See #topic here.\n";
+        assert!(outline(md).contains("\"#topic\" tag\n"), "{}", outline(md));
+    }
+
+    #[test]
+    fn a_footnote_referenced_in_a_table_is_listed() {
+        let md = "| a |\n|---|\n| x[^t] |\n\n[^t]: In table.\n";
+        assert_eq!(listed(md), ["In table. ↩"]);
+    }
+
+    #[test]
+    fn footnote_labels_match_as_the_parser_matches_them() {
+        let md = "A[^STRASSE] b[^ΑΣ].\n\n[^straße]: s\n\n[^ασ]: g\n";
+        assert_eq!(listed(md), ["s ↩", "g ↩"]);
+    }
+
+    #[test]
+    fn a_list_item_holding_a_footnote_stays() {
+        let blocks = kinds("1. one\n2. [^a]: def\n3. three[^a]\n");
+        let BlockKind::List { items, .. } = &blocks[0] else {
+            panic!("{blocks:?}");
+        };
+        assert_eq!(items.len(), 3);
     }
 
     #[test]

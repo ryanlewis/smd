@@ -167,10 +167,12 @@ fn default_title(name: &str) -> String {
         .map_or(String::new(), |c| c.to_uppercase().chain(chars).collect())
 }
 
-/// `inlines` with `skip` bytes taken off the front and the spaces at either
-/// end trimmed.
+/// `inlines` with the `skip` bytes of the marker taken off the front, when
+/// it was read as text, and the spaces at either end trimmed.
 fn trimmed_title(mut inlines: Vec<Inline>, skip: usize) -> Vec<Inline> {
-    if let Some(Inline::Text { text, .. }) = inlines.first_mut() {
+    if let Some(Inline::Text { text, .. }) = inlines.first_mut()
+        && text.starts_with("[!")
+    {
         *text = text.get(skip..).unwrap_or("").trim_start().to_string();
     }
     if let Some(Inline::Text { text, .. }) = inlines.last_mut() {
@@ -1080,6 +1082,10 @@ impl<'a> Builder<'a> {
         top.kind = FrameKind::Paragraph(None);
         top.inline_span = None;
         top.span.start = end;
+        // What the title line held says nothing about the body.
+        top.other_inline = false;
+        top.images.clear();
+        top.display_math.clear();
         let inlines = std::mem::take(&mut top.inlines);
         self.take_title(inlines, marker);
         true
@@ -1728,6 +1734,36 @@ callout Warning fold=None @0..30
         assert_eq!(head("> [!whatever]\n").2, vec![text("Whatever")]);
         // The marker alone, then a blank line, then the body.
         assert_eq!(head("> [!note]\n>\n> one\n>\n> two\n").3, 2);
+    }
+
+    #[test]
+    fn a_callout_body_after_its_title_can_be_an_image_or_maths() {
+        assert_eq!(
+            outline("> [!note] Diagram\n> ![pic](pic.png)\n\n> [!info] Sum\n> $$x$$\n"),
+            "\
+callout Note fold=None @0..36
+  title
+    \"Diagram\"
+  image \"pic.png\" alt=\"pic\" wiki=false @18..36
+callout Info fold=None @37..59
+  title
+    \"Sum\"
+  figure Math \"x\" @51..59
+"
+        );
+    }
+
+    #[test]
+    fn a_marker_read_as_a_link_keeps_its_text() {
+        assert_eq!(
+            outline("> [!note](x) rest\n"),
+            "\
+callout Note fold=None @0..18
+  title
+    \"!note\" link=\"x\" wiki=false
+    \" rest\"
+"
+        );
     }
 
     #[test]

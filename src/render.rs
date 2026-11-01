@@ -9,7 +9,7 @@ use syntect::parsing::SyntaxSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::doc::{
-    Block, BlockKind, Document, FigureKind, Frontmatter, Inline, InlineStyle, Link, ListItem,
+    self, Block, BlockKind, Document, FigureKind, Frontmatter, Inline, InlineStyle, Link, ListItem,
 };
 use crate::highlight::{self, Segments};
 use crate::images::{self, Images, Placement};
@@ -257,7 +257,10 @@ fn contents(
             let error = images::key(block).and_then(|key| ctx.images.error(&key));
             figure(source, error, width, first, rest, out);
         }
-        BlockKind::Frontmatter(front) => frontmatter(front, width, first, rest, out),
+        BlockKind::Frontmatter(front) => {
+            let links = frontmatter(front, width, first, rest, out);
+            ctx.layout.links.extend(links);
+        }
         BlockKind::Html(html) => {
             let dim = Style::new().add_modifier(Modifier::DIM);
             preformatted(html, dim, width, first, rest, out);
@@ -287,18 +290,23 @@ fn contents(
 
 /// A note's properties, dimmed, one `key  value` row each with the values
 /// lined up. A key too wide for its column has its value on the lines under
-/// it. Frontmatter that could not be read shows as its text.
+/// it. Frontmatter that could not be read shows as its text. Returns where
+/// the links in one-line values landed.
 fn frontmatter(
     front: &Frontmatter,
     width: usize,
     first: &[Span<'static>],
     rest: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
-) {
+) -> Vec<LinkSpot> {
     let dim = Style::new().add_modifier(Modifier::DIM);
+    let mut links = Vec::new();
     let props = match &front.properties {
         Some(props) if !props.is_empty() => props,
-        _ => return preformatted(&front.raw, dim, width, first, rest, out),
+        _ => {
+            preformatted(&front.raw, dim, width, first, rest, out);
+            return links;
+        }
     };
     // The widest key that fits in a third of the view.
     let most = width.saturating_sub(spans_width(rest)) / 3;
@@ -320,9 +328,11 @@ fn frontmatter(
         if value.contains('\n') {
             preformatted(value, dim, width, &key_first, &under, out);
         } else {
-            wrap(&[note(value.clone())], dim, width, &key_first, &under, out);
+            let content = doc::value_inlines(value);
+            links.extend(wrap(&content, dim, width, &key_first, &under, out));
         }
     }
+    links
 }
 
 /// Plain text as inline content.
@@ -1903,7 +1913,9 @@ graph TD
             ]
         );
         let layout = render(&parse(md), 40, &no_images());
-        assert!(layout.links.is_empty(), "{:?}", layout.links);
+        let spots: Vec<_> = layout.links.iter().map(|s| s.cells.clone()).collect();
+        assert_eq!(spots, vec![vec![(2, 7..20)]]);
+        assert_eq!(layout.links[0].link, Link::from("https://x.org"));
         let key = &layout.lines[0].spans[0];
         assert!(key.style.add_modifier.contains(Modifier::DIM), "{key:?}");
     }
@@ -1938,6 +1950,26 @@ graph TD
         assert_eq!(
             plain("---\nk: v\n---\ntext\n\n---\n", 10),
             vec!["k  v", "", "text", "", "──────────"]
+        );
+    }
+
+    #[test]
+    fn wiki_links_in_frontmatter_can_be_followed() {
+        let md = "---\nup: \"[[Parent]]\"\nrelated: [\"[[A|the a]]\", \"[[B]]\"]\n---\n";
+        assert_eq!(plain(md, 40), vec!["up       Parent", "related  the a, B"]);
+        let layout = render(&parse(md), 40, &no_images());
+        let found: Vec<_> = layout
+            .links
+            .iter()
+            .map(|s| (s.link.dest.as_str(), s.link.wiki, s.cells.clone()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("Parent", true, vec![(0, 9..15)]),
+                ("A", true, vec![(1, 9..14)]),
+                ("B", true, vec![(1, 16..17)]),
+            ]
         );
     }
 }

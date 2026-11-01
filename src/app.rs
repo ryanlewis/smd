@@ -784,7 +784,7 @@ impl Browser {
         match self.vault.follow(link, &self.path) {
             Target::Note { path, heading } if path == self.path => {
                 if let Some(h) = heading {
-                    self.jump(&h);
+                    self.jump_here(&h);
                 }
             }
             Target::Note { path, heading } => {
@@ -801,7 +801,7 @@ impl Browser {
                     self.ahead = ahead;
                 }
             }
-            Target::Heading(h) => self.jump(&h),
+            Target::Heading(h) => self.jump_here(&h),
             Target::Web(url) => self.hand_on(&url),
             Target::Other(path) => self.hand_on(&path.to_string_lossy()),
             Target::Missing(name) => self.say(format!("no note found: {name}")),
@@ -814,7 +814,18 @@ impl Browser {
         }
     }
 
-    /// Go back to the note the last link was followed from, where it was.
+    /// Jump to a heading in this note, as a link does: Back comes back to
+    /// where the link was. A jump that goes nowhere leaves no Back step.
+    fn jump_here(&mut self, heading: &str) {
+        let here = self.here();
+        self.jump(heading);
+        if self.view.scroll != here.scroll {
+            self.history.push(here);
+            self.ahead.clear();
+        }
+    }
+
+    /// Go back to where the last link was followed from.
     fn back(&mut self) {
         self.step(|b| &mut b.history, |b| &mut b.ahead);
     }
@@ -859,7 +870,9 @@ impl Browser {
     /// Open a note again where it was left. Returns false when it cannot
     /// be read.
     fn revisit(&mut self, visited: &Visited) -> bool {
-        if !self.open(visited.path.clone()) {
+        // A place in the note on screen, unchanged since, needs no reading.
+        let showing = visited.path == self.path && Rc::ptr_eq(&visited.doc, &self.view.doc);
+        if !showing && !self.open(visited.path.clone()) {
             return false;
         }
         self.view.scroll = visited.scroll.min(self.view.max_scroll());
@@ -1793,12 +1806,15 @@ mod tests {
         b.view.act(Action::Top);
         b.follow(&wiki("#Later"));
         assert_eq!(top(&b.view), "Later");
-        // This note with no heading goes nowhere.
+        // This note with no heading, a heading already at the top and a
+        // missing heading go nowhere, and leave no Back step.
+        assert_eq!(b.history.len(), 2);
         b.follow(&wiki("HOME"));
+        b.follow(&wiki("#Later"));
         assert_eq!(top(&b.view), "Later");
-        assert!(b.history.is_empty());
         b.follow(&wiki("#nowhere"));
         assert_eq!(b.view.notice.as_deref(), Some("no heading found: nowhere"));
+        assert_eq!(b.history.len(), 2);
         // Web links and files smd does not show go to the opener.
         b.opener = |target| Err(io::Error::other(format!("asked for {target}")));
         b.follow(&Link::from("https://example.com/"));
@@ -1818,7 +1834,37 @@ mod tests {
         b.follow(&wiki("Plan#Missing"));
         assert_eq!(b.path, dir.join("Plan.md"));
         assert_eq!(b.view.notice.as_deref(), Some("no heading found: Missing"));
-        assert_eq!(b.history.len(), 1);
+        assert_eq!(b.history.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_and_forward_step_through_jumps_in_one_note() {
+        let home = format!("# Top\n\n{0}## Later\n\n{0}## Last\n\n{0}", paragraphs(8));
+        let (mut b, dir) = browser("jumps", &[("HOME.md", &home), ("Plan.md", "# Plan\n")]);
+        b.follow(&wiki("#Later"));
+        b.follow(&wiki("#Last"));
+        assert_eq!(top(&b.view), "Last");
+        let doc = Rc::clone(&b.view.doc);
+        b.back();
+        assert_eq!(top(&b.view), "Later");
+        // The note on screen is not read again.
+        assert!(Rc::ptr_eq(&doc, &b.view.doc));
+        b.back();
+        assert_eq!(top(&b.view), "Top");
+        assert!(b.history.is_empty());
+        b.forward();
+        assert_eq!(top(&b.view), "Later");
+        // A new jump drops Forward, as a link to another note does.
+        b.follow(&wiki("#Top"));
+        assert!(b.ahead.is_empty());
+        // Back from another note lands on the jump's heading, not the top.
+        b.follow(&wiki("Plan"));
+        b.back();
+        assert_eq!(b.path, dir.join("HOME.md"));
+        assert_eq!(top(&b.view), "Top");
+        b.back();
+        assert_eq!(top(&b.view), "Later");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

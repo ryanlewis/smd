@@ -239,7 +239,7 @@ Checkboxes in a file smd cannot write to are shown but passed over by Tab and cl
 
 ![Following a wiki link, with the back and forward toolbar](docs/images/links.png)
 
-The toolbar on the top row has Back and Forward buttons, dimmed when there is nowhere to go, and the name of the note. Following a link to another note opens it in smd. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
+The toolbar on the top row has Back and Forward buttons, dimmed when there is nowhere to go, and the name of the note. Following a link to another note opens it in smd. A link to a heading in the same note scrolls to it, and Back returns to where you were. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
 
 Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]` and `[[#Heading]]`. smd finds the vault by looking up from the file for a folder with a `.obsidian` folder in it, and looks up a note by name anywhere in the vault, as Obsidian does. A note outside a vault looks in its own folder and the folders below it. An embedded image, `![[diagram.png]]`, is shown like any other image. An embedded note, `![[Note]]`, is shown as a link to it.
 

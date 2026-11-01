@@ -25,7 +25,7 @@ When a change is meant to alter the screenshots, make new references in CI, not 
 
 1. Push the change to a branch.
 2. Run the `screenshots` workflow on that branch from the Actions tab with **update** ticked, or with `gh workflow run screenshots.yml --ref <branch> -f update=true`.
-3. Download the `screenshots` artifact (`gh run download <run id> -n screenshots -D tests/screenshots/reference`), check the images look right, and commit them.
+3. Once the run has passed, download the `screenshots` artifact (`gh run download <run id> -n screenshots -D tests/screenshots/reference`), check the images look right, and commit them.
 
 The same applies when you change the pinned kitty or font version, or add a note to `tests/screenshots`.
 

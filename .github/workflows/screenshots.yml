@@ -45,7 +45,9 @@ jobs:
       - run: cargo build --locked --release
       - run: sudo tests/screenshots/install.sh
       - run: tests/screenshots/capture.sh target/release/smd "$RUNNER_TEMP/screenshots"
-      - if: ${{ !inputs.update }}
+      # Also after a failed capture, so the artifact has diffs for the notes
+      # that were saved.
+      - if: ${{ !cancelled() && !inputs.update }}
         run: tests/screenshots/compare.sh "$RUNNER_TEMP/screenshots"
       - if: ${{ failure() || inputs.update }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

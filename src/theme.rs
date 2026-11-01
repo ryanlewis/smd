@@ -61,6 +61,24 @@ pub fn code_panel() -> Option<Color> {
     }
 }
 
+/// The colour `==highlighted==` text is drawn on, when the terminal said
+/// what its background is.
+pub fn highlight() -> Option<Color> {
+    BACKGROUND.get().map(|&rgb| marker(rgb))
+}
+
+/// The background moved towards yellow: a little on dark, so light text
+/// stays easy to read on it, and more on light.
+fn marker((r, g, b): Rgb) -> Color {
+    let light = luma(fraction_of(r), fraction_of(g), fraction_of(b)) > 0.5;
+    let amount = if light { 0.5 } else { 0.35 };
+    let mix = |c: u8, target: u8| {
+        let c = f64::from(c);
+        (c + (f64::from(target) - c) * amount).round() as u8
+    };
+    Color::Rgb(mix(r, 255), mix(g, 208), mix(b, 0))
+}
+
 /// The background moved a little towards white when it is dark, or towards
 /// black when it is light.
 fn panel((r, g, b): Rgb) -> Color {
@@ -190,6 +208,12 @@ mod tests {
             parse_background_colour(b"\x1b]11;rgba:0000/0000/0000/ffff\x1b\\"),
             Some((0, 0, 0))
         );
+    }
+
+    #[test]
+    fn highlight_is_the_background_moved_towards_yellow() {
+        assert_eq!(marker((0, 0, 0)), Color::Rgb(89, 73, 0));
+        assert_eq!(marker((255, 255, 255)), Color::Rgb(255, 232, 128));
     }
 
     #[test]

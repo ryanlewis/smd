@@ -227,6 +227,10 @@ pub struct InlineStyle {
     pub strikethrough: bool,
     pub code: bool,
     pub math: bool,
+    /// Obsidian's `==highlight==`.
+    pub highlight: bool,
+    /// An Obsidian tag, `#tag` or `#nested/tag`.
+    pub tag: bool,
     pub link: Option<Link>,
 }
 
@@ -366,7 +370,12 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
         }
         None => 0,
     };
-    for (event, range) in Parser::new_ext(&source[start..], options).into_offset_iter() {
+    let body = &source[start..];
+    builder.comments = comments(body, options)
+        .into_iter()
+        .map(|c| c.start + start..c.end + start)
+        .collect();
+    for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
         builder.event(event, range.start + start..range.end + start);
     }
     builder.finish()
@@ -616,6 +625,8 @@ struct Builder<'a> {
     /// For each image started and not yet ended, whether it was a wiki embed
     /// of a note, read as a link instead.
     embeds: Vec<bool>,
+    /// Obsidian comments, which are hidden.
+    comments: Vec<Range<usize>>,
 }
 
 struct Frame {
@@ -631,8 +642,12 @@ struct Frame {
     display_math: Vec<String>,
     images: Vec<(String, String, bool)>,
     other_inline: bool,
-    /// Whether an image or block in it was left out for the theme.
+    /// Whether an image or block in it was left out, for the theme or as a
+    /// comment.
     left_out: bool,
+    /// A `==` highlight opened and not yet closed: where it starts in
+    /// `inlines`, and the style the `==` had.
+    highlight: Option<(usize, InlineStyle)>,
 }
 
 enum FrameKind {
@@ -670,11 +685,26 @@ impl Frame {
             images: Vec::new(),
             other_inline: false,
             left_out: false,
+            highlight: None,
+        }
+    }
+
+    /// A `==` with no partner after it is shown as text after all.
+    fn end_highlight(&mut self) {
+        if let Some((at, style)) = self.highlight.take() {
+            for inline in &mut self.inlines[at..] {
+                if let Inline::Text { style, .. } = inline {
+                    style.highlight = false;
+                }
+            }
+            let text = "==".to_string();
+            self.inlines.insert(at, Inline::Text { text, style });
         }
     }
 
     /// Turn loose inline content (a tight list item's text) into a paragraph.
     fn flush_inlines(&mut self) {
+        self.end_highlight();
         if self.inlines.is_empty() {
             return;
         }
@@ -687,6 +717,7 @@ impl Frame {
 /// A paragraph that holds nothing but display maths becomes maths figures,
 /// and one that holds nothing but one image becomes an image block.
 fn paragraph_blocks(frame: &mut Frame, span: Range<usize>) -> Vec<Block> {
+    frame.end_highlight();
     let inlines = std::mem::take(&mut frame.inlines);
     let maths = std::mem::take(&mut frame.display_math);
     let mut images = std::mem::take(&mut frame.images);
@@ -734,6 +765,7 @@ impl<'a> Builder<'a> {
             hide: None,
             hidden: 0,
             embeds: Vec::new(),
+            comments: Vec::new(),
         }
     }
 
@@ -758,6 +790,7 @@ impl<'a> Builder<'a> {
             emphasis: self.emphasis > 0,
             strong: self.strong > 0,
             strikethrough: self.strikethrough > 0,
+            highlight: self.stack.last().is_some_and(|f| f.highlight.is_some()),
             link: self.links.last().cloned(),
             ..InlineStyle::default()
         }
@@ -773,6 +806,15 @@ impl<'a> Builder<'a> {
     }
 
     fn event(&mut self, event: Event, range: Range<usize>) {
+        // Whatever is all inside a comment is hidden.
+        if self
+            .comments
+            .iter()
+            .any(|c| c.start <= range.start && range.end <= c.end)
+        {
+            self.top().left_out = true;
+            return;
+        }
         // A table is kept whole as source text, so skip its contents.
         if self.in_table {
             if matches!(event, Event::End(TagEnd::Table)) {
@@ -794,7 +836,7 @@ impl<'a> Builder<'a> {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => match &mut self.top().kind {
                 FrameKind::Code { code, .. } => code.push_str(&text),
-                _ => self.text(&text, self.style(), range),
+                _ => self.prose(&text, range),
             },
             Event::Html(html) => match &mut self.top().kind {
                 FrameKind::Html(buf) => buf.push_str(&html),
@@ -961,6 +1003,7 @@ impl<'a> Builder<'a> {
     /// Pop the top frame and add what it built to its parent.
     fn close(&mut self) {
         let mut frame = self.stack.pop().expect("frame to close");
+        frame.end_highlight();
         let span = frame.span.clone();
         // A block left empty by an image left out for the theme goes too.
         let emptied = |frame: &Frame| frame.left_out && frame.blocks.is_empty();
@@ -1156,6 +1199,105 @@ impl<'a> Builder<'a> {
         self.push_text(text, style, range);
     }
 
+    /// A text event's text less what is in a comment, with its highlights
+    /// and tags. Text that is not the same as its source, such as an entity,
+    /// has no comment taken out.
+    fn prose(&mut self, text: &str, range: Range<usize>) {
+        let source = self.source;
+        if source.get(range.clone()) != Some(text) {
+            return self.marks(text, range, false);
+        }
+        let mut shown = Vec::new();
+        let mut at = range.start;
+        for c in &self.comments {
+            if c.start < range.end && range.start < c.end {
+                if at < c.start {
+                    shown.push(at..c.start);
+                }
+                at = at.max(c.end);
+            }
+        }
+        if at < range.end {
+            shown.push(at..range.end);
+        }
+        if shown != [range.clone()] {
+            self.top().left_out = true;
+        }
+        for piece in shown {
+            self.marks(&source[piece.clone()], piece, true);
+        }
+    }
+
+    /// Text with each `==` that opens or closes a highlight taken out, and
+    /// each tag in the tag style. When the text is `exact`, the same as the
+    /// source at `range`, the source either side of it counts too: a `==`
+    /// must touch the text it highlights, and a tag must follow a space or
+    /// start a line.
+    fn marks(&mut self, text: &str, range: Range<usize>, exact: bool) {
+        let source = self.source;
+        let before = |i: usize| match text[..i].chars().next_back() {
+            None if exact => source[..range.start].chars().next_back(),
+            c => c,
+        };
+        let after = |i: usize| match text[i..].chars().next() {
+            None if exact => source[range.end..].chars().next(),
+            c => c,
+        };
+        let piece = |s: usize, e: usize| match exact {
+            true => range.start + s..range.start + e,
+            false => range.clone(),
+        };
+        // An image's alt text is kept as written.
+        if self.image.is_some() {
+            return self.text(text, self.style(), range);
+        }
+        let mut start = 0;
+        let mut i = 0;
+        while let Some(c) = text[i..].chars().next() {
+            let prev = before(i);
+            if text[i..].starts_with("==")
+                && !matches!(prev, Some('=' | '\\'))
+                && after(i + 2) != Some('=')
+            {
+                let open = self.top().highlight.is_some();
+                let touches = match open {
+                    true => prev.is_some_and(|c| !c.is_whitespace()),
+                    false => after(i + 2).is_some_and(|c| !c.is_whitespace()),
+                };
+                if touches {
+                    self.text(&text[start..i], self.style(), piece(start, i));
+                    let style = self.style();
+                    let top = self.top();
+                    top.highlight = match open {
+                        true => None,
+                        false => Some((top.inlines.len(), style)),
+                    };
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+            }
+            let len = match c {
+                '#' => tag_len(&text[i + 1..]),
+                _ => 0,
+            };
+            if len > 0 && self.links.is_empty() && prev.is_none_or(char::is_whitespace) {
+                self.text(&text[start..i], self.style(), piece(start, i));
+                let end = i + 1 + len;
+                let style = InlineStyle {
+                    tag: true,
+                    ..self.style()
+                };
+                self.text(&text[i..end], style, piece(i, end));
+                i = end;
+                start = i;
+                continue;
+            }
+            i += c.len_utf8();
+        }
+        self.text(&text[start..], self.style(), piece(start, text.len()));
+    }
+
     /// Add inline text without counting it as prose.
     fn push_text(&mut self, text: &str, style: InlineStyle, range: Range<usize>) {
         if text.is_empty() {
@@ -1183,6 +1325,50 @@ impl<'a> Builder<'a> {
         top.inlines.push(inline);
         extend_span(&mut top.inline_span, range);
     }
+}
+
+/// The length in bytes of the tag name at the start of `text`, the part
+/// after its `#`: letters, digits, `_`, `-` and `/`, not only digits. Zero
+/// when there is no tag.
+fn tag_len(text: &str) -> usize {
+    let len = text
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '/')))
+        .unwrap_or(text.len());
+    let name = &text[..len];
+    match name.chars().all(|c| c.is_ascii_digit() || c == '/') {
+        true => 0,
+        false => len,
+    }
+}
+
+/// Obsidian comments, `%%hidden%%`, inline or across lines, as byte ranges
+/// of `source` taking in both markers. A `%%` in code or maths does not
+/// count, and a last one with no partner is shown as it is.
+fn comments(source: &str, options: Options) -> Vec<Range<usize>> {
+    if !source.contains("%%") {
+        return Vec::new();
+    }
+    let code: Vec<Range<usize>> = Parser::new_ext(source, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Start(Tag::CodeBlock(_))
+            | Event::Code(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_) => Some(range),
+            _ => None,
+        })
+        .collect();
+    let mut marks = Vec::new();
+    let mut i = 0;
+    while let Some(at) = source[i..].find("%%") {
+        let at = i + at;
+        if !code.iter().any(|c| c.contains(&at)) {
+            marks.push(at);
+        }
+        i = at + 2;
+    }
+    let (pairs, _) = marks.as_chunks::<2>();
+    pairs.iter().map(|&[open, close]| open..close + 2).collect()
 }
 
 pub fn is_wiki(link_type: LinkType) -> bool {
@@ -1866,6 +2052,8 @@ paragraph @23..37
                         strikethrough,
                         code,
                         math,
+                        highlight,
+                        tag,
                         link,
                     } = style;
                     let mut line = format!("{text:?}");
@@ -1875,6 +2063,8 @@ paragraph @23..37
                         (strikethrough, "strike"),
                         (code, "code"),
                         (math, "math"),
+                        (highlight, "highlight"),
+                        (tag, "tag"),
                     ] {
                         if *on {
                             line.push_str(&format!(" {name}"));
@@ -2333,5 +2523,99 @@ heading 2 @17..26
         assert_eq!(props("---\ntitle: \"a # b\"\n---\n"), one("title", "a # b"));
         assert_eq!(props("---\ntag: c#\n---\n"), one("tag", "c#"));
         assert_eq!(props("---\n\"a: b\": c\n---\n"), one("a: b", "c"));
+    }
+
+    #[test]
+    fn highlights_span_styles_and_need_text_touching_their_marks() {
+        assert_outline(
+            "a ==b *c* d== e == f ==g\n",
+            r#"paragraph @0..25
+  "a "
+  "b " highlight
+  "c" em highlight
+  " d" highlight
+  " e == f "
+  "=="
+  "g"
+"#,
+        );
+    }
+
+    #[test]
+    fn highlights_are_not_read_in_code_escapes_or_longer_runs() {
+        assert_outline(
+            "`==a==` \\==b== c===d===\n\n```\n==e==\n```\n",
+            r#"paragraph @0..24
+  "==a==" code
+  " ==b== c===d==="
+code None "==e==\n" @25..38
+"#,
+        );
+    }
+
+    #[test]
+    fn tags_start_after_a_space_and_are_not_all_digits() {
+        assert_outline(
+            "#top and #a/b-c_d, e#f #123 #4x `#g` [#h](u) &amp;#i\n",
+            r##"paragraph @0..53
+  "#top" tag
+  " and "
+  "#a/b-c_d" tag
+  ", e#f #123 "
+  "#4x" tag
+  " "
+  "#g" code
+  " "
+  "#h" link="u" wiki=false
+  " &#i"
+"##,
+        );
+    }
+
+    #[test]
+    fn a_heading_can_hold_a_tag() {
+        assert_outline(
+            "## Plan #todo\n",
+            r##"heading 2 @0..14
+  "Plan "
+  "#todo" tag
+"##,
+        );
+    }
+
+    #[test]
+    fn comments_are_hidden_inline_and_across_lines() {
+        assert_outline(
+            "a %%b%% c %%d\ne%% f\n\n%%\nhidden\n\n- x\n%%\n\n`%%` g\n",
+            r#"paragraph @0..20
+  "a  c  f"
+paragraph @40..47
+  "%%" code
+  " g"
+"#,
+        );
+    }
+
+    #[test]
+    fn a_block_holding_only_a_comment_goes() {
+        assert_outline(
+            "> %%x%%\n\n- %%y%%\n\n# %%z%%\n\nend\n",
+            "paragraph @27..31\n  \"end\"\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_does_not_move_a_tasks_mark() {
+        let doc = parse("%%a%%\n- [x] b %%c%%\n");
+        let BlockKind::List { items, .. } = &doc.blocks[0].kind else {
+            panic!("not a list: {:?}", doc.blocks);
+        };
+        assert_eq!(items[0].mark, Some(9));
+        assert_eq!(&doc.source[9..10], "x");
+    }
+
+    #[test]
+    fn a_comment_with_no_partner_is_shown() {
+        assert_outline("a %%b\n", "paragraph @0..6\n  \"a %%b\"\n");
     }
 }

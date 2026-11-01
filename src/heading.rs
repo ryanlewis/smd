@@ -144,18 +144,23 @@ fn osc66(scale: u8, width: u8, text: &str) -> String {
 /// Draw the heading lines in view as larger text: the first cell of each
 /// character holds its OSC 66 sequence, and the other cells it covers are
 /// left alone, as the terminal draws over them. `scroll` is the layout row
-/// at the top of `area`. A line not wholly in view stays as the layout drew
-/// it, spaced out, since the terminal cannot draw part of a character.
+/// at the top of `area`. The terminal cannot draw part of a character, so a
+/// line cut off by the bottom of `area` is drawn at the size of text, and
+/// one cut off by the top leaves only its blank rows in view.
 pub fn draw_sized(buf: &mut Buffer, area: Rect, scroll: usize, lines: &[SizedLine]) {
     for line in lines {
         let s = u16::from(line.scale);
         let Some(top) = line.row.checked_sub(scroll) else {
             continue;
         };
-        if top + usize::from(s) > usize::from(area.height) {
+        if top >= usize::from(area.height) {
             continue;
         }
         let y = area.y + top as u16;
+        if top + usize::from(s) > usize::from(area.height) {
+            text_size(buf, area.x, y, line);
+            continue;
+        }
         for cell in &line.cells {
             let cols = s * u16::from(cell.width);
             let Some(width) = NonZeroU16::new(cols) else {
@@ -319,6 +324,32 @@ fn fonts() -> Option<(&'static FontVec, &'static FontVec)> {
     let sans = raster::sans_bold().ok()?;
     let mono = raster::fonts().map_or(sans, |f| f.bold());
     Some((sans, mono))
+}
+
+/// Draw `line`'s characters on row `y` side by side at the size of text,
+/// where the layout spaced them out, in the styles they were given.
+fn text_size(buf: &mut Buffer, x: u16, y: u16, line: &SizedLine) {
+    let (Some(first), Some(last)) = (line.cells.first(), line.cells.last()) else {
+        return;
+    };
+    let s = u16::from(line.scale);
+    let end = (last.col + s * u16::from(last.width)).min(buf.area.right() - x);
+    let chars: Vec<_> = line
+        .cells
+        .iter()
+        .map(|c| (c, buf[(x + c.col, y)].style()))
+        .collect();
+    for col in first.col..end {
+        buf[(x + col, y)].reset();
+    }
+    let mut col = x + first.col;
+    for (cell, style) in chars {
+        if col + u16::from(cell.width) > buf.area.right() {
+            break;
+        }
+        buf[(col, y)].set_symbol(&cell.text).set_style(style);
+        col += u16::from(cell.width);
+    }
 }
 
 /// What a heading image is made from, or `None` for a heading that stays
@@ -796,10 +827,10 @@ mod tests {
     fn sized_lines_partly_out_of_view_stay_as_laid_out() {
         let lines = [sized(0, 2, &[(0, 1, "A")]), sized(3, 3, &[(0, 1, "B")])];
         let area = Rect::new(0, 0, 10, 4);
-        // Scrolled one row down, the first is cut at the top and the
-        // second at the bottom.
+        // Scrolled one row down, the first is cut at the top: nothing is
+        // drawn on its blank row.
         let mut buf = Buffer::empty(area);
-        draw_sized(&mut buf, area, 1, &lines);
+        draw_sized(&mut buf, area, 1, &lines[..1]);
         assert_eq!(buf, Buffer::empty(area));
         // In view inside an area lower down the screen.
         let area = Rect::new(2, 1, 10, 6);
@@ -811,6 +842,21 @@ mod tests {
         let mut buf = Buffer::empty(area);
         draw_sized(&mut buf, area, 0, &[sized(0, 2, &[(9, 1, "C")])]);
         assert_eq!(buf, Buffer::empty(area));
+    }
+
+    #[test]
+    fn sized_lines_cut_at_the_bottom_are_drawn_at_the_size_of_text() {
+        use ratatui::style::{Color, Style};
+        // As laid out: "A", a space and "日" spaced out three times.
+        let line = sized(1, 3, &[(1, 1, "A"), (4, 1, " "), (7, 2, "日")]);
+        let area = Rect::new(0, 0, 14, 3);
+        let mut buf = Buffer::empty(area);
+        let red = Style::new().fg(Color::Red);
+        buf.set_string(1, 1, "A     日    ", red);
+        draw_sized(&mut buf, area, 0, &[line]);
+        let mut want = Buffer::empty(area);
+        want.set_string(1, 1, "A 日", red);
+        assert_eq!(buf, want);
     }
 
     #[test]

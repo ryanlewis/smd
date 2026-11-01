@@ -385,15 +385,16 @@ fn sized_heading(
     let avail = (width.saturating_sub(prefix) / s).max(1);
     let mut wrapped = Vec::new();
     let links = wrap(content, heading_style(level), avail, &[], &[], &mut wrapped);
-    let top = layout.lines.len();
     let left = |i: usize| spans_width(if i == 0 { first } else { rest });
+    let mut rows = Vec::new();
     for (i, line) in wrapped.into_iter().enumerate() {
         let row = layout.lines.len();
+        rows.push(row);
         let mut col = left(i);
         let mut spans = Vec::new();
-        let mut cells = Vec::new();
+        let mut cells: Vec<heading::SizedCell> = Vec::new();
         for span in line.spans {
-            for piece in clusters(&span.content) {
+            for piece in sized_pieces(&span.content) {
                 let w = piece.width();
                 spans.push(Span::styled(piece.to_string(), span.style));
                 if w > 0 {
@@ -403,11 +404,19 @@ fn sized_heading(
                         width: w as u8,
                         text: piece.to_string(),
                     });
+                } else if let Some(cell) = cells.last_mut() {
+                    // A mark that starts a span, after emphasis say, still
+                    // belongs to the character before it.
+                    cell.text.push_str(piece);
                 }
                 col += s * w;
             }
         }
         emit(if i == 0 { first } else { rest }, spans, &mut layout.lines);
+        // An empty heading takes one row, as it does at the size of text.
+        if cells.is_empty() {
+            continue;
+        }
         for _ in 1..s {
             emit(rest, Vec::new(), &mut layout.lines);
         }
@@ -418,13 +427,37 @@ fn sized_heading(
             .cells
             .iter()
             .flat_map(|(r, cols)| {
-                let (row, x) = (top + r * s, left(*r) as u16);
+                let (row, x) = (rows[*r], left(*r) as u16);
                 let cols = x + cols.start * scale as u16..x + cols.end * scale as u16;
                 (row..row + s).map(move |row| (row, cols.clone()))
             })
             .collect();
         layout.links.push(spot);
     }
+}
+
+/// `s` in the pieces each drawn as one larger character: [`clusters`], with
+/// a flag's two letters and an emoji's skin tone kept with it, as the
+/// terminal would only join them if they were drawn together.
+fn sized_pieces(s: &str) -> Vec<&str> {
+    let flag = |c: char| matches!(c, '\u{1F1E6}'..='\u{1F1FF}');
+    let tone = |c: char| matches!(c, '\u{1F3FB}'..='\u{1F3FF}');
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for piece in clusters(s) {
+        let end = start + piece.len();
+        let first = piece.chars().next().unwrap_or(' ');
+        let joins = out.last().is_some_and(|last| {
+            let pair = flag(first) && last.chars().count() == 1 && last.chars().all(flag);
+            pair || (tone(first) && !last.chars().all(char::is_whitespace))
+        });
+        match out.last_mut() {
+            Some(last) if joins => *last = &s[end - piece.len() - last.len()..end],
+            _ => out.push(piece),
+        }
+        start = end;
+    }
+    out
 }
 
 /// A note's properties, dimmed, one `key  value` row each with the values
@@ -1400,6 +1433,35 @@ mod tests {
         assert_eq!(layout.links.len(), 1);
         let cells = &layout.links[0].cells;
         assert_eq!(cells, &[(3, 2..17), (4, 2..17), (5, 2..17)]);
+    }
+
+    fn sized_texts(layout: &Layout) -> Vec<(u16, u8, String)> {
+        let cells = layout.sized.iter().flat_map(|l| &l.cells);
+        cells.map(|c| (c.col, c.width, c.text.clone())).collect()
+    }
+
+    #[test]
+    fn sized_headings_keep_flags_and_skin_tones_whole() {
+        let layout = sized("## 🇬🇧👍🏽 🏽\n", 2, 40);
+        let want = [(2, 2, "🇬🇧"), (6, 2, "👍🏽"), (10, 1, " "), (12, 2, "🏽")];
+        let want: Vec<_> = want.iter().map(|&(c, w, t)| (c, w, t.into())).collect();
+        assert_eq!(sized_texts(&layout), want);
+        // Three flag letters: a pair, then one alone.
+        assert_eq!(sized_pieces("🇬🇧🇫"), ["🇬🇧", "🇫"]);
+    }
+
+    #[test]
+    fn a_mark_after_emphasis_stays_with_its_character() {
+        let layout = sized("# *e*\u{301}x\n", 2, 40);
+        let texts: Vec<String> = sized_texts(&layout).into_iter().map(|c| c.2).collect();
+        assert_eq!(texts, ["e\u{301}", "x"]);
+    }
+
+    #[test]
+    fn an_empty_sized_heading_takes_one_row() {
+        let layout = sized("#\n", 3, 40);
+        assert_eq!(layout.lines.len(), 1);
+        assert!(layout.sized.is_empty());
     }
 
     #[test]

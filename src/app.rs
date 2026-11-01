@@ -576,9 +576,9 @@ fn heading_start(source: &str, blocks: &[doc::Block], wanted: &str) -> Option<us
             (vault::heading_matches(&text, wanted) || vault::heading_matches(typed, wanted))
                 .then_some(b.span.start)
         }
-        BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
-            heading_start(source, inner, wanted)
-        }
+        BlockKind::Quote(inner)
+        | BlockKind::Callout { blocks: inner, .. }
+        | BlockKind::Details { blocks: inner, .. } => heading_start(source, inner, wanted),
         BlockKind::List { items, .. } => items
             .iter()
             .find_map(|item| heading_start(source, &item.blocks, wanted)),
@@ -1714,6 +1714,22 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_details_summary_opens_it() {
+        let note = "<details><summary>More</summary>\n\nsee [[Plan]]\n\n</details>\n";
+        let (mut b, dir) = browser("details", &[("HOME.md", note), ("Plan.md", "p\n")]);
+        let rows = |b: &Browser| b.view.layout.lines.len();
+        assert_eq!(rows(&b), 1);
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.stops(), [Stop::Fold(0)]);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(rows(&b), 2);
+        assert_eq!(b.view.stops(), [Stop::Fold(0), Stop::Link(0)]);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(rows(&b), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn back_comes_back_to_the_folds_as_they_were_left() {
         let note = "> [!note]- Shut\n> go [[Plan]]\n\nafter [[Plan]]\n";
         let (mut b, dir) = browser("fold-back", &[("HOME.md", note), ("Plan.md", "p\n")]);
@@ -1973,6 +1989,30 @@ mod tests {
     }
 
     #[test]
+    fn jump_to_a_heading_in_shut_details_opens_it() {
+        let md = format!(
+            "{0}<details><summary>More</summary>\n\n## Inside\n\ntext\n\n</details>\n\n{0}",
+            paragraphs(10)
+        );
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        assert!(v.jump_to_heading("inside"));
+        assert_eq!(top(&v), "  Inside");
+    }
+
+    #[test]
+    fn jump_to_a_heading_in_shut_details_in_a_definition_opens_it() {
+        let md = format!(
+            "{0}Term\n: <details><summary>More</summary>\n\n  ## Inside\n\n  </details>\n\n{0}",
+            paragraphs(10)
+        );
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        assert!(v.jump_to_heading("inside"));
+        assert!(top(&v).ends_with("Inside"), "{:?}", top(&v));
+    }
+
+    #[test]
     fn a_fold_stays_open_when_the_note_is_edited_above_it() {
         let note = "> [!note]- Shut\n> body\n";
         let mut v = new_view(note);
@@ -2180,9 +2220,9 @@ mod tests {
         for block in blocks {
             match &block.kind {
                 BlockKind::Image { src, .. } => srcs.push(src.clone()),
-                BlockKind::Quote(inner) | BlockKind::Callout { blocks: inner, .. } => {
-                    srcs.extend(image_srcs(inner))
-                }
+                BlockKind::Quote(inner)
+                | BlockKind::Callout { blocks: inner, .. }
+                | BlockKind::Details { blocks: inner, .. } => srcs.extend(image_srcs(inner)),
                 BlockKind::List { items, .. } => {
                     for item in items {
                         srcs.extend(image_srcs(&item.blocks));

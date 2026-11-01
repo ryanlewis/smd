@@ -4,6 +4,7 @@ mod doc;
 mod embed;
 mod heading;
 mod highlight;
+mod html;
 mod images;
 mod kitty;
 mod maths;

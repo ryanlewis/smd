@@ -659,8 +659,15 @@ fn svg(data: &[u8], hrefs: Hrefs) -> Result<Png, String> {
 /// would unzip a gzipped one with no limit on its size.
 fn web_data(mime: &str, data: Arc<Vec<u8>>) -> Option<resvg::usvg::ImageKind> {
     use resvg::usvg::ImageKind;
-    let size = imagesize::blob_size(&data).ok()?;
-    if size.width.saturating_mul(size.height) > GIF_MAX_PIXELS {
+    // A JPEG is measured by the decoder that draws it, as imagesize can be
+    // shown a different size.
+    let (width, height) = match mime {
+        "image/jpg" | "image/jpeg" => jpeg_size(&data).ok()?,
+        _ => imagesize::blob_size(&data)
+            .map(|size| (size.width, size.height))
+            .ok()?,
+    };
+    if width.saturating_mul(height) > GIF_MAX_PIXELS {
         return None;
     }
     match mime {
@@ -1046,6 +1053,35 @@ pub mod tests {
             "JPEG too large"
         );
         assert!(decode_remote(jpeg_claiming(5, 3)).is_ok());
+    }
+
+    /// [`jpeg_claiming`] with a fill byte before the size, which the decoder
+    /// skips. imagesize reads the fill byte as a marker instead, skips 48 KB
+    /// on, and finds a 1x1 size hidden in a comment the decoder skips.
+    fn jpeg_hiding_its_size(w: u16, h: u16) -> Vec<u8> {
+        let data = jpeg_claiming(w, h);
+        let sof = data.windows(2).position(|m| m == [0xff, 0xc0]).unwrap();
+        let sof_end = sof + 2 + usize::from(u16::from_be_bytes([data[sof + 2], data[sof + 3]]));
+        let mut out = [&data[..sof], &[0xff], &data[sof..sof_end]].concat();
+        // Where imagesize reads its next marker.
+        let at = sof + 2 + usize::from(u16::from_be_bytes([0xc0, data[sof + 2]]));
+        let mut comment = vec![0; at - (out.len() + 4)];
+        comment.extend([0xff, 0xc0, 0, 17, 8, 0, 1, 0, 1, 0, 0, 0]);
+        out.extend([0xff, 0xfe]);
+        out.extend(u16::try_from(comment.len() + 2).unwrap().to_be_bytes());
+        out.extend(comment);
+        out.extend(&data[sof_end..]);
+        out
+    }
+
+    #[test]
+    fn a_jpeg_in_a_web_svg_is_measured_as_its_decoder_reads_it() {
+        let hidden = jpeg_hiding_its_size(16000, 16000);
+        let size = imagesize::blob_size(&hidden).unwrap();
+        assert_eq!((size.width, size.height), (1, 1));
+        assert!(web_data("image/jpeg", Arc::new(hidden)).is_none());
+        let small = jpeg_hiding_its_size(5, 3);
+        assert!(web_data("image/jpeg", Arc::new(small)).is_some());
     }
 
     #[test]

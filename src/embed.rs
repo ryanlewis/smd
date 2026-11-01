@@ -501,6 +501,18 @@ mod tests {
         assert_eq!(layout.folds.len(), 0);
     }
 
+    #[test]
+    fn an_embed_in_a_comment_stays_hidden() {
+        let v = TempVault::new(
+            "comment",
+            &[
+                ("a.md", "x\n\n%%![[b]]%%\n\n%%\n![[b]]\n%%"),
+                ("b.md", "secret"),
+            ],
+        );
+        assert_eq!(v.lines("a.md"), ["x"]);
+    }
+
     /// `path` relative to the current folder, as when smd is started there.
     fn relative(path: &Path) -> PathBuf {
         let here = std::env::current_dir().unwrap();

@@ -9,10 +9,13 @@ A sexy markdown reader for the terminal that draws mermaid diagrams, maths and h
 - **Diagrams.** A ` ```mermaid ` code block is drawn as an image, by [merman](https://github.com/Latias94/merman).
 - **Maths.** Display maths (`$$ ... $$` on its own, or a ` ```math ` block) is drawn as an image. Inline maths stays as text.
 - **Headings.** Headings are drawn as images in a real font, larger for higher levels, including colour emoji.
-- **Images.** A paragraph that holds only a local PNG, GIF (first frame), JPEG or SVG, such as `![diagram](diagram.png)`, is shown as the image, read from the markdown file's folder.
+- **Images.** A paragraph that holds only a PNG, GIF (first frame), JPEG or SVG, such as `![diagram](diagram.png)` or an HTML `<img>`, is shown as the image. Local images are read from the markdown file's folder. Images from the web are fetched only when you turn them on (see [Images from the web](#images-from-the-web)).
 - **Code blocks.** Code is coloured by the language named on its fence, such as `rust` or `diff`, in the terminal's own colours, on a panel a little lighter than the background (darker on a light one).
 - **Tables.** A table wider than the pane wraps its cells. A table with too many columns to wrap well is shown as one card per row, with a `Header: value` line for each cell.
 - **Links and notes.** Follow links with the keyboard or the mouse, with a back and forward toolbar. Links to other notes open in smd, and Obsidian wiki links work.
+- **Obsidian and GitHub syntax.** Callouts and GitHub alerts, which can fold; embedded notes; frontmatter as a panel of properties; `==highlights==`, `#tags` and hidden `%%comments%%`; footnotes; definition lists; and `:emoji:` shortcodes. See [Links and Obsidian notes](#links-and-obsidian-notes).
+- **HTML.** The common HTML in READMEs is read: `<br>`, `<kbd>`, `<sub>`, `<sup>`, `<b>`, `<i>`, `<a href>`, `<img>`, and `<details>`, which folds. Comments are hidden. Other HTML is shown as dim source.
+- **Punctuation.** Straight quotes, `--`, `---` and `...` are drawn as curly quotes, en and em dashes and an ellipsis, except in code.
 - **Live reload.** smd reloads the file when it changes on disk.
 
 ## Screenshots
@@ -201,10 +204,10 @@ Diagram labels and text in SVG images use Trebuchet MS or Verdana on macOS, and 
 ## Usage
 
 ```sh
-smd [--no-graphics] [FILE]
+smd [--no-graphics] [--remote-images | --no-remote-images] [FILE]
 ```
 
-With no file, smd opens the `home` note from the config. `smd --help` lists the options and the main keys.
+With no file, smd opens the `home` note from the config. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
 
 ### Keys
 
@@ -214,8 +217,8 @@ With no file, smd opens the `home` note from the config. `smd --help` lists the 
 | Space, PgDn, PgUp, Ctrl-F, Ctrl-B | Scroll a page |
 | Ctrl-D, Ctrl-U | Scroll half a page |
 | `g`, `G`, Home, End | Go to the top or bottom |
-| Tab, Shift-Tab | Select the next or previous link or checkbox |
-| Enter | Follow the selected link, or tick or untick the selected checkbox |
+| Tab, Shift-Tab | Select the next or previous link, checkbox or folding title |
+| Enter | Follow the selected link, tick or untick the selected checkbox, or fold or unfold the selected title |
 | `x` | Tick or untick the selected checkbox |
 | Backspace, `H`, Alt-Left | Go back |
 | `L`, Alt-Right | Go forward |
@@ -225,7 +228,7 @@ The keys can be changed in the [config](#config).
 
 ### Mouse
 
-Click a link to follow it, click a checkbox to tick or untick it, click the toolbar's Back and Forward buttons, and scroll with the wheel. While smd has the mouse, dragging does not select text; most terminals let you select with Option (macOS) or Shift held.
+Click a link to follow it, click a checkbox to tick or untick it, click a callout's or `<details>` title to fold or unfold it, click the toolbar's Back and Forward buttons, and scroll with the wheel. While smd has the mouse, dragging does not select text; most terminals let you select with Option (macOS) or Shift held.
 
 With `mouse = false` in the config, smd leaves the mouse to the terminal and marks links as terminal hyperlinks (OSC 8) instead, so the terminal opens them: a web link in the browser, and a note in whatever app opens `.md` files.
 
@@ -241,7 +244,21 @@ Checkboxes in a file smd cannot write to are shown but passed over by Tab and cl
 
 The toolbar on the top row has Back and Forward buttons, dimmed when there is nowhere to go, and the name of the note. Following a link to another note opens it in smd. A link to a heading in the same note scrolls to it, and Back returns to where you were. Web links and files smd does not show (such as a PDF) are opened with the system's opener, `open` or `xdg-open`.
 
-Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]` and `[[#Heading]]`. smd finds the vault by looking up from the file for a folder with a `.obsidian` folder in it, and looks up a note by name anywhere in the vault, as Obsidian does. A note outside a vault looks in its own folder and the folders below it. An embedded image, `![[diagram.png]]`, is shown like any other image. An embedded note, `![[Note]]`, is shown as a link to it.
+Obsidian wiki links work: `[[Note]]`, `[[folder/Note|text]]`, `[[Note#Heading]]` and `[[#Heading]]`. smd finds the vault by looking up from the file for a folder with a `.obsidian` folder in it, and looks up a note by name anywhere in the vault, as Obsidian does. A note outside a vault looks in its own folder and the folders below it. An embedded image, `![[diagram.png]]`, is shown like any other image.
+
+An embedded note, `![[Note]]`, on a line of its own, shows that note's content in a frame, under the note's name, which links to it. `![[Note#Heading]]` shows only that heading's section, and `![[Note#^block]]` shows the whole note. The embedded note's frontmatter is left out. Links inside an embed lead where they would from the embedded note, and its tasks cannot be ticked. An embed in the middle of a sentence, one that cannot be found, a loop, or one nested more than three deep is shown as a link.
+
+A quote that starts with a callout or GitHub alert type, such as `> [!note]` or `> [!WARNING] Title`, is drawn as a callout: a coloured bar, a title line with a small mark, then the body. An unknown type is drawn as a note, and with no title the type's name is used. Put `-` after the type, `> [!faq]-`, to start it folded shut, or `+` to start it open; then select the title with Tab and press Enter, or click it, to fold or unfold it. An HTML `<details>` block folds the same way, with its `<summary>` as the title, and starts shut unless it has the `open` attribute.
+
+Frontmatter at the top of a note is shown as a small dimmed panel, one `key  value` row per top-level key. Lists are joined with commas, and links in a value can be followed. Frontmatter that is not simple `key: value` lines, and TOML `+++` frontmatter, is shown as its raw lines, dimmed.
+
+`==text==` is highlighted. Tags such as `#tag` and `#nested/tag` are shown in colour; `#123` and a `#` in the middle of a word are not tags. `%%comments%%` are hidden, inline or over several lines. None of these are read inside code, and inside tables they are shown as written.
+
+A footnote reference, `[^note]`, is shown as a numbered link, `[1]`, numbered in order of first use. The footnotes are listed at the end of the note after a rule, each with a ↩ link back to where it was first used. Back returns to where you were. A reference with no footnote stays as plain text.
+
+### Images from the web
+
+smd shows images from the web (http and https) only when `remote_images = true` is in the config or `--remote-images` is on the command line. It is off by default, and with it off smd fetches nothing. Images are fetched in the background, with a 10-second timeout and a 10 MB limit, and kept for a day in `~/.cache/smd/images` (or `$XDG_CACHE_HOME/smd/images`; `~/Library/Caches/smd/images` on macOS). If a cached image is older than a day and cannot be fetched again, the old copy is shown. An image that cannot be fetched shows its alt text. An SVG from the web cannot load local files or other URLs.
 
 ### Reloading
 
@@ -271,6 +288,11 @@ mouse = true
 # "read_only" so smd never writes to your notes.
 tasks = "toggle"
 
+# Whether images from the web (http and https) are fetched and shown.
+# Off by default, so smd fetches nothing. `--remote-images` and
+# `--no-remote-images` override it for one run.
+remote_images = false
+
 # What draws mermaid diagrams: "builtin" (the default), or "mmdc" for
 # mermaid-cli, which starts a headless browser for each one.
 mermaid = "builtin"
@@ -293,7 +315,7 @@ The actions and their default keys:
 | `page_down`, `page_up` | `space`, `pagedown`, `ctrl-f`; `pageup`, `ctrl-b` |
 | `top`, `bottom` | `g`, `home`; `G`, `end` |
 | `next_link`, `prev_link` | `tab`; `shift-tab` |
-| `follow` | `enter` (also ticks a selected checkbox) |
+| `follow` | `enter` (also ticks a selected checkbox, or folds a selected title) |
 | `toggle` | `x` |
 | `back`, `forward` | `backspace`, `H`, `alt-left`; `L`, `alt-right` |
 
@@ -303,7 +325,6 @@ A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `b
 
 - Links in headings drawn as images cannot be selected or clicked yet.
 - Only the first frame of a GIF is shown.
-- Only local images are shown; images from the web are not fetched.
 - SVGs are drawn by resvg, which covers most of SVG but not all of CSS. Text in an SVG is set in the diagram fonts (see [Fonts](#fonts)), whatever font it names.
 - Diagrams are drawn by merman, which follows mermaid closely but not exactly: a diagram may be laid out a little differently from mermaid's own, and a few that mermaid rejects are drawn. Set `mermaid = "mmdc"` to use mermaid-cli.
 - Diagram labels in Chinese, Japanese and other scripts outside the diagram font, and emoji in labels, are drawn as boxes.

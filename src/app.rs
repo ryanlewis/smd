@@ -173,7 +173,7 @@ impl View {
         let blocks = &self.layout.blocks;
         let block = match anchor {
             // The innermost block the anchor is in.
-            Some(_) => blocks.iter().rfind(|b| b.span.contains(&at) || b.span.start == at),
+            Some(_) => blocks.iter().rfind(|b| b.span.contains(&at)),
             None => blocks.iter().find(|b| b.span.start == at),
         };
         if let Some(b) = block {
@@ -1938,6 +1938,25 @@ mod tests {
         v.resize(20, 5);
         assert!(v.jump_to_heading("details"));
         assert_eq!(top(&v), "│ Details");
+    }
+
+    #[test]
+    fn jump_to_a_footnote_reference_in_a_shut_callout_opens_it() {
+        let md = format!(
+            "{0}> [!faq]- More\n> Said[^n].\n\n{0}[^n]: The note.\n",
+            paragraphs(10)
+        );
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        let shown = |v: &View| {
+            v.layout
+                .lines
+                .iter()
+                .any(|l| l.to_string().contains("Said"))
+        };
+        assert!(!shown(&v));
+        assert!(v.jump_to_heading("fnref:1"));
+        assert_eq!(top(&v), "│ Said[1].");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame, Terminal};
@@ -27,6 +27,7 @@ use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
 use crate::render::{Layout, render_folds};
+use crate::search::Search;
 use crate::theme;
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
@@ -51,6 +52,11 @@ pub struct View {
     scroll: usize,
     /// A message shown on the bottom row, such as the file being deleted.
     notice: Option<String>,
+    /// What is being typed on the bottom row, such as a search term. It
+    /// takes the row over `notice`.
+    prompt: Option<String>,
+    /// The term searched for and where it is drawn.
+    search: Search,
     /// The selected link or checkbox.
     selected: Option<Stop>,
     /// Whether checkboxes can be ticked: the config allows it and the file
@@ -87,6 +93,8 @@ pub enum Go {
     Forward,
     /// Fold the block that starts at this byte of the source open or shut.
     Fold(usize),
+    /// Show a short message on the bottom row until the next key.
+    Say(String),
 }
 
 /// The block at the top of the view, found again after the document is laid
@@ -141,6 +149,8 @@ impl View {
             height: 0,
             scroll: 0,
             notice: None,
+            prompt: None,
+            search: Search::default(),
             selected: None,
             tasks: false,
             kept: Vec::new(),
@@ -156,6 +166,7 @@ impl View {
         self.base = base;
         self.scroll = 0;
         self.selected = None;
+        self.clear_search();
         self.flipped.clear();
         self.want_images();
         self.relayout(None);
@@ -221,6 +232,7 @@ impl View {
             if let Some(row) = anchor.and_then(|a| self.find(&a)) {
                 self.scroll = row;
             }
+            self.refresh_search();
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.selected = self.selected.filter(|&s| self.has(s));
@@ -300,6 +312,7 @@ impl View {
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
             self.selected = self.selected.filter(|&s| self.has(s));
+            self.refresh_search();
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
@@ -330,7 +343,7 @@ impl View {
         mut area: Rect,
         href: impl Fn(&Link) -> Option<String>,
     ) {
-        if let Some(notice) = &self.notice
+        if let Some(notice) = self.prompt.as_ref().or(self.notice.as_ref())
             && area.height > 0
         {
             area.height -= 1;
@@ -356,6 +369,24 @@ impl View {
                 .collect()
         };
         let buf = frame.buffer_mut();
+        // Where the search term is drawn, the match the reader is on in
+        // reverse.
+        if self.search.active() {
+            let marked = Style::new().fg(Color::Black).bg(Color::Yellow);
+            for (i, m) in self.search.matches.iter().enumerate() {
+                let Some(cols) = &m.cols else {
+                    continue;
+                };
+                let style = if self.search.current == Some(i) {
+                    marked.add_modifier(Modifier::REVERSED)
+                } else {
+                    marked
+                };
+                for rect in cells(&[(m.row, cols.clone())]) {
+                    buf.set_style(rect, style);
+                }
+            }
+        }
         // The selected link or checkbox is shown in reverse.
         if let Some(stop) = self.selected {
             for rect in cells(&self.cells(stop)) {
@@ -466,8 +497,96 @@ impl View {
             },
             Action::Back => return Some(Go::Back),
             Action::Forward => return Some(Go::Forward),
+            Action::Search => self.start_search(),
+            Action::NextMatch => return Some(self.next_match(true)),
+            Action::PrevMatch => return Some(self.next_match(false)),
         }
         None
+    }
+
+    /// Start typing a search term on the bottom row.
+    fn start_search(&mut self) {
+        self.search = Search {
+            typing: true,
+            ..Search::default()
+        };
+        self.prompt = Some(self.search.prompt());
+    }
+
+    /// Take a key typed into the search prompt: a character adds to the
+    /// term, Backspace takes one off, Enter goes to the first match from
+    /// the top of the view and Esc gives the search up.
+    fn search_key(&mut self, key: event::KeyEvent) -> Option<Go> {
+        match key.code {
+            KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+                self.search.term.push(c);
+            }
+            KeyCode::Backspace => {
+                self.search.term.pop();
+            }
+            KeyCode::Enter => {
+                self.search.typing = false;
+                self.prompt = None;
+                if !self.search.active() {
+                    return None;
+                }
+                let found = self.search.first_from(self.scroll);
+                let found = found.map(|(i, round)| (i, round.then_some(true)));
+                return Some(self.go_to_match(found));
+            }
+            KeyCode::Esc => {
+                self.clear_search();
+                return None;
+            }
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                self.clear_search();
+                return None;
+            }
+            _ => return None,
+        }
+        self.refresh_search();
+        None
+    }
+
+    /// Find the search term in the layout again, keeping the prompt's count
+    /// up to date while it is typed.
+    fn refresh_search(&mut self) {
+        self.search.refresh(&self.layout, &self.doc);
+        if self.search.typing {
+            self.prompt = Some(self.search.prompt());
+        }
+    }
+
+    /// Give up the search and stop marking its matches.
+    fn clear_search(&mut self) {
+        self.search = Search::default();
+        self.prompt = None;
+    }
+
+    /// Go to the next or previous match of the search.
+    fn next_match(&mut self, forward: bool) -> Go {
+        if !self.search.active() {
+            return Go::Say("no search: press / to search".into());
+        }
+        let found = self.search.step(forward, self.in_view());
+        self.go_to_match(found.map(|(i, round)| (i, round.then_some(forward))))
+    }
+
+    /// Make `found` the current match and bring it into view, a little way
+    /// down the page when that moves it. Says which match it is, or that
+    /// there are none.
+    fn go_to_match(&mut self, found: Option<(usize, Option<bool>)>) -> Go {
+        let wrapped = found.and_then(|(_, w)| w);
+        if let Some((i, _)) = found {
+            self.search.current = Some(i);
+            let row = self.search.matches[i].row;
+            if !self.in_view().contains(&row) {
+                self.scroll = row
+                    .saturating_sub(self.height as usize / 3)
+                    .min(self.max_scroll());
+            }
+        }
+        Go::Say(self.search.status(wrapped))
     }
 
     /// Open each shut block that holds the byte `at`, outermost first, so
@@ -699,6 +818,8 @@ type Stack = fn(&mut Browser) -> &mut Vec<Visited>;
 /// A note left by following a link, to come back to.
 struct Visited {
     path: PathBuf,
+    /// It was read from stdin, so it cannot be read again.
+    piped: bool,
     doc: Rc<Document>,
     scroll: usize,
     selected: Option<Stop>,
@@ -711,6 +832,9 @@ pub struct Browser {
     view: View,
     path: PathBuf,
     watcher: Watcher,
+    /// The note on screen was read from stdin: it has no file to reload or
+    /// tick tasks in.
+    piped: bool,
     vault: Vault,
     config: Config,
     /// Where Back goes, the last place last.
@@ -737,6 +861,7 @@ impl Browser {
             view,
             path,
             watcher,
+            piped: false,
             vault,
             config,
             history: Vec::new(),
@@ -751,6 +876,14 @@ impl Browser {
         browser
     }
 
+    /// The same browser, its note read from stdin: it is not reloaded and
+    /// its tasks cannot be ticked.
+    pub fn piped(mut self) -> Self {
+        self.piped = true;
+        self.check_tasks();
+        self
+    }
+
     /// Show a short message until the next key.
     fn say(&mut self, notice: String) {
         self.view.set_notice(Some(notice));
@@ -760,6 +893,10 @@ impl Browser {
     /// Handle a mouse event: a click on a link follows it, and the wheel
     /// scrolls.
     fn mouse(&mut self, event: MouseEvent) {
+        // Clicks wait until the search term is typed.
+        if self.view.search.typing {
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if event.modifiers.is_empty() => {
                 if std::mem::take(&mut self.passing) {
@@ -795,6 +932,17 @@ impl Browser {
         if std::mem::take(&mut self.passing) {
             self.view.set_notice(None);
         }
+        if self.view.search.typing {
+            if let Some(go) = self.view.search_key(key) {
+                self.go(go);
+            }
+            return false;
+        }
+        // Esc leaves a search before it quits.
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() && self.view.search.active() {
+            self.view.clear_search();
+            return false;
+        }
         let Some(action) = self.config.action(key) else {
             return false;
         };
@@ -815,6 +963,7 @@ impl Browser {
             Go::Back => self.back(),
             Go::Forward => self.forward(),
             Go::Fold(at) => self.view.fold(at),
+            Go::Say(notice) => self.say(notice),
         }
     }
 
@@ -834,7 +983,7 @@ impl Browser {
     /// Let checkboxes be ticked when the config allows it and the note can
     /// be written.
     fn check_tasks(&mut self) {
-        self.view.tasks = self.config.tasks == Tasks::Toggle && writable(&self.path);
+        self.view.tasks = self.config.tasks == Tasks::Toggle && !self.piped && writable(&self.path);
         if let Some(Stop::Task(_)) = self.view.selected
             && !self.view.tasks
         {
@@ -877,7 +1026,7 @@ impl Browser {
 
     fn follow(&mut self, link: &Link) {
         match self.vault.follow(link, &self.path) {
-            Target::Note { path, heading } if path == self.path => {
+            Target::Note { path, heading } if path == self.path && !self.piped => {
                 if let Some(h) = heading {
                     self.jump_here(&h);
                 }
@@ -966,6 +1115,7 @@ impl Browser {
     fn here(&self) -> Visited {
         Visited {
             path: self.path.clone(),
+            piped: self.piped,
             doc: Rc::clone(&self.view.doc),
             scroll: self.view.scroll,
             selected: self.view.selected,
@@ -978,8 +1128,14 @@ impl Browser {
     fn revisit(&mut self, visited: &Visited) -> bool {
         // A place in the note on screen, unchanged since, needs no reading.
         let showing = visited.path == self.path && Rc::ptr_eq(&visited.doc, &self.view.doc);
-        if !showing && !self.open(visited.path.clone()) {
-            return false;
+        if !showing {
+            if visited.piped {
+                // Stdin cannot be read twice: its text is shown again.
+                let source = visited.doc.source.clone();
+                self.show(visited.path.clone(), &source, true);
+            } else if !self.open(visited.path.clone()) {
+                return false;
+            }
         }
         // Folds are kept by where they start, so only in the same text.
         if self.view.doc.source == visited.doc.source {
@@ -1054,10 +1210,17 @@ impl Browser {
                 return false;
             }
         };
+        self.show(path, &source, false);
+        self.watcher = watcher;
+        true
+    }
+
+    /// Show `source` as the note at `path`, read from stdin when `piped`.
+    fn show(&mut self, path: PathBuf, source: &str, piped: bool) {
         if !self.vault.holds(&path) {
             self.vault = Vault::for_file(&path);
         }
-        let doc = parse(&self.vault, &source, &path);
+        let doc = parse(&self.vault, source, &path);
         // Keep the images of the nearest notes Back and Forward lead to, and
         // of the one being left, which is about to join them.
         let back = self.history.iter().rev().take(KEEP_IMAGES_OF);
@@ -1068,10 +1231,12 @@ impl Browser {
         self.view.show(doc, folder(&path));
         self.view.set_notice(None);
         self.missed = None;
-        self.watcher = watcher;
+        if piped {
+            self.watcher = Watcher::new(path.clone());
+        }
         self.path = path;
+        self.piped = piped;
         self.check_tasks();
-        true
     }
 
     /// Hand a web link, or a file smd does not show, to whatever the config
@@ -1207,7 +1372,9 @@ fn run_browser<W: Write>(
         }
         if input.now().saturating_duration_since(last_check) >= CHECK_EVERY {
             last_check = input.now();
-            if let Some(change) = browser.watcher.check() {
+            if !browser.piped
+                && let Some(change) = browser.watcher.check()
+            {
                 apply(&mut browser.view, &browser.path, &browser.vault, change);
                 // Its permissions may have changed too.
                 browser.check_tasks();
@@ -1761,6 +1928,37 @@ mod tests {
     }
 
     #[test]
+    fn a_note_read_from_stdin_is_shown_with_its_tasks_locked() {
+        // As smd makes it: named stdin, its links read from here.
+        let path = PathBuf::from("stdin");
+        let vault = Vault::for_file(&path);
+        let source = "- [ ] one [[README]]\n";
+        let doc = super::parse(&vault, source, &path);
+        let mut view = View::new(doc, folder(&path), Images::new((8, 16)));
+        view.resize(40, 6);
+        let watcher = Watcher::new(path.clone());
+        let mut b = Browser::new(view, path.clone(), watcher, vault, Config::default()).piped();
+        assert!(!b.view.tasks);
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let bar: String = (0..40).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(bar.trim_end().ends_with(" stdin"), "{bar}");
+        // Tab passes over the checkbox to the link, which leads to a file
+        // here, where tasks can be ticked again.
+        enter(&mut b, KeyCode::Tab);
+        assert_eq!(b.view.selected, Some(Stop::Link(0)));
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, PathBuf::from("./README.md"));
+        assert!(!b.piped);
+        // Back shows the text read from stdin again, still locked.
+        b.back();
+        assert_eq!(b.path, path);
+        assert!(b.piped && !b.view.tasks);
+        assert_eq!(b.view.doc.source, source);
+    }
+
+    #[test]
     fn a_click_ticks_a_checkbox() {
         let (mut b, dir) = browser("tick-click", &[("HOME.md", "- [ ] one\n")]);
         let click = |column| MouseEvent {
@@ -2047,6 +2245,133 @@ mod tests {
 
     fn enter(b: &mut Browser, code: KeyCode) {
         b.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn search_marks_matches_steps_through_them_and_esc_clears_it() {
+        // Paragraph n is on row 2n; "needle" is on rows 6, 20 and 32.
+        let md: String = (0..20)
+            .map(|n| match n {
+                3 | 10 | 16 => format!("line {n} Needle\n\n"),
+                _ => format!("line {n}\n\n"),
+            })
+            .collect();
+        let (mut b, dir) = browser("search", &[("note.md", &md)]);
+        let notice = |b: &Browser| b.view.notice.clone().unwrap_or_default();
+        enter(&mut b, KeyCode::Char('/'));
+        for c in "needle".chars() {
+            enter(&mut b, KeyCode::Char(c));
+        }
+        assert_eq!(b.view.prompt.as_deref(), Some("/needle  3 matches"));
+        assert_eq!(b.view.scroll, 0, "typing does not move the view");
+        // Enter goes to the first match, a third of the way down the view.
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.view.prompt, None);
+        assert_eq!((b.view.scroll, notice(&b)), (4, "match 1/3".into()));
+        let mut steps = Vec::new();
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('n'),
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('N'),
+        ] {
+            enter(&mut b, code);
+            steps.push((b.view.scroll, notice(&b)));
+        }
+        assert_eq!(
+            steps,
+            [
+                (18, "match 2/3".into()),
+                (30, "match 3/3".into()),
+                (4, "match 1/3, wrapped to the top".into()),
+                (30, "match 3/3, wrapped to the bottom".into()),
+                (18, "match 2/3".into()),
+            ]
+        );
+        // The match on screen is marked, the current one in reverse.
+        let mut terminal = Terminal::new(TestBackend::new(30, 7)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        // The toolbar takes the top row; row 20 is the third in view.
+        let y = 1 + 20 - 18;
+        let marked: String = (0..30)
+            .filter(|&x| buf[(x, y)].bg == Color::Yellow)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert_eq!(marked, "Needle");
+        assert!(buf[(8, y)].modifier.contains(Modifier::REVERSED));
+        // A capital makes case count.
+        enter(&mut b, KeyCode::Char('/'));
+        enter(&mut b, KeyCode::Char('N'));
+        enter(&mut b, KeyCode::Char('E'));
+        assert_eq!(b.view.prompt.as_deref(), Some("/NE  no matches"));
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(notice(&b), "no matches for NE");
+        // Esc clears the search rather than quitting; the next one quits.
+        assert!(!b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!b.view.search.active());
+        assert!(b.view.search.matches.is_empty());
+        assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_search_prompt_keeps_up_and_lets_go() {
+        let md = format!(
+            "> [!note]- Shut\n> needle\n\nneedle a\n\nneedle b\n\n{}",
+            paragraphs(6)
+        );
+        let (mut b, dir) = browser("prompt", &[("note.md", &md), ("Plan.md", "# Plan\n")]);
+        let search = |b: &mut Browser, term: &str| {
+            enter(b, KeyCode::Char('/'));
+            for c in term.chars() {
+                enter(b, KeyCode::Char(c));
+            }
+        };
+        // Ctrl-C gives the prompt up.
+        search(&mut b, "needle");
+        b.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            (b.view.prompt.clone(), b.view.search.active()),
+            (None, false)
+        );
+        // Opening the callout while typing updates the count on the prompt.
+        search(&mut b, "needle");
+        assert_eq!(b.view.prompt.as_deref(), Some("/needle  2 matches"));
+        let at = b.view.layout.folds[0].at;
+        b.view.fold(at);
+        assert_eq!(b.view.prompt.as_deref(), Some("/needle  3 matches"));
+        b.view.fold(at);
+        enter(&mut b, KeyCode::Enter);
+        enter(&mut b, KeyCode::Char('n'));
+        assert_eq!(b.view.notice.as_deref(), Some("match 2/2"));
+        // A new layout numbers the matches anew, so none is current: "needle
+        // b" would be the third match now, not the second.
+        b.view.fold(at);
+        assert_eq!(b.view.search.current, None);
+        // Another note starts with no search.
+        b.follow(&wiki("Plan"));
+        assert!(!b.view.search.active());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_click_while_typing_a_search_is_passed_over() {
+        let (mut b, dir) = browser(
+            "click-search",
+            &[("HOME.md", "go [[Plan]] now\n"), ("Plan.md", "# Plan\n")],
+        );
+        enter(&mut b, KeyCode::Char('/'));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        b.mouse(click);
+        assert_eq!(b.path, dir.join("HOME.md"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn wiki(dest: &str) -> Link {
@@ -2471,6 +2796,20 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 2);
         assert_eq!(top(&b.view), "something else");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_does_not_reload_a_note_read_from_stdin() {
+        let (b, dir) = loaded("loop-piped", &[("a.md", "one\n")]);
+        let mut b = b.piped();
+        // A file at the same path is not the note shown.
+        std::fs::write(dir.join("a.md"), "something else\n").unwrap();
+        let steps = vec![Step::Wait, Step::Wait, Step::Wait, quit()];
+        let (result, frames, _) = run_script(&mut b, steps);
+        assert!(result.is_ok());
+        assert_eq!(frames, 1);
+        assert_eq!(top(&b.view), "one");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

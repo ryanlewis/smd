@@ -207,7 +207,15 @@ Diagram labels and text in SVG images use Trebuchet MS or Verdana on macOS, and 
 smd [--no-graphics] [--remote-images | --no-remote-images] [FILE]
 ```
 
-With no file, smd opens the `home` note from the config. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
+With no file, smd opens the `home` note from the config, unless markdown is piped in. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says. `smd --help` lists the options and the main keys.
+
+smd also reads markdown piped into it, or from stdin when the file is `-`:
+
+```sh
+gh pr view --json body -q .body | smd
+```
+
+Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
 
 ### Keys
 
@@ -222,9 +230,15 @@ With no file, smd opens the `home` note from the config. `--remote-images` and `
 | `x` | Tick or untick the selected checkbox |
 | Backspace, `H`, Alt-Left | Go back |
 | `L`, Alt-Right | Go forward |
+| `/` | Search the note: type a term, then Enter to go to the first match from the top of the screen |
+| `n`, `N` | Go to the next or previous match, going round at the end |
 | `q`, Esc, Ctrl-C | Quit |
 
 The keys can be changed in the [config](#config).
+
+### Search
+
+Press `/` and type a term. Matches are marked as you type, and the bottom row says how many there are. Enter goes to the first match from the top of the screen; `n` and `N` go to the next and previous match, going round at the end and saying so. Esc while typing gives the search up, and Esc after it clears the marks (the next Esc quits). The search ignores case unless the term has a capital letter in it. It looks at the text as drawn, code blocks and table cells included, not the markdown source, and a heading drawn as an image is found by its text.
 
 ### Mouse
 
@@ -318,6 +332,8 @@ The actions and their default keys:
 | `follow` | `enter` (also ticks a selected checkbox, or folds a selected title) |
 | `toggle` | `x` |
 | `back`, `forward` | `backspace`, `H`, `alt-left`; `L`, `alt-right` |
+| `search` | `/` |
+| `next_match`, `prev_match` | `n`; `N` |
 
 A key is a character (`j`, `G`, `?`), or a name: `enter`, `tab`, `shift-tab`, `backspace`, `esc`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `insert` or `f1` to `f24`. Put `ctrl-` or `alt-` in front for a modifier. With `ctrl-`, the letters `a` to `z` ignore case, so `ctrl-o` and `ctrl-O` are the same key. smd stops with an error that names the problem if the file has a mistake in it, such as an unknown setting or one key set for two actions.
 

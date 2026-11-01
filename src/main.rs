@@ -12,6 +12,7 @@ mod mermaid;
 mod raster;
 mod remote;
 mod render;
+mod search;
 mod table;
 mod theme;
 mod vault;
@@ -38,7 +39,8 @@ struct Args {
     /// Do not fetch images from the web, whatever the config says
     #[arg(long, overrides_with = "remote_images")]
     no_remote_images: bool,
-    /// The markdown file; with none, the `home` note from the config
+    /// The markdown file, or `-` for stdin; with none, stdin when markdown
+    /// is piped in, else the `home` note from the config
     file: Option<PathBuf>,
 }
 
@@ -56,17 +58,40 @@ Keys:
   x                       tick or untick the selected checkbox
   backspace, H, alt-left  go back
   L, alt-right            go forward
+  /, n, N                 search, go to the next or previous match
   q, esc, ctrl-c          quit
 
 Click a link to follow it, a checkbox to tick it, and the toolbar's buttons to
 go back and forward.
 The keys can be changed in the config file; see the README.";
 
-/// The file to open: the one given, else the home note from the config.
-fn pick_file(given: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf, &'static str> {
-    given
-        .or(home)
-        .ok_or("no file given, and no `home` in ~/.config/smd/config.toml")
+/// The name a document read from stdin goes by. Its relative links and
+/// images are read from the current directory.
+const STDIN_NAME: &str = "stdin";
+
+/// Where the markdown comes from.
+#[derive(Debug, PartialEq)]
+enum Source {
+    File(PathBuf),
+    Stdin,
+}
+
+/// Where to read the markdown from: stdin when `-` is given, or when no
+/// file is and markdown is `piped_in`; else the file given, else the home
+/// note from the config.
+fn pick_source(
+    given: Option<PathBuf>,
+    home: Option<PathBuf>,
+    piped_in: bool,
+) -> Result<Source, &'static str> {
+    match given {
+        Some(path) if path.as_os_str() == "-" => Ok(Source::Stdin),
+        Some(path) => Ok(Source::File(path)),
+        None if piped_in => Ok(Source::Stdin),
+        None => home
+            .map(Source::File)
+            .ok_or("no file given, and no `home` in ~/.config/smd/config.toml"),
+    }
 }
 
 /// Whether web images are fetched: as the flags say, else as the config does.
@@ -132,6 +157,24 @@ fn loaded(config: Result<config::Config, String>) -> Result<config::Config, Fail
 /// The markdown file's text, or a failure naming the file.
 fn source(path: &Path, read: io::Result<String>) -> Result<String, Failure> {
     read.map_err(|err| Failure::new(format!("{}: {err}", path.display())))
+}
+
+/// Whether `fd` is a pipe or a file, as stdin is with `cmd | smd` or
+/// `smd < a.md`. Not when it is /dev/null or closed, as when a launcher
+/// starts smd: the home note is opened then.
+fn is_piped(fd: libc::c_int) -> bool {
+    // SAFETY: a stat is plain data, and fstat only writes the one it is given.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    let kind = st.st_mode & libc::S_IFMT;
+    kind == libc::S_IFIFO || kind == libc::S_IFREG
+}
+
+/// The markdown read from stdin, or a failure saying it cannot be read.
+fn piped(read: io::Result<String>) -> Result<String, Failure> {
+    read.map_err(|err| Failure::new(format!("cannot read stdin: {err}")))
 }
 
 /// The terminal, or a failure saying it cannot be opened.
@@ -211,13 +254,27 @@ fn main() -> ExitCode {
 
 fn smd(args: Args) -> Result<(), Failure> {
     let config = loaded(config::Config::load())?;
-    let path = pick_file(args.file, config.home.clone()).unwrap_or_else(|message| {
+    let picked = pick_source(args.file, config.home.clone(), is_piped(libc::STDIN_FILENO));
+    let picked = picked.unwrap_or_else(|message| {
         Args::command()
             .error(ErrorKind::MissingRequiredArgument, message)
             .exit()
     });
+    let from_stdin = picked == Source::Stdin;
+    let (path, read) = match picked {
+        Source::File(path) => {
+            let read = std::fs::read_to_string(&path);
+            (path, read)
+        }
+        // Keys are then read from the terminal itself, /dev/tty.
+        Source::Stdin => (PathBuf::from(STDIN_NAME), io::read_to_string(io::stdin())),
+    };
     let watcher = watch::Watcher::new(path.clone());
-    let source = source(&path, std::fs::read_to_string(&path))?;
+    let source = if from_stdin {
+        piped(read)?
+    } else {
+        source(&path, read)?
+    };
     let vault = vault::Vault::for_file(&path);
     // Asked before the terminal is set up, while nothing else reads its replies.
     let probe = (!args.no_graphics).then(kitty::probe);
@@ -242,7 +299,10 @@ fn smd(args: Args) -> Result<(), Failure> {
     // Relative image paths are read from the markdown file's directory.
     let doc = app::parse(&vault, &source, &path);
     let view = app::View::new(doc, app::folder(&path), images);
-    let browser = app::Browser::new(view, path, watcher, vault, config);
+    let mut browser = app::Browser::new(view, path, watcher, vault, config);
+    if from_stdin {
+        browser = browser.piped();
+    }
     let result = app::run(&mut terminal, browser);
     set_mouse(&mut io::stdout(), mouse, false);
     ratatui::restore();
@@ -279,8 +339,50 @@ mod tests {
     fn a_given_file_wins_over_home() {
         let given = Some(PathBuf::from("a.md"));
         let home = Some(PathBuf::from("home.md"));
-        assert_eq!(pick_file(given, home.clone()), Ok(PathBuf::from("a.md")));
-        assert_eq!(pick_file(None, home), Ok(PathBuf::from("home.md")));
+        let file = |name: &str| Ok(Source::File(PathBuf::from(name)));
+        assert_eq!(
+            pick_source(given.clone(), home.clone(), false),
+            file("a.md")
+        );
+        assert_eq!(pick_source(given, home.clone(), true), file("a.md"));
+        assert_eq!(pick_source(None, home, false), file("home.md"));
+    }
+
+    #[test]
+    fn stdin_is_read_when_piped_or_given_as_a_dash() {
+        let home = Some(PathBuf::from("home.md"));
+        assert_eq!(pick_source(None, home.clone(), true), Ok(Source::Stdin));
+        assert_eq!(pick_source(None, None, true), Ok(Source::Stdin));
+        let dash = Some(PathBuf::from("-"));
+        assert_eq!(pick_source(dash, home, false), Ok(Source::Stdin));
+    }
+
+    #[test]
+    fn only_a_pipe_or_a_file_counts_as_piped_in() {
+        use std::os::fd::AsRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: pipe writes two descriptors into fds.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(is_piped(fds[0]));
+        // SAFETY: both descriptors are ours and closed once.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        let file = std::fs::File::open("Cargo.toml").unwrap();
+        assert!(is_piped(file.as_raw_fd()));
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert!(!is_piped(null.as_raw_fd()));
+        assert!(!is_piped(-1));
+    }
+
+    #[test]
+    fn stdin_that_cannot_be_read_says_so() {
+        assert_eq!(piped(Ok("# a".to_string())), Ok("# a".to_string()));
+        assert_eq!(
+            piped(Err(io_err("bad bytes"))),
+            Err(Failure::new("cannot read stdin: bad bytes"))
+        );
     }
 
     #[test]
@@ -306,7 +408,7 @@ mod tests {
 
     #[test]
     fn no_file_and_no_home_says_so() {
-        let err = pick_file(None, None).unwrap_err();
+        let err = pick_source(None, None, false).unwrap_err();
         assert!(err.contains("no file given") && err.contains("home"));
     }
 

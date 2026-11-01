@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame, Terminal};
@@ -27,6 +27,7 @@ use crate::highlight;
 use crate::images::{self, Images};
 use crate::kitty;
 use crate::render::{Layout, render_folds};
+use crate::search::Search;
 use crate::theme;
 use crate::vault::{self, Target, Vault};
 use crate::watch::{Change, Watcher};
@@ -51,6 +52,11 @@ pub struct View {
     scroll: usize,
     /// A message shown on the bottom row, such as the file being deleted.
     notice: Option<String>,
+    /// What is being typed on the bottom row, such as a search term. It
+    /// takes the row over `notice`.
+    prompt: Option<String>,
+    /// The term searched for and where it is drawn.
+    search: Search,
     /// The selected link or checkbox.
     selected: Option<Stop>,
     /// Whether checkboxes can be ticked: the config allows it and the file
@@ -87,6 +93,8 @@ pub enum Go {
     Forward,
     /// Fold the block that starts at this byte of the source open or shut.
     Fold(usize),
+    /// Show a short message on the bottom row until the next key.
+    Say(String),
 }
 
 /// The block at the top of the view, found again after the document is laid
@@ -141,6 +149,8 @@ impl View {
             height: 0,
             scroll: 0,
             notice: None,
+            prompt: None,
+            search: Search::default(),
             selected: None,
             tasks: false,
             kept: Vec::new(),
@@ -156,6 +166,7 @@ impl View {
         self.base = base;
         self.scroll = 0;
         self.selected = None;
+        self.search.current = None;
         self.flipped.clear();
         self.want_images();
         self.relayout(None);
@@ -221,6 +232,7 @@ impl View {
             if let Some(row) = anchor.and_then(|a| self.find(&a)) {
                 self.scroll = row;
             }
+            self.search.refresh(&self.layout, &self.doc);
         }
         self.scroll = self.scroll.min(self.max_scroll());
         self.selected = self.selected.filter(|&s| self.has(s));
@@ -300,6 +312,7 @@ impl View {
             self.scroll = self.scroll * self.layout.lines.len() / old_len;
             self.width = width;
             self.selected = self.selected.filter(|&s| self.has(s));
+            self.search.refresh(&self.layout, &self.doc);
         }
         self.height = height;
         self.scroll = self.scroll.min(self.max_scroll());
@@ -330,7 +343,7 @@ impl View {
         mut area: Rect,
         href: impl Fn(&Link) -> Option<String>,
     ) {
-        if let Some(notice) = &self.notice
+        if let Some(notice) = self.prompt.as_ref().or(self.notice.as_ref())
             && area.height > 0
         {
             area.height -= 1;
@@ -356,6 +369,24 @@ impl View {
                 .collect()
         };
         let buf = frame.buffer_mut();
+        // Where the search term is drawn, the match the reader is on in
+        // reverse.
+        if self.search.active() {
+            let marked = Style::new().fg(Color::Black).bg(Color::Yellow);
+            for (i, m) in self.search.matches.iter().enumerate() {
+                let Some(cols) = &m.cols else {
+                    continue;
+                };
+                let style = if self.search.current == Some(i) {
+                    marked.add_modifier(Modifier::REVERSED)
+                } else {
+                    marked
+                };
+                for rect in cells(&[(m.row, cols.clone())]) {
+                    buf.set_style(rect, style);
+                }
+            }
+        }
         // The selected link or checkbox is shown in reverse.
         if let Some(stop) = self.selected {
             for rect in cells(&self.cells(stop)) {
@@ -466,8 +497,84 @@ impl View {
             },
             Action::Back => return Some(Go::Back),
             Action::Forward => return Some(Go::Forward),
+            Action::Search => self.start_search(),
+            Action::NextMatch => return Some(self.next_match(true)),
+            Action::PrevMatch => return Some(self.next_match(false)),
         }
         None
+    }
+
+    /// Start typing a search term on the bottom row.
+    fn start_search(&mut self) {
+        self.search = Search {
+            typing: true,
+            ..Search::default()
+        };
+        self.prompt = Some(self.search.prompt());
+    }
+
+    /// Take a key typed into the search prompt: a character adds to the
+    /// term, Backspace takes one off, Enter goes to the first match from
+    /// the top of the view and Esc gives the search up.
+    fn search_key(&mut self, key: event::KeyEvent) -> Option<Go> {
+        match key.code {
+            KeyCode::Char(c) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+                self.search.term.push(c);
+            }
+            KeyCode::Backspace => {
+                self.search.term.pop();
+            }
+            KeyCode::Enter => {
+                self.search.typing = false;
+                self.prompt = None;
+                if !self.search.active() {
+                    return None;
+                }
+                let found = self.search.first_from(self.scroll);
+                let found = found.map(|(i, round)| (i, round.then_some(true)));
+                return Some(self.go_to_match(found));
+            }
+            KeyCode::Esc => {
+                self.clear_search();
+                return None;
+            }
+            _ => return None,
+        }
+        self.search.refresh(&self.layout, &self.doc);
+        self.prompt = Some(self.search.prompt());
+        None
+    }
+
+    /// Give up the search and stop marking its matches.
+    fn clear_search(&mut self) {
+        self.search = Search::default();
+        self.prompt = None;
+    }
+
+    /// Go to the next or previous match of the search.
+    fn next_match(&mut self, forward: bool) -> Go {
+        if !self.search.active() {
+            return Go::Say("no search: press / to search".into());
+        }
+        let found = self.search.step(forward, self.in_view());
+        self.go_to_match(found.map(|(i, round)| (i, round.then_some(forward))))
+    }
+
+    /// Make `found` the current match and bring it into view, a little way
+    /// down the page when that moves it. Says which match it is, or that
+    /// there are none.
+    fn go_to_match(&mut self, found: Option<(usize, Option<bool>)>) -> Go {
+        let wrapped = found.and_then(|(_, w)| w);
+        if let Some((i, _)) = found {
+            self.search.current = Some(i);
+            let row = self.search.matches[i].row;
+            if !self.in_view().contains(&row) {
+                self.scroll = row
+                    .saturating_sub(self.height as usize / 3)
+                    .min(self.max_scroll());
+            }
+        }
+        Go::Say(self.search.status(wrapped))
     }
 
     /// Open each shut block that holds the byte `at`, outermost first, so
@@ -795,6 +902,17 @@ impl Browser {
         if std::mem::take(&mut self.passing) {
             self.view.set_notice(None);
         }
+        if self.view.search.typing {
+            if let Some(go) = self.view.search_key(key) {
+                self.go(go);
+            }
+            return false;
+        }
+        // Esc leaves a search before it quits.
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() && self.view.search.active() {
+            self.view.clear_search();
+            return false;
+        }
         let Some(action) = self.config.action(key) else {
             return false;
         };
@@ -815,6 +933,7 @@ impl Browser {
             Go::Back => self.back(),
             Go::Forward => self.forward(),
             Go::Fold(at) => self.view.fold(at),
+            Go::Say(notice) => self.say(notice),
         }
     }
 
@@ -2047,6 +2166,75 @@ mod tests {
 
     fn enter(b: &mut Browser, code: KeyCode) {
         b.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn search_marks_matches_steps_through_them_and_esc_clears_it() {
+        // Paragraph n is on row 2n; "needle" is on rows 6, 20 and 32.
+        let md: String = (0..20)
+            .map(|n| match n {
+                3 | 10 | 16 => format!("line {n} Needle\n\n"),
+                _ => format!("line {n}\n\n"),
+            })
+            .collect();
+        let (mut b, dir) = browser("search", &[("note.md", &md)]);
+        let notice = |b: &Browser| b.view.notice.clone().unwrap_or_default();
+        enter(&mut b, KeyCode::Char('/'));
+        for c in "needle".chars() {
+            enter(&mut b, KeyCode::Char(c));
+        }
+        assert_eq!(b.view.prompt.as_deref(), Some("/needle  3 matches"));
+        assert_eq!(b.view.scroll, 0, "typing does not move the view");
+        // Enter goes to the first match, a third of the way down the view.
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.view.prompt, None);
+        assert_eq!((b.view.scroll, notice(&b)), (4, "match 1/3".into()));
+        let mut steps = Vec::new();
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('n'),
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('N'),
+        ] {
+            enter(&mut b, code);
+            steps.push((b.view.scroll, notice(&b)));
+        }
+        assert_eq!(
+            steps,
+            [
+                (18, "match 2/3".into()),
+                (30, "match 3/3".into()),
+                (4, "match 1/3, wrapped to the top".into()),
+                (30, "match 3/3, wrapped to the bottom".into()),
+                (18, "match 2/3".into()),
+            ]
+        );
+        // The match on screen is marked, the current one in reverse.
+        let mut terminal = Terminal::new(TestBackend::new(30, 7)).unwrap();
+        terminal.draw(|f| b.draw(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        // The toolbar takes the top row; row 20 is the third in view.
+        let y = 1 + 20 - 18;
+        let marked: String = (0..30)
+            .filter(|&x| buf[(x, y)].bg == Color::Yellow)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert_eq!(marked, "Needle");
+        assert!(buf[(8, y)].modifier.contains(Modifier::REVERSED));
+        // A capital makes case count.
+        enter(&mut b, KeyCode::Char('/'));
+        enter(&mut b, KeyCode::Char('N'));
+        enter(&mut b, KeyCode::Char('E'));
+        assert_eq!(b.view.prompt.as_deref(), Some("/NE  no matches"));
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(notice(&b), "no matches for NE");
+        // Esc clears the search rather than quitting; the next one quits.
+        assert!(!b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!b.view.search.active());
+        assert!(b.view.search.matches.is_empty());
+        assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn wiki(dest: &str) -> Link {

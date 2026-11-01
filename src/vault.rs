@@ -118,7 +118,7 @@ impl Vault {
 
     /// The file a wiki link names: a path from the vault's top, or a file
     /// name anywhere in it. A name with no extension is a note.
-    fn wiki(&self, name: &str, from: &Path) -> Option<PathBuf> {
+    pub(crate) fn wiki(&self, name: &str, from: &Path) -> Option<PathBuf> {
         let name = name.trim_start_matches('/');
         let file = if has_extension(name) {
             name.to_string()

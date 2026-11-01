@@ -681,40 +681,78 @@ fn web_data(mime: &str, data: Arc<Vec<u8>>) -> Option<resvg::usvg::ImageKind> {
 
 /// `text` with each CSS `var(--name, fallback)` replaced by its fallback.
 /// SVGs made for web pages colour themselves this way, and resvg does not
-/// read `var()`. One with no fallback is left alone.
+/// read `var()`. One with no fallback is left alone. This takes time in line
+/// with the length of `text` and does not recurse, as an SVG from the web
+/// may nest them as deep as it likes.
 fn css_fallbacks(text: &str) -> String {
+    let closing = var_closing_brackets(text);
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("var(") {
-        out.push_str(&rest[..at]);
-        let inner = &rest[at + 4..];
-        // The closing bracket, past any brackets inside, such as rgb(...).
-        let mut depth = 0;
-        let end = inner.char_indices().find_map(|(i, c)| match c {
-            '(' => {
-                depth += 1;
-                None
-            }
-            ')' if depth == 0 => Some(i),
-            ')' => {
-                depth -= 1;
-                None
-            }
-            _ => None,
-        });
-        match end.and_then(|end| Some((end, inner[..end].split_once(',')?.1))) {
-            Some((end, fallback)) => {
-                out.push_str(&css_fallbacks(fallback.trim()));
-                rest = &inner[end + 1..];
+    // The fallbacks being copied into this one: where each ends, and where
+    // to go on from after it.
+    let mut outer = Vec::new();
+    let (mut at, mut end) = (0, text.len());
+    loop {
+        let Some(found) = text[at..end].find("var(") else {
+            out.push_str(&text[at..end]);
+            let Some((outer_end, next)) = outer.pop() else {
+                return out;
+            };
+            (at, end) = (next, outer_end);
+            continue;
+        };
+        let var = at + found;
+        out.push_str(&text[at..var]);
+        let open = var + 3;
+        let Some(&close) = closing.get(&open) else {
+            out.push_str("var(");
+            at = open + 1;
+            continue;
+        };
+        match text[open + 1..close].find(',') {
+            Some(comma) => {
+                // Copy the fallback, trimmed, then go on after the bracket.
+                let fallback = text[open + 2 + comma..close].trim_start();
+                let from = close - fallback.len();
+                outer.push((end, close + 1));
+                (at, end) = (from, from + fallback.trim_end().len());
             }
             None => {
-                out.push_str("var(");
-                rest = inner;
+                // No fallback here, nor in any `var(` inside it.
+                out.push_str(&text[var..=close]);
+                at = close + 1;
             }
         }
     }
-    out.push_str(rest);
-    out
+}
+
+/// The closing bracket of each `var(` in `text` that has one, by the index
+/// of its opening bracket, found in one pass.
+fn var_closing_brackets(text: &str) -> HashMap<usize, usize> {
+    let mut closing = HashMap::new();
+    // Each `var(` not yet closed, and how many brackets were open before it.
+    let mut open = Vec::new();
+    let mut depth = 0;
+    for (i, b) in text.bytes().enumerate() {
+        match b {
+            b'(' => {
+                if text.as_bytes()[..i].ends_with(b"var") {
+                    open.push((i, depth));
+                }
+                depth += 1;
+            }
+            b')' if depth > 0 => {
+                depth -= 1;
+                if let Some(&(at, before)) = open.last()
+                    && before == depth
+                {
+                    open.pop();
+                    closing.insert(at, i);
+                }
+            }
+            _ => {}
+        }
+    }
+    closing
 }
 
 /// The fonts SVG text is set in: the proportional ones mermaid labels use,
@@ -1307,6 +1345,23 @@ pub mod tests {
         let teal = "<rect width='2' height='2' fill='var(--accent, #0b6e6e)'/>";
         let png = load_bytes("vars.svg", &svg_bytes(2, 2, teal)).unwrap();
         assert_eq!(pixels_rgba(&png)[0], [0x0b, 0x6e, 0x6e, 255]);
+    }
+
+    #[test]
+    fn deeply_nested_css_variables_do_not_overflow_the_stack() {
+        // A web SVG can nest them as deep as it likes.
+        let n = 30_000;
+        let text = format!("{}red{}", "var(--a, ".repeat(n), ")".repeat(n));
+        assert_eq!(css_fallbacks(&text), "red");
+    }
+
+    #[test]
+    fn many_unclosed_css_variables_take_linear_time() {
+        // Each `var(` used to scan to the end of the text for its bracket.
+        let text = "var(".repeat(100_000);
+        let started = Instant::now();
+        assert_eq!(css_fallbacks(&text), text);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

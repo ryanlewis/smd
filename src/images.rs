@@ -1922,7 +1922,7 @@ pub mod tests {
     }
 
     #[test]
-    fn a_web_svg_draws_gifs_and_webps_up_to_the_largest_allowed() {
+    fn a_web_svg_draws_gifs_webps_and_pngs_as_large_as_allowed() {
         use resvg::usvg::ImageKind;
         let data = |bytes: Vec<u8>| Arc::new(bytes);
         let gif = web_data("image/gif", data(gif_header(4, 3)));

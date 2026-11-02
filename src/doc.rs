@@ -821,9 +821,9 @@ struct Builder<'a> {
     /// wiki embed.
     image: Option<(String, String, bool)>,
     image_depth: u32,
-    /// Whether an image left out of the alt text being read has left a gap
-    /// whose space is not yet taken out.
-    alt_gap: bool,
+    /// Whether an image left out has left a gap whose space is not yet
+    /// taken out.
+    gap: bool,
     /// Images ending with this are left out.
     hide: Option<&'static str>,
     /// How deep in an image being left out.
@@ -878,6 +878,13 @@ impl Open {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
 }
+
+/// The most frames deep a block that holds others nests; deeper ones give
+/// their blocks to the one around them. A list takes two frames, a list
+/// and an item, so lists nest about half as deep. Far deeper than real
+/// documents nest, and shallow enough that drawing and dropping the
+/// blocks, which recurse, cannot run out of stack.
+const MAX_DEPTH: usize = 100;
 
 struct Frame {
     kind: FrameKind,
@@ -1034,7 +1041,7 @@ impl<'a> Builder<'a> {
             in_table: false,
             image: None,
             image_depth: 0,
-            alt_gap: false,
+            gap: false,
             hide: None,
             hidden: 0,
             colon: None,
@@ -1232,7 +1239,7 @@ impl<'a> Builder<'a> {
                 Event::Start(Tag::Image { .. }) => self.hidden += 1,
                 Event::End(TagEnd::Image) => {
                     self.hidden -= 1;
-                    self.alt_gap = self.hidden == 0 && self.image.is_some();
+                    self.gap = self.hidden == 0;
                 }
                 _ => {}
             }
@@ -1365,6 +1372,7 @@ impl<'a> Builder<'a> {
             self.top().other_inline = true;
         }
         self.push_text("[image: ", self.style(), range);
+        self.gap = false;
         self.image_depth += 1;
         if self.image_depth == 1 {
             self.image = Some((image_src(dest, wiki), String::new(), wiki));
@@ -1411,7 +1419,7 @@ impl<'a> Builder<'a> {
             return;
         }
         // An image left out at the end of an image's alt text leaves no space.
-        if std::mem::take(&mut self.alt_gap)
+        if std::mem::take(&mut self.gap)
             && let Some((_, alt, _)) = &mut self.image
             && alt.ends_with(char::is_whitespace)
         {
@@ -1519,7 +1527,11 @@ impl<'a> Builder<'a> {
             },
             FrameKind::Definition => {
                 frame.flush_inlines();
-                self.add_definition(frame.blocks, span);
+                if self.too_deep() {
+                    self.top().blocks.extend(frame.blocks);
+                } else {
+                    self.add_definition(frame.blocks, span);
+                }
                 return;
             }
             FrameKind::Code { lang, code } => code_block(lang, code),
@@ -1539,7 +1551,7 @@ impl<'a> Builder<'a> {
                     open,
                     blocks: frame.blocks,
                 };
-                self.push_block(kind, span.start..span.end.max(end));
+                self.push_nested(kind, span.start..span.end.max(end));
                 return;
             }
             FrameKind::Html(html) => {
@@ -1557,7 +1569,49 @@ impl<'a> Builder<'a> {
                 items,
             },
         };
-        self.push_block(kind, span);
+        self.push_nested(kind, span);
+    }
+
+    /// Whether a block closing now is nested deeper than `MAX_DEPTH`.
+    fn too_deep(&self) -> bool {
+        self.stack.len() >= MAX_DEPTH
+    }
+
+    /// Add a block that may hold others to the block around it. Nested too
+    /// deep to draw, what it holds goes there instead, after its title.
+    fn push_nested(&mut self, kind: BlockKind, span: Range<usize>) {
+        if !self.too_deep() {
+            return self.push_block(kind, span);
+        }
+        let paragraph = |inlines: Vec<Inline>| Block {
+            kind: BlockKind::Paragraph(inlines),
+            span: span.clone(),
+        };
+        let blocks = match kind {
+            BlockKind::Quote(blocks) => blocks,
+            BlockKind::Callout { callout, blocks } => {
+                let mut all = vec![paragraph(callout.title)];
+                all.extend(blocks);
+                all
+            }
+            BlockKind::Details {
+                summary, blocks, ..
+            } => {
+                let mut all = vec![paragraph(summary)];
+                all.extend(blocks);
+                all
+            }
+            BlockKind::Definition { term, definitions } => {
+                let mut all = vec![paragraph(term)];
+                all.extend(definitions.into_iter().flatten());
+                all
+            }
+            BlockKind::List { items, .. } => items.into_iter().flat_map(|i| i.blocks).collect(),
+            kind => vec![Block { kind, span }],
+        };
+        let top = self.top();
+        top.flush_inlines();
+        top.blocks.extend(blocks);
     }
 
     /// The `<details>` just under the lists and items on top of the stack,
@@ -1614,7 +1668,7 @@ impl<'a> Builder<'a> {
             if self.hidden > 0 {
                 // Left out for the theme: there are no events to skip.
                 self.hidden = 0;
-                self.alt_gap = self.image.is_some();
+                self.gap = true;
             } else {
                 self.text(tag.attr("alt").unwrap_or(""), self.style(), range);
                 self.end_image();
@@ -1942,15 +1996,27 @@ impl<'a> Builder<'a> {
         if let Some((_, alt, _)) = &mut self.image {
             // An image left out of it leaves one space at most.
             let mut text = text;
-            if self.alt_gap && (alt.is_empty() || alt.ends_with(char::is_whitespace)) {
+            if self.gap && (alt.is_empty() || alt.ends_with(char::is_whitespace)) {
                 text = text.trim_start();
             }
             if !text.is_empty() {
-                self.alt_gap = false;
+                self.gap = false;
             }
             alt.push_str(text);
             return self.push_text(text, style, range);
-        } else if !text.trim().is_empty() {
+        }
+        // An image left out between words leaves one space. Code keeps its
+        // spaces.
+        let mut text = text;
+        if std::mem::take(&mut self.gap)
+            && !style.code
+            && let Some(Inline::Text { text: last, .. }) = self.top().inlines.last()
+            && last.ends_with(|c: char| c.is_ascii_whitespace())
+        {
+            // Not a no-break space, which keeps its words together.
+            text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        }
+        if !text.trim().is_empty() {
             self.top().other_inline = true;
         }
         self.push_text(text, style, range);
@@ -3013,6 +3079,38 @@ paragraph @23..37
         );
         // With no theme known, both logos stay.
         assert_eq!(parse_for(md, None).blocks, parse(md).blocks);
+    }
+
+    #[test]
+    fn a_logo_left_out_between_words_leaves_one_space() {
+        let md = "x ![b](b.png#gh-light-mode-only) y\n";
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..35\n  \"x y\"\n");
+        let md = "x <img src=\"b.png#gh-light-mode-only\"> y\n";
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..41\n  \"x y\"\n");
+        // Inside alt text, the gap is closed by the text after it.
+        let md = "![a ![b](b.png#gh-light-mode-only) c ` x`](l.png)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "image \"l.png\" alt=\"a c  x\" wiki=false @0..50\n"
+        );
+        // A no-break space after it stays.
+        let md = "x ![b](b.png#gh-light-mode-only)\u{a0}y\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..36\n  \"x \\u{a0}y\"\n"
+        );
+        // Code after it keeps its spaces.
+        let md = "x ![b](b.png#gh-light-mode-only)` a` y\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..39\n  \"x \"\n  \" a\" code\n  \" y\"\n"
+        );
+        // The alt text of an image after it keeps its space.
+        let md = "x ![b](b.png#gh-light-mode-only) ![ c](l.png)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..46\n  \"x [image:  c]\"\n"
+        );
     }
 
     #[test]
@@ -4374,5 +4472,75 @@ paragraph @51..57
             "<p>a</summary> b</p>\n",
             "paragraph @0..21\n  \"a</summary> b\"\n",
         );
+    }
+
+    /// The text of each paragraph in `blocks`, with how deep it is.
+    fn deep_texts(blocks: &[Block], depth: usize, out: &mut Vec<(usize, String)>) {
+        let words = |inlines: &[Inline]| {
+            let text = inlines.iter().map(|i| match i {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            });
+            text.collect::<String>()
+        };
+        for block in blocks {
+            match &block.kind {
+                BlockKind::Paragraph(inlines) => out.push((depth, words(inlines))),
+                BlockKind::Quote(inner) => deep_texts(inner, depth + 1, out),
+                BlockKind::Callout { callout, blocks } => {
+                    out.push((depth, words(&callout.title)));
+                    deep_texts(blocks, depth + 1, out);
+                }
+                BlockKind::Details {
+                    summary, blocks, ..
+                } => {
+                    out.push((depth, words(summary)));
+                    deep_texts(blocks, depth + 1, out);
+                }
+                BlockKind::Definition { term, definitions } => {
+                    out.push((depth, words(term)));
+                    for blocks in definitions {
+                        deep_texts(blocks, depth + 1, out);
+                    }
+                }
+                BlockKind::List { items, .. } => {
+                    for item in items {
+                        deep_texts(&item.blocks, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_nested_too_deep_join_the_deepest_level_after_their_titles() {
+        let n = 150;
+        let mut details = String::new();
+        for i in 0..n {
+            details.push_str(&format!("<details><summary>s{i}</summary>\n\n"));
+        }
+        details.push_str("deep\n\n");
+        details.push_str(&"</details>\n\n".repeat(n));
+        let mut defs = String::new();
+        for i in 0..n {
+            let pad = "  ".repeat(i);
+            defs.push_str(&format!("{pad}t{i}\n{pad}: d{i}\n\n"));
+        }
+        let callout = format!("{}[!note] title\n{}body\n", "> ".repeat(n), "> ".repeat(n));
+        let list = format!("{}a\n{}- b\n", "- ".repeat(n), "  ".repeat(n - 1));
+        let at = |d: usize, texts: &[&str]| -> Vec<(usize, String)> {
+            texts.iter().map(|t| (d, t.to_string())).collect()
+        };
+        for (md, want) in [
+            (details, at(99, &["s148", "s149", "deep"])),
+            (defs, at(49, &["d148", "t149", "d149"])),
+            (callout, at(99, &["title", "body"])),
+            (list, at(50, &["a", "b"])),
+        ] {
+            let mut out = Vec::new();
+            deep_texts(&parse(&md).blocks, 0, &mut out);
+            assert_eq!(out[out.len() - want.len()..], want);
+        }
     }
 }

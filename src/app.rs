@@ -1975,11 +1975,15 @@ fn key_terminal() -> Option<std::fs::File> {
 }
 
 /// Whether the terminal on `fd` has gone: it reads as ready, yet has no
-/// bytes waiting, or cannot say how many (`waiting` then stays 0). Only right for a raw terminal
-/// that nothing else reads at the same time, as with the run loop's.
+/// bytes waiting, or cannot say how many (`waiting` then stays 0). Only
+/// right for a raw terminal that nothing else reads at the same time, as
+/// with the run loop's. A descriptor too high for select is never gone:
+/// `readable` asks poll for it, which on macOS takes any terminal as ready.
 #[cfg(unix)]
 fn gone(fd: libc::c_int) -> bool {
-    if !kitty::readable(fd, Duration::ZERO).unwrap_or(false) {
+    if fd >= libc::FD_SETSIZE as libc::c_int
+        || !kitty::readable(fd, Duration::ZERO).unwrap_or(false)
+    {
         return false;
     }
     let mut waiting: libc::c_int = 0;
@@ -4540,6 +4544,7 @@ mod tests {
         assert!(!gone(slave.as_raw_fd()), "a key waiting");
         drop(master);
         assert!(gone(slave.as_raw_fd()));
+        assert!(!gone(libc::FD_SETSIZE as libc::c_int), "too high for select");
     }
 
     // poll cannot watch a terminal on macOS, so `hung_up` does not wait there.

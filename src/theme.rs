@@ -54,9 +54,15 @@ pub fn set_fallback_panel(rgb: Rgb) {
 /// The colour to draw code blocks on: shaded from the background if the
 /// terminal said what it is, or else the fallback, if there is one.
 pub fn code_panel() -> Option<Color> {
-    match (BACKGROUND.get(), FALLBACK_PANEL.get()) {
-        (Some(&rgb), _) => Some(panel(rgb)),
-        (None, Some(&(r, g, b))) => Some(Color::Rgb(r, g, b)),
+    code_panel_for(BACKGROUND.get().copied(), FALLBACK_PANEL.get().copied())
+}
+
+/// The colour to draw code blocks on for the `background` the terminal
+/// reported, if it did, and the `fallback` colour, if there is one.
+fn code_panel_for(background: Option<Rgb>, fallback: Option<Rgb>) -> Option<Color> {
+    match (background, fallback) {
+        (Some(rgb), _) => Some(panel(rgb)),
+        (None, Some((r, g, b))) => Some(Color::Rgb(r, g, b)),
         (None, None) => None,
     }
 }
@@ -64,7 +70,13 @@ pub fn code_panel() -> Option<Color> {
 /// The colour `==highlighted==` text is drawn on, when the terminal said
 /// what its background is.
 pub fn highlight() -> Option<Color> {
-    BACKGROUND.get().map(|&rgb| marker(rgb))
+    highlight_for(BACKGROUND.get().copied())
+}
+
+/// The colour `==highlighted==` text is drawn on for the `background` the
+/// terminal reported, if it did.
+fn highlight_for(background: Option<Rgb>) -> Option<Color> {
+    background.map(marker)
 }
 
 /// The background moved towards yellow: a little on dark, so light text
@@ -268,5 +280,43 @@ mod tests {
     fn theme_names_are_lower_case_words() {
         assert_eq!(Theme::Dark.name(), "dark");
         assert_eq!(Theme::Light.name(), "light");
+    }
+
+    #[test]
+    fn the_code_panel_is_shaded_from_the_background_before_the_fallback() {
+        let dark = (0x1e, 0x1e, 0x2e);
+        let fallback = (10, 20, 30);
+        assert_eq!(
+            code_panel_for(Some(dark), Some(fallback)),
+            Some(Color::Rgb(48, 48, 63))
+        );
+        assert_eq!(
+            code_panel_for(Some((255, 255, 255)), None),
+            Some(Color::Rgb(235, 235, 235))
+        );
+        assert_eq!(
+            code_panel_for(None, Some(fallback)),
+            Some(Color::Rgb(10, 20, 30))
+        );
+        assert_eq!(code_panel_for(None, None), None);
+    }
+
+    #[test]
+    fn highlight_needs_the_background() {
+        assert_eq!(highlight_for(Some((0, 0, 0))), Some(Color::Rgb(89, 73, 0)));
+        assert_eq!(
+            highlight_for(Some((255, 255, 255))),
+            Some(Color::Rgb(255, 232, 128))
+        );
+        assert_eq!(highlight_for(None), None);
+    }
+
+    #[test]
+    fn without_a_reply_or_fallback_there_is_no_panel_or_highlight() {
+        // Tests never set the background or fallback, so this is the state
+        // at start-up in a terminal that does not answer.
+        assert!(!reported());
+        assert_eq!(code_panel(), None);
+        assert_eq!(highlight(), None);
     }
 }

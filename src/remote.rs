@@ -515,7 +515,6 @@ mod tests {
         });
         // Nothing was written anywhere else in it.
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(got, Png::new(png(4, 2)));
     }

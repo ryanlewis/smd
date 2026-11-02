@@ -1190,8 +1190,10 @@ mod tests {
                 libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
             }
         }
-        // SAFETY: duplicates an open descriptor onto an unused number.
-        (unsafe { libc::dup2(fd, high) } == high).then_some(high)
+        // SAFETY: duplicates an open descriptor onto the lowest free number
+        // at or above FD_SETSIZE, so it never takes one another test uses.
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD, libc::FD_SETSIZE as libc::c_int) };
+        (dup >= libc::FD_SETSIZE as libc::c_int).then_some(dup)
     }
 
     #[cfg(unix)]

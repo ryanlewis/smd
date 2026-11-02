@@ -4224,6 +4224,24 @@ quote @45..55
     }
 
     #[test]
+    fn a_quote_goes_only_when_it_held_nothing_but_footnotes() {
+        // An empty quote stays, as does one with text beside its footnote.
+        assert_outline(">\n", "quote @0..2\n");
+        let blocks = parse("> [^1]: n\n>\n> text\n\nx[^1]\n").blocks;
+        assert!(
+            matches!(&blocks[0].kind, BlockKind::Quote(inner)
+                if matches!(inner.as_slice(), [b] if matches!(b.kind, BlockKind::Paragraph(_)))),
+            "{blocks:?}"
+        );
+        // One that held only the footnote goes.
+        let blocks = parse("> [^1]: n\n\nx[^1]\n").blocks;
+        assert!(
+            !blocks.iter().any(|b| matches!(b.kind, BlockKind::Quote(_))),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
     fn html_comments_are_hidden() {
         assert_outline(
             "a <!-- one\nline --> b\n\n<!--\nmany\n\nlines\n-->\n\n<div>x</div> <!-- y -->\n\n<!-- open\n",

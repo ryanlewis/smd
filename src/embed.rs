@@ -746,4 +746,82 @@ mod tests {
         let got = vault.follow(&Link::from(dests[0].as_str()), &v.0.join("a.md"));
         assert!(matches!(got, Target::Missing(_)), "{got:?}");
     }
+
+    #[test]
+    fn links_in_quotes_lists_and_embeds_inside_an_embed_are_rebased() {
+        let v = TempVault::new(
+            "embed-rebase-nested",
+            &[
+                ("a.md", "![[sub/b]]"),
+                (
+                    "sub/b.md",
+                    "> [q](c.md)\n\n- [l](c.md)\n\n![[d]]\n\n[[nowhere]]\n\n![w](https://x.org/w.png)",
+                ),
+                ("sub/c.md", ""),
+                ("sub/d.md", "D"),
+                // Found from the host instead, `[[d]]` would lead here.
+                ("d.md", "Root D"),
+            ],
+        );
+        let doc = v.open("a.md");
+        let BlockKind::Embed { doc, .. } = &doc.blocks[0].kind else {
+            panic!("not embedded: {:?}", doc.blocks);
+        };
+        let sub = absolute(v.0.join("sub"));
+        let sub = sub.display();
+        let link = |blocks: &[Block]| -> Link {
+            let BlockKind::Paragraph(content) = &blocks[0].kind else {
+                panic!("no paragraph: {blocks:?}");
+            };
+            let Inline::Text { style, .. } = &content[0] else {
+                panic!("no text: {content:?}");
+            };
+            style.link.clone().expect("a link")
+        };
+        let BlockKind::Quote(quote) = &doc.blocks[0].kind else {
+            panic!("no quote: {:?}", doc.blocks);
+        };
+        assert_eq!(link(quote).dest, format!("{sub}/c.md"));
+        let BlockKind::List { items, .. } = &doc.blocks[1].kind else {
+            panic!("no list: {:?}", doc.blocks);
+        };
+        assert_eq!(link(&items[0].blocks).dest, format!("{sub}/c.md"));
+        let BlockKind::Embed { link: inner, .. } = &doc.blocks[2].kind else {
+            panic!("no inner embed: {:?}", doc.blocks);
+        };
+        assert_eq!(
+            *inner,
+            Link {
+                dest: format!("{sub}/d.md"),
+                wiki: false
+            }
+        );
+        // A wiki link that leads nowhere is kept, as it leads nowhere from
+        // any note.
+        assert_eq!(
+            link(std::slice::from_ref(&doc.blocks[3])),
+            Link {
+                dest: "nowhere".into(),
+                wiki: true
+            }
+        );
+        // A web image is left as it is.
+        let BlockKind::Image { src, .. } = &doc.blocks[4].kind else {
+            panic!("no image: {:?}", doc.blocks);
+        };
+        assert_eq!(src, "https://x.org/w.png");
+    }
+
+    #[test]
+    fn an_embed_with_a_styled_alias_is_framed_under_the_whole_alias() {
+        let v = TempVault::new(
+            "embed-styled-alias",
+            &[("a.md", "![[b|x *y* z]]"), ("b.md", "B")],
+        );
+        let doc = v.open("a.md");
+        let BlockKind::Embed { title, .. } = &doc.blocks[0].kind else {
+            panic!("not embedded: {:?}", doc.blocks);
+        };
+        assert_eq!(title, "x y z");
+    }
 }

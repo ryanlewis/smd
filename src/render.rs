@@ -1452,6 +1452,40 @@ mod tests {
         layout.lines.iter().map(line).collect()
     }
 
+    /// A level 1 heading at twice the size in 42 columns, two of them a
+    /// quote bar. unicode-width counts a skin tone joined to flag letters as
+    /// two columns, but its pieces take four, so its last cell is laid out
+    /// past the edge.
+    fn too_wide() -> Layout {
+        let layout = sized("# aaaaaaaaaaaaaaaaaa🏻\u{200D}🇫🇧\n", 2, 42);
+        assert!(usize::from(layout.sized[0].cells.last().unwrap().col) >= 42);
+        layout
+    }
+
+    #[test]
+    fn a_sized_heading_laid_out_past_the_edge_is_cut_at_the_bottom_without_a_panic() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        // Cut at the bottom of the view, it is drawn at the size of text.
+        let area = Rect::new(0, 0, 42, 1);
+        let mut buf = Buffer::empty(area);
+        heading::draw_sized(&mut buf, area, 0, &too_wide().sized);
+        assert_eq!(buf[(19, 0)].symbol(), "a🏻\u{200D}🇫");
+        assert_eq!(buf[(23, 0)].symbol(), "🇧");
+    }
+
+    #[test]
+    fn a_sized_heading_cut_at_the_bottom_leaves_the_margins_alone() {
+        use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+        // A view narrower than the screen, as max_width makes it.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 1));
+        buf.set_string(0, 0, "M".repeat(60), Style::default());
+        let area = Rect::new(9, 0, 42, 1);
+        heading::draw_sized(&mut buf, area, 0, &too_wide().sized);
+        for x in (0..9).chain(51..60) {
+            assert_eq!(buf[(x, 0)].symbol(), "M", "column {x}");
+        }
+    }
+
     #[test]
     fn sized_headings_are_spaced_out_with_rows_under_them() {
         // A narrow letter, a wide one and an emoji with U+FE0F.

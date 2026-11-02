@@ -3,39 +3,54 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long smd may take to end once the terminal is gone.
 const ENDS_WITHIN: Duration = Duration::from_secs(1);
 
-/// A new pseudo-terminal, 80 by 24: its master and its slave.
+/// A new pseudo-terminal, 80 by 24: its master and its slave. Both are
+/// opened close-on-exec, so an smd another test starts meanwhile cannot
+/// hold the master open, which would keep the pty up. The slave still
+/// reaches smd as its stdin or stdout.
 fn pty() -> (OwnedFd, OwnedFd) {
-    let (mut master, mut slave) = (-1, -1);
-    let mut size = libc::winsize {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    /// ptsname writes the name to a buffer every caller shares.
+    static PTSNAME: Mutex<()> = Mutex::new(());
+    let open = |path: &std::ffi::OsStr| -> OwnedFd {
+        File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .unwrap()
+            .into()
+    };
+    let master = open("/dev/ptmx".as_ref());
+    let fd = master.as_raw_fd();
+    let size = libc::winsize {
         ws_row: 24,
         ws_col: 80,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    // SAFETY: openpty writes two descriptors; the rest are only read.
-    let made = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut size,
-        )
+    let _shared = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: fd is a pty master; ptsname's name is copied before the lock
+    // is let go, and TIOCSWINSZ only reads size.
+    let name = unsafe {
+        assert_eq!(libc::grantpt(fd), 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(libc::unlockpt(fd), 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(libc::ioctl(fd, libc::TIOCSWINSZ, &size), 0);
+        let name = libc::ptsname(fd);
+        assert!(!name.is_null(), "{}", std::io::Error::last_os_error());
+        std::ffi::CStr::from_ptr(name).to_owned()
     };
-    assert_eq!(made, 0, "openpty: {}", std::io::Error::last_os_error());
-    // So smd does not hold the master open, which would keep the pty up.
-    // SAFETY: only changes the descriptor's flags.
-    unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
-    // SAFETY: both are new descriptors that nothing else owns.
-    unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+    let slave = open(std::ffi::OsStr::from_bytes(name.to_bytes()));
+    (master, slave)
 }
 
 /// Start smd on the slave of a new pty, as its controlling terminal, with

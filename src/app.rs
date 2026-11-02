@@ -4637,36 +4637,37 @@ mod tests {
         assert!(!ignored(libc::SIGUSR2));
     }
 
-    /// A new pseudo-terminal: its master and its slave.
+    /// A new pseudo-terminal: its master and its slave. Both are opened
+    /// close-on-exec, so a child another test starts meanwhile cannot hold
+    /// the master open, which would keep the pty up.
     #[cfg(unix)]
     fn pty() -> (std::fs::File, std::fs::File) {
-        use std::os::fd::FromRawFd;
-        let (mut master, mut slave) = (-1, -1);
-        // SAFETY: openpty writes two descriptors; the null ones are unused.
-        let made = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        /// ptsname writes the name to a buffer every caller shares.
+        static PTSNAME: Mutex<()> = Mutex::new(());
+        let open = |path: &std::ffi::OsStr| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(path)
+                .unwrap()
         };
-        assert_eq!(made, 0, "openpty: {}", io::Error::last_os_error());
-        // So a child another test starts does not hold the master open,
-        // which would keep the pty up.
-        // SAFETY: only changes the descriptors' flags.
-        unsafe {
-            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        // SAFETY: both are new descriptors that nothing else owns.
-        unsafe {
-            (
-                std::fs::File::from_raw_fd(master),
-                std::fs::File::from_raw_fd(slave),
-            )
-        }
+        let master = open("/dev/ptmx".as_ref());
+        let fd = master.as_raw_fd();
+        let _shared = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: fd is a pty master; ptsname's name is copied before the
+        // lock is let go.
+        let name = unsafe {
+            assert_eq!(libc::grantpt(fd), 0, "{}", io::Error::last_os_error());
+            assert_eq!(libc::unlockpt(fd), 0, "{}", io::Error::last_os_error());
+            let name = libc::ptsname(fd);
+            assert!(!name.is_null(), "{}", io::Error::last_os_error());
+            std::ffi::CStr::from_ptr(name).to_owned()
+        };
+        let slave = open(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        (master, slave)
     }
 
     #[cfg(unix)]

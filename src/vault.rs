@@ -107,7 +107,7 @@ impl Vault {
         let found = if link.wiki {
             self.wiki(name, from)
         } else {
-            self.relative(&percent_decode(name), from)
+            Self::relative(&percent_decode(name), from)
         };
         match found {
             Some(path) if is_markdown(&path) => Target::Note { path, heading },
@@ -143,7 +143,7 @@ impl Vault {
 
     /// The file a markdown link points at, relative to the linking note. A
     /// path with no extension may leave off `.md`.
-    fn relative(&self, name: &str, from: &Path) -> Option<PathBuf> {
+    fn relative(name: &str, from: &Path) -> Option<PathBuf> {
         let path = folder(from).join(name);
         if path.is_file() {
             return Some(path);

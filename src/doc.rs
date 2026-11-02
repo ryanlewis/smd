@@ -150,7 +150,10 @@ pub enum CalloutKind {
 
 impl CalloutKind {
     fn from_name(name: &str) -> CalloutKind {
-        use CalloutKind::*;
+        use CalloutKind::{
+            Abstract, Bug, Caution, Danger, Example, Failure, Important, Info, Note, Question,
+            Quote, Success, Tip, Todo, Warning,
+        };
         match name.to_ascii_lowercase().as_str() {
             "abstract" | "summary" | "tldr" => Abstract,
             "info" => Info,

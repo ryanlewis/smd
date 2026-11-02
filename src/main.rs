@@ -623,6 +623,30 @@ mod tests {
         assert_eq!(String::from_utf8(err).unwrap(), "smd: gone\n");
     }
 
+    /// A stderr whose writes fail, as a broken pipe's do.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "failed printing to stderr: ")]
+    fn a_failure_whose_message_cannot_be_written_panics() {
+        exit_code(Err(Failure::new("gone")), &mut Broken);
+    }
+
+    #[test]
+    fn success_writes_nothing_even_to_a_broken_stderr() {
+        assert_eq!(exit_code(Ok(()), &mut Broken), ExitCode::SUCCESS);
+    }
+
     #[test]
     fn images_are_graphics_only_with_a_cell() {
         let images = images_for(Some((9, 18)));

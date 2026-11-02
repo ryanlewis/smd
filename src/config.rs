@@ -838,4 +838,27 @@ mod tests {
         .unwrap_err();
         assert!(err.starts_with("/c/config.toml: "), "{err}");
     }
+
+    #[test]
+    fn the_path_comes_from_the_environment() {
+        let want = path_in(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        );
+        assert_eq!(path(), want);
+    }
+
+    #[test]
+    fn home_starts_from_the_home_folder() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        assert_eq!(
+            expand_home("~/notes/index.md"),
+            Path::new(&home).join("notes/index.md")
+        );
+        // Only a leading "~/" is the home folder.
+        assert_eq!(expand_home("notes/~/a.md"), PathBuf::from("notes/~/a.md"));
+        assert_eq!(expand_home("~notes"), PathBuf::from("~notes"));
+    }
 }

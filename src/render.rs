@@ -419,7 +419,7 @@ fn sized_heading(
                 if w > 0 {
                     spans.push(Span::styled(" ".repeat((s - 1) * w), span.style));
                     cells.push(heading::SizedCell {
-                        col: col as u16,
+                        col: column(col),
                         width: w as u8,
                         text: piece.to_string(),
                     });
@@ -443,7 +443,7 @@ fn sized_heading(
     }
     layout.joins.extend(wrapped.joins.into_iter().map(|j| Join {
         row: rows[j.row],
-        col: left(j.row) as u16,
+        col: column(left(j.row)),
         ..j
     }));
     for mut spot in links {
@@ -451,8 +451,9 @@ fn sized_heading(
             .cells
             .iter()
             .flat_map(|(r, cols)| {
-                let (row, x) = (rows[*r], left(*r) as u16);
-                let cols = x + cols.start * scale as u16..x + cols.end * scale as u16;
+                let (row, x) = (rows[*r], left(*r));
+                let at = |c: u16| column(x + usize::from(c) * s);
+                let cols = at(cols.start)..at(cols.end);
                 (row..row + s).map(move |row| (row, cols.clone()))
             })
             .collect();
@@ -600,12 +601,12 @@ fn fold_title(
     if fold.is_some()
         && let Some(line) = ctx.layout.lines.get(row)
     {
-        let from = spans_width(first) as u16;
-        let to = line.width() as u16;
+        let from = column(spans_width(first));
+        let to = column(line.width());
         ctx.layout.folds.push(FoldSpot {
             at,
             open,
-            cell: (row, from..to.max(from + 1)),
+            cell: (row, from..to.max(from.saturating_add(1))),
         });
     }
     open
@@ -752,8 +753,9 @@ fn table(
         emit(line_prefix(i), line, out);
     }
     let place = |(row, cols): (usize, Range<u16>)| {
-        let indent = spans_width(line_prefix(row)) as u16;
-        (top + row, cols.start + indent..cols.end + indent)
+        let indent = spans_width(line_prefix(row));
+        let at = |c: u16| column(usize::from(c) + indent);
+        (top + row, at(cols.start)..at(cols.end))
     };
     let spot = |spot: LinkSpot| LinkSpot {
         cells: spot.cells.into_iter().map(place).collect(),
@@ -836,11 +838,11 @@ fn list(
             indent += 4;
             if let Some(mark) = item.mark.filter(|_| ctx.embedded.is_none()) {
                 // The item's first line is the next one out.
-                let at = (spans_width(prefix) + marker_width) as u16;
+                let at = column(spans_width(prefix) + marker_width);
                 ctx.layout.tasks.push(TaskSpot {
                     mark,
                     done,
-                    cell: (ctx.layout.lines.len(), at..at + 3),
+                    cell: (ctx.layout.lines.len(), at..at.saturating_add(3)),
                 });
             }
         }
@@ -1236,7 +1238,7 @@ impl<'a> Lines<'a> {
         };
         let row = self.out.len();
         let end = spans_width(self.prefix()) + self.used;
-        let (start, end) = (start as u16, end as u16);
+        let (start, end) = (column(start), column(end));
         match spot.cells.last_mut() {
             Some((r, cols)) if *r == row && cols.end == start => cols.end = end,
             _ => spot.cells.push((row, start..end)),
@@ -1290,7 +1292,7 @@ impl<'a> Lines<'a> {
     fn join(&self, space: bool) -> Join {
         Join {
             row: self.out.len(),
-            col: spans_width(self.prefix()) as u16,
+            col: column(spans_width(self.prefix())),
             space,
             end: None,
         }
@@ -1301,7 +1303,7 @@ impl<'a> Lines<'a> {
             // A panel fills the gap a wide character leaves at the edge.
             let end = self
                 .pad
-                .map(|_| (spans_width(self.prefix()) + self.used) as u16);
+                .map(|_| column(spans_width(self.prefix()) + self.used));
             if self.break_before(piece.width()) {
                 let join = self.join(false);
                 self.joins.push(Join { end, ..join });
@@ -1409,6 +1411,13 @@ fn with(prefix: &[Span<'static>], span: Span<'static>) -> Vec<Span<'static>> {
 
 fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.content.width()).sum()
+}
+
+/// Column `x` as a terminal column. One further right than a terminal can
+/// be, past a list nested thousands deep, stays past the last column
+/// rather than wrapping round into view.
+fn column(x: usize) -> u16 {
+    u16::try_from(x).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]
@@ -2881,5 +2890,64 @@ graph TD
         assert_eq!(folds, [(0, false), (55, true)]);
         let layout = render_folds(&doc, 20, &no_images(), &HashSet::from([0, 55]));
         assert_eq!(text(&layout), ["▾ More", "  hidden", "", "▸ Shown"]);
+    }
+
+    /// Columns past the last a terminal can have: what a list nested
+    /// thousands deep puts before its text.
+    const PAST_LAST: usize = u16::MAX as usize + 5;
+
+    #[test]
+    fn spots_past_the_last_column_stay_past_it() {
+        let md = "a [l](u) bc\n\n- [ ] task\n\n| a |\n|-|\n| [t](v) |\n\n\
+                  > [!note]- Title\n> body\n\n```\n界界\n```\n";
+        let doc = parse(md);
+        let images = no_images();
+        let mut ctx = Ctx {
+            source: &doc.source,
+            images: &images,
+            layout: Layout::default(),
+            sizes: HashMap::new(),
+            panel: Some(Color::Black),
+            syntaxes: None,
+            flipped: &HashSet::new(),
+            embedded: None,
+        };
+        let wide = [Span::raw(" ".repeat(PAST_LAST))];
+        blocks(&doc.blocks, 80, &wide, &wide, false, &mut ctx);
+        let layout = ctx.layout;
+        let mut cols: Vec<u16> = Vec::new();
+        for spot in &layout.links {
+            cols.extend(spot.cells.iter().map(|(_, c)| c.start));
+        }
+        cols.extend(layout.tasks.iter().map(|t| t.cell.1.start));
+        cols.extend(layout.folds.iter().map(|f| f.cell.1.start));
+        cols.extend(layout.joins.iter().map(|j| j.col));
+        cols.extend(layout.joins.iter().filter_map(|j| j.end));
+        assert_eq!(layout.links.len(), 2);
+        assert_eq!(layout.tasks.len(), 1);
+        assert_eq!(layout.folds.len(), 1);
+        assert!(layout.joins.iter().any(|j| j.end.is_some()));
+        assert!(cols.iter().all(|&c| c == u16::MAX), "{cols:?}");
+    }
+
+    #[test]
+    fn a_sized_heading_past_the_last_column_stays_past_it() {
+        let BlockKind::Heading { level, content } = parse("# ab [l](u)\n").blocks.remove(0).kind
+        else {
+            panic!("not a heading");
+        };
+        let wide = [Span::raw(" ".repeat(PAST_LAST))];
+        let mut layout = Layout::default();
+        sized_heading(&content, level, 2, 80, &wide, &wide, &mut layout);
+        let mut cols: Vec<u16> = Vec::new();
+        for line in &layout.sized {
+            cols.extend(line.cells.iter().map(|c| c.col));
+        }
+        for spot in &layout.links {
+            cols.extend(spot.cells.iter().map(|(_, c)| c.start));
+        }
+        cols.extend(layout.joins.iter().map(|j| j.col));
+        assert!(!layout.joins.is_empty() && !layout.links.is_empty());
+        assert!(cols.iter().all(|&c| c == u16::MAX), "{cols:?}");
     }
 }

@@ -1491,6 +1491,22 @@ impl<'a> Builder<'a> {
 
     /// Pop the top frame and add what it built to its parent.
     fn close(&mut self) {
+        // An image left out at the end of a block leaves no space, unless
+        // the space is code's, is all the text there is, or comes before an
+        // open `==` that ends as text.
+        if std::mem::take(&mut self.gap)
+            && self.top().highlight.is_none()
+            && let Some(Inline::Text { text, style }) = self.top().inlines.last_mut()
+            && !style.code
+            && !style.kbd
+        {
+            let len = text
+                .trim_end_matches(|c: char| c.is_ascii_whitespace())
+                .len();
+            if len > 0 {
+                text.truncate(len);
+            }
+        }
         let mut frame = self.stack.pop().expect("frame to close");
         frame.end_highlight();
         let span = frame.span.clone();
@@ -2056,14 +2072,17 @@ impl<'a> Builder<'a> {
             alt.push_str(text);
             return self.push_text(text, style, range);
         }
-        // An image left out between words leaves one space. Code keeps its
-        // spaces.
+        // An image left out between words leaves one space, and at the start
+        // of a block or line none, unless an open `==` is there, which ends
+        // as text. Code keeps its spaces.
         let mut text = text;
-        if std::mem::take(&mut self.gap)
-            && !style.code
-            && let Some(Inline::Text { text: last, .. }) = self.top().inlines.last()
-            && last.ends_with(|c: char| c.is_ascii_whitespace())
-        {
+        let space_before = match self.top().inlines.last() {
+            Some(Inline::Text { text: last, .. }) => {
+                last.ends_with(|c: char| c.is_ascii_whitespace())
+            }
+            _ => self.top().highlight.is_none(),
+        };
+        if std::mem::take(&mut self.gap) && !style.code && !style.kbd && space_before {
             // Not a no-break space, which keeps its words together.
             text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
         }
@@ -3086,7 +3105,7 @@ paragraph @23..37
         );
         assert_eq!(
             themed(md, Theme::Light),
-            "paragraph @0..71\n  \" \"\n  \"[image: l]\" link=\"v\" wiki=false\n"
+            "paragraph @0..71\n  \"[image: l]\" link=\"v\" wiki=false\n"
         );
         // A wiki embed, whose fragment is not part of its name.
         let md = "![[logo.png#gh-dark-mode-only]]\n\nafter\n";
@@ -3130,6 +3149,44 @@ paragraph @23..37
         );
         // With no theme known, both logos stay.
         assert_eq!(parse_for(md, None).blocks, parse(md).blocks);
+    }
+
+    #[test]
+    fn a_logo_left_out_at_the_edge_of_a_block_leaves_no_space() {
+        let l = "![b](b.png#gh-light-mode-only)";
+        let dark = |md: String| themed(&md, Theme::Dark);
+        assert_eq!(dark(format!("{l} y\n")), "paragraph @0..33\n  \"y\"\n");
+        assert_eq!(dark(format!("# {l} y\n")), "heading 1 @0..35\n  \"y\"\n");
+        assert_eq!(dark(format!("x {l}\n")), "paragraph @0..33\n  \"x\"\n");
+        assert_eq!(dark(format!("# x {l}\n")), "heading 1 @0..35\n  \"x\"\n");
+        // Code keeps its spaces, at either edge.
+        assert_eq!(
+            dark(format!("{l}` a`\n")),
+            "paragraph @0..35\n  \" a\" code\n"
+        );
+        assert_eq!(
+            dark(format!("x `a `{l}\n")),
+            "paragraph @0..37\n  \"x \"\n  \"a \" code\n"
+        );
+        // An open `==`, put back as text when the block ends, keeps its space.
+        assert_eq!(
+            dark(format!("x =={l}\n")),
+            "paragraph @0..35\n  \"x \"\n  \"==\"\n"
+        );
+        assert_eq!(
+            dark(format!("=={l} a\n")),
+            "paragraph @0..35\n  \"==\"\n  \" a\"\n"
+        );
+        // Inside a highlight, between words, one space.
+        assert_eq!(
+            dark(format!("==a {l} b==\n")),
+            "paragraph @0..39\n  \"a b\" highlight\n"
+        );
+        // A highlight open at the logo still ends well.
+        assert_eq!(
+            dark(format!("*a*\n=={l}\n")),
+            "paragraph @0..37\n  \"a\" em\n  \" \"\n  \"==\"\n"
+        );
     }
 
     #[test]
@@ -3209,7 +3266,7 @@ paragraph @23..37
     #[test]
     fn a_logo_left_out_takes_an_image_in_its_alt_text_with_it() {
         let md = "![a ![b](b.png) c](l.png#gh-light-mode-only) after\n";
-        assert_eq!(themed(md, Theme::Dark), "paragraph @0..51\n  \" after\"\n");
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..51\n  \"after\"\n");
     }
 
     #[test]

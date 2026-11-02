@@ -275,13 +275,11 @@ mod tests {
 
     /// A vault in a temporary folder holding `files`, each a name and its
     /// text.
-    struct TempVault(PathBuf);
+    struct TempVault(crate::testdir::TempDir);
 
     impl TempVault {
         fn new(name: &str, files: &[(&str, &str)]) -> TempVault {
-            let root =
-                std::env::temp_dir().join(format!("smd-embed-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let root = crate::testdir::TempDir::new(&format!("embed-{name}"));
             std::fs::create_dir_all(root.join(".obsidian")).unwrap();
             for (file, text) in files {
                 let path = root.join(file);
@@ -309,12 +307,6 @@ mod tests {
                 .iter()
                 .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
                 .collect()
-        }
-    }
-
-    impl Drop for TempVault {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

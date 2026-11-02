@@ -307,13 +307,11 @@ mod tests {
     use super::*;
 
     /// A vault in a temporary folder, with `files` written empty.
-    struct TempVault(PathBuf);
+    struct TempVault(crate::testdir::TempDir);
 
     impl TempVault {
         fn new(name: &str, files: &[&str]) -> TempVault {
-            let root =
-                std::env::temp_dir().join(format!("smd-vault-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let root = crate::testdir::TempDir::new(&format!("vault-{name}"));
             std::fs::create_dir_all(root.join(".obsidian")).unwrap();
             for file in files {
                 let path = root.join(file);
@@ -325,12 +323,6 @@ mod tests {
 
         fn path(&self, file: &str) -> PathBuf {
             self.0.join(file)
-        }
-    }
-
-    impl Drop for TempVault {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -352,7 +344,7 @@ mod tests {
     fn the_vault_is_the_folder_with_obsidian_in_it() {
         let v = TempVault::new("root", &["HOME.md", "a/b/deep.md"]);
         let vault = Vault::for_file(&v.path("a/b/deep.md"));
-        assert_eq!(vault.root, v.0);
+        assert_eq!(vault.root, v.0.path());
         assert!(vault.holds(&v.path("HOME.md")));
         assert!(!vault.holds(Path::new("/elsewhere/x.md")));
     }
@@ -820,10 +812,8 @@ mod tests {
 
     #[test]
     fn a_note_outside_a_vault_looks_in_its_own_folder_and_below() {
-        let root = std::env::temp_dir().join(format!("smd-vault-novault-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
         // Removes the folder on drop, even when an assertion fails.
-        let _guard = TempVault(root.clone());
+        let root = crate::testdir::TempDir::new("vault-novault");
         std::fs::create_dir_all(root.join("notes/deep")).unwrap();
         std::fs::write(root.join("notes/a.md"), "").unwrap();
         std::fs::write(root.join("notes/deep/b.md"), "").unwrap();

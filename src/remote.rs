@@ -267,9 +267,10 @@ mod tests {
             .into()
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("smd-remote-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A cache folder, not made yet, removed when dropped.
+    fn scratch(name: &str) -> crate::testdir::TempDir {
+        let dir = crate::testdir::TempDir::new(&format!("remote-{name}"));
+        std::fs::remove_dir(&dir).unwrap();
         dir
     }
 

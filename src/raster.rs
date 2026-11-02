@@ -748,8 +748,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn map_reads_a_whole_file_and_refuses_an_empty_or_missing_one() {
-        let dir = std::env::temp_dir().join(format!("smd-raster-map-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::TempDir::new("raster-map");
         let full = dir.join("full");
         std::fs::write(&full, b"font bytes").unwrap();
         let empty = dir.join("empty");

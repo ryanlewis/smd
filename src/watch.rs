@@ -110,20 +110,11 @@ mod tests {
     use std::fs;
 
     /// A fresh directory under the system temp dir, removed when dropped.
-    struct Scratch(PathBuf);
+    struct Scratch(crate::testdir::TempDir);
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("smd-watch-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            Scratch(crate::testdir::TempDir::new(&format!("watch-{name}")))
         }
     }
 

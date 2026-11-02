@@ -40,7 +40,9 @@ fn pty() -> (OwnedFd, OwnedFd) {
 
 /// Start smd on the slave of a new pty, as its controlling terminal, with
 /// SIGHUP ignored as under `nohup` when `nohup`, and the markdown piped in
-/// when `piped`. Returns smd and the pty's master.
+/// when `piped`. Its errors go to `errors.txt` in a folder named `name`, as
+/// the terminal is gone by the time they would be read. Returns smd and the
+/// pty's master.
 fn smd_on_a_pty(name: &str, nohup: bool, piped: bool) -> (Child, OwnedFd) {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -53,7 +55,7 @@ fn smd_on_a_pty(name: &str, nohup: bool, piped: bool) -> (Child, OwnedFd) {
         .env("HOME", &dir)
         .env("XDG_CONFIG_HOME", &dir)
         .stdout(slave.try_clone().unwrap())
-        .stderr(slave.try_clone().unwrap());
+        .stderr(File::create(dir.join("errors.txt")).unwrap());
     if piped {
         command.stdin(Stdio::piped());
     } else {
@@ -125,7 +127,11 @@ fn ends_when_the_terminal_goes(name: &str, nohup: bool, piped: bool) {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
+    let errors = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(name)
+        .join("errors.txt");
+    let errors = std::fs::read_to_string(errors).unwrap_or_default();
+    assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}: {errors}");
 }
 
 #[test]

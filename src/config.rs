@@ -495,6 +495,40 @@ fn expand_home(path: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The action after `action` in `Action::ALL`. A new action does not
+    /// compile here until it is given a place in the list.
+    fn after(action: Action) -> Option<Action> {
+        use Action::*;
+        match action {
+            Quit => Some(Down),
+            Down => Some(Up),
+            Up => Some(HalfDown),
+            HalfDown => Some(HalfUp),
+            HalfUp => Some(PageDown),
+            PageDown => Some(PageUp),
+            PageUp => Some(Top),
+            Top => Some(Bottom),
+            Bottom => Some(NextLink),
+            NextLink => Some(PrevLink),
+            PrevLink => Some(Follow),
+            Follow => Some(Toggle),
+            Toggle => Some(Back),
+            Back => Some(Forward),
+            Forward => Some(Search),
+            Search => Some(NextMatch),
+            NextMatch => Some(PrevMatch),
+            PrevMatch => Some(Reload),
+            Reload => Some(Help),
+            Help => None,
+        }
+    }
+
+    #[test]
+    fn all_lists_every_action_once() {
+        let every: Vec<Action> = std::iter::successors(Some(Action::Quit), |&a| after(a)).collect();
+        assert_eq!(Action::ALL.to_vec(), every);
+    }
+
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }

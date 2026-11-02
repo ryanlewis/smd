@@ -360,7 +360,7 @@ impl View {
         let Some(m) = self.search.current.and_then(|i| self.search.matches.get(i)) else {
             return;
         };
-        let rows = m.rows();
+        let rows = self.match_rows(m);
         let height = (self.height as usize).max(1);
         if rows.end > self.scroll + height {
             self.scroll = rows.end - height;
@@ -760,18 +760,24 @@ impl View {
         let wrapped = found.and_then(|(_, w)| w);
         if let Some((i, _)) = found {
             self.search.current = Some(i);
-            let rows = self.search.matches[i].rows();
-            // A heading drawn larger takes the rows under its lines too.
-            let last = self
-                .layout
-                .sized
-                .iter()
-                .filter(|l| rows.contains(&l.row))
-                .map(|l| l.row + usize::from(l.scale) - 1)
-                .fold(rows.end - 1, usize::max);
-            self.scroll_into_view(rows.start, last);
+            let rows = self.match_rows(&self.search.matches[i]);
+            self.scroll_into_view(rows.start, rows.end - 1);
         }
         Go::Say(self.search.status(wrapped))
+    }
+
+    /// The rows `m` takes on screen: a heading drawn larger takes the rows
+    /// under its lines too.
+    fn match_rows(&self, m: &search::Match) -> std::ops::Range<usize> {
+        let rows = m.rows();
+        let end = self
+            .layout
+            .sized
+            .iter()
+            .filter(|l| rows.contains(&l.row))
+            .map(|l| l.row + usize::from(l.scale))
+            .fold(rows.end, usize::max);
+        rows.start..end
     }
 
     /// Where the view is as "page X/Y": the page its top line is on, and the
@@ -2476,7 +2482,6 @@ mod tests {
 
     #[test]
     fn going_to_a_match_in_a_sized_heading_brings_all_its_rows_into_view() {
-        use crate::heading::{SizedCell, SizedLine};
         let md = format!("{}needle\n\n{}", paragraphs(4), paragraphs(10));
         // Where the view is after going to "needle" on row 8, the last row
         // in view, laid out as a heading three times the size or not.
@@ -2484,17 +2489,7 @@ mod tests {
             let mut v = new_view(&md);
             v.resize(20, height);
             if sized {
-                let cells = "needle".chars().enumerate().map(|(i, c)| SizedCell {
-                    col: 3 * i as u16,
-                    width: 1,
-                    text: c.into(),
-                });
-                let cells = cells.collect();
-                v.layout.sized.push(SizedLine {
-                    row: 8,
-                    scale: 3,
-                    cells,
-                });
+                needle_larger_on_row_8(&mut v);
             }
             v.scroll = 9 - usize::from(height);
             on_match(&mut v, "needle", 0);
@@ -2508,6 +2503,87 @@ mod tests {
         assert_eq!(go(5, true), 7..12);
         assert_eq!(go(4, true), 7..11);
         assert_eq!(go(3, true), 8..11);
+    }
+
+    /// Lay "needle" on row 8 out as a heading three times the size, taking
+    /// rows 8 to 10.
+    fn needle_larger_on_row_8(v: &mut View) {
+        use crate::heading::{SizedCell, SizedLine};
+        let cells = "needle".chars().enumerate().map(|(i, c)| SizedCell {
+            col: 3 * i as u16,
+            width: 1,
+            text: c.into(),
+        });
+        let cells = cells.collect();
+        v.layout.sized.push(SizedLine {
+            row: 8,
+            scale: 3,
+            cells,
+        });
+    }
+
+    /// A view 5 rows tall of "needle" on rows 0 and 12, with a heading
+    /// "needle" on row 8 drawn as an image three rows tall, searched for
+    /// "needle".
+    fn needle_as_an_image_on_row_8() -> View {
+        use crate::images::Placement;
+        let md = format!(
+            "needle\n\n{}# needle\n\n{}needle\n\n{}",
+            paragraphs(3),
+            paragraphs(1),
+            paragraphs(10)
+        );
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        let at = md.find("# needle").unwrap();
+        let block = v.layout.blocks.iter_mut().rfind(|b| b.span.start == at);
+        let block = block.expect("a block starts there");
+        assert_eq!(block.rows, 8..9);
+        block.rows.end = 11;
+        block.image = Some(Placement {
+            id: 1,
+            cols: 20,
+            rows: 3,
+        });
+        v.search.term = "needle".into();
+        v.refresh_search(None);
+        let rows: Vec<usize> = v.search.matches.iter().map(|m| m.row).collect();
+        assert_eq!(rows, [0, 8, 12]);
+        v
+    }
+
+    #[test]
+    fn a_current_match_in_an_image_heading_is_brought_back_whole() {
+        // Pushed out below the view, all three rows of the image come back.
+        let mut v = needle_as_an_image_on_row_8();
+        v.search.current = Some(1);
+        v.show_current();
+        assert_eq!(v.in_view(), 6..11);
+    }
+
+    #[test]
+    fn a_current_match_in_a_sized_heading_is_brought_back_whole() {
+        // Pushed out below the view, all three rows of the heading come back,
+        // so it is drawn larger, not on the bottom row at the size of text.
+        let md = format!("{}needle\n\n{}", paragraphs(4), paragraphs(10));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        needle_larger_on_row_8(&mut v);
+        v.search.term = "needle".into();
+        v.refresh_search(None);
+        v.search.current = Some(0);
+        v.show_current();
+        assert_eq!(v.in_view(), 6..11);
+    }
+
+    #[test]
+    fn a_current_match_in_an_image_heading_partly_in_view_is_stepped_from() {
+        // Only the image's lower rows are in view, and N goes to the match
+        // before it, not to the last one in view.
+        let mut v = needle_as_an_image_on_row_8();
+        v.search.current = Some(1);
+        v.scroll = 9;
+        assert_eq!(v.search.step(false, v.in_view()), Some((0, false)));
     }
 
     fn paragraphs(n: usize) -> String {

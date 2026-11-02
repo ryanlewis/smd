@@ -40,3 +40,9 @@ unicode-width = "=0.2.2"
 # webpki roots: no OpenSSL, no async runtime.
 ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
+
+# On macOS, kqueue cannot watch /dev/tty, so with `cmd | smd` crossterm could
+# not read keys. This feature makes it wait with select there instead. It is
+# ratatui's own crossterm, so it adds only the filedescriptor crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+crossterm = { version = "=0.29.0", default-features = false, features = ["use-dev-tty"] }

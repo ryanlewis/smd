@@ -40,16 +40,20 @@ fn pty() -> (OwnedFd, OwnedFd) {
     };
     let _shared = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: fd is a pty master; ptsname's name is copied before the lock
-    // is let go, and TIOCSWINSZ only reads size.
+    // is let go.
     let name = unsafe {
         assert_eq!(libc::grantpt(fd), 0, "{}", std::io::Error::last_os_error());
         assert_eq!(libc::unlockpt(fd), 0, "{}", std::io::Error::last_os_error());
-        assert_eq!(libc::ioctl(fd, libc::TIOCSWINSZ, &size), 0);
         let name = libc::ptsname(fd);
         assert!(!name.is_null(), "{}", std::io::Error::last_os_error());
         std::ffi::CStr::from_ptr(name).to_owned()
     };
     let slave = open(std::ffi::OsStr::from_bytes(name.to_bytes()));
+    // On the slave, as macOS takes no size on the master before the slave
+    // is open.
+    // SAFETY: TIOCSWINSZ only reads size.
+    let sized = unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    assert_eq!(sized, 0, "{}", std::io::Error::last_os_error());
     (master, slave)
 }
 

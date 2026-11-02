@@ -871,6 +871,13 @@ impl Open {
     }
 }
 
+/// The most frames deep a block that holds others nests; deeper ones give
+/// their blocks to the one around them. A list takes two frames, a list
+/// and an item, so lists nest about half as deep. Far deeper than real
+/// documents nest, and shallow enough that drawing and dropping the
+/// blocks, which recurse, cannot run out of stack.
+const MAX_DEPTH: usize = 100;
+
 struct Frame {
     kind: FrameKind,
     span: Range<usize>,
@@ -1498,7 +1505,11 @@ impl<'a> Builder<'a> {
             },
             FrameKind::Definition => {
                 frame.flush_inlines();
-                self.add_definition(frame.blocks, span);
+                if self.too_deep() {
+                    self.top().blocks.extend(frame.blocks);
+                } else {
+                    self.add_definition(frame.blocks, span);
+                }
                 return;
             }
             FrameKind::Code { lang, code } => code_block(lang, code),
@@ -1518,7 +1529,7 @@ impl<'a> Builder<'a> {
                     open,
                     blocks: frame.blocks,
                 };
-                self.push_block(kind, span.start..span.end.max(end));
+                self.push_nested(kind, span.start..span.end.max(end));
                 return;
             }
             FrameKind::Html(html) => {
@@ -1536,7 +1547,49 @@ impl<'a> Builder<'a> {
                 items,
             },
         };
-        self.push_block(kind, span);
+        self.push_nested(kind, span);
+    }
+
+    /// Whether a block closing now is nested deeper than `MAX_DEPTH`.
+    fn too_deep(&self) -> bool {
+        self.stack.len() >= MAX_DEPTH
+    }
+
+    /// Add a block that may hold others to the block around it. Nested too
+    /// deep to draw, what it holds goes there instead, after its title.
+    fn push_nested(&mut self, kind: BlockKind, span: Range<usize>) {
+        if !self.too_deep() {
+            return self.push_block(kind, span);
+        }
+        let paragraph = |inlines: Vec<Inline>| Block {
+            kind: BlockKind::Paragraph(inlines),
+            span: span.clone(),
+        };
+        let blocks = match kind {
+            BlockKind::Quote(blocks) => blocks,
+            BlockKind::Callout { callout, blocks } => {
+                let mut all = vec![paragraph(callout.title)];
+                all.extend(blocks);
+                all
+            }
+            BlockKind::Details {
+                summary, blocks, ..
+            } => {
+                let mut all = vec![paragraph(summary)];
+                all.extend(blocks);
+                all
+            }
+            BlockKind::Definition { term, definitions } => {
+                let mut all = vec![paragraph(term)];
+                all.extend(definitions.into_iter().flatten());
+                all
+            }
+            BlockKind::List { items, .. } => items.into_iter().flat_map(|i| i.blocks).collect(),
+            kind => vec![Block { kind, span }],
+        };
+        let top = self.top();
+        top.flush_inlines();
+        top.blocks.extend(blocks);
     }
 
     /// The `<details>` just under the lists and items on top of the stack,
@@ -4354,5 +4407,75 @@ paragraph @51..57
             "<p>a</summary> b</p>\n",
             "paragraph @0..21\n  \"a</summary> b\"\n",
         );
+    }
+
+    /// The text of each paragraph in `blocks`, with how deep it is.
+    fn deep_texts(blocks: &[Block], depth: usize, out: &mut Vec<(usize, String)>) {
+        let words = |inlines: &[Inline]| {
+            let text = inlines.iter().map(|i| match i {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            });
+            text.collect::<String>()
+        };
+        for block in blocks {
+            match &block.kind {
+                BlockKind::Paragraph(inlines) => out.push((depth, words(inlines))),
+                BlockKind::Quote(inner) => deep_texts(inner, depth + 1, out),
+                BlockKind::Callout { callout, blocks } => {
+                    out.push((depth, words(&callout.title)));
+                    deep_texts(blocks, depth + 1, out);
+                }
+                BlockKind::Details {
+                    summary, blocks, ..
+                } => {
+                    out.push((depth, words(summary)));
+                    deep_texts(blocks, depth + 1, out);
+                }
+                BlockKind::Definition { term, definitions } => {
+                    out.push((depth, words(term)));
+                    for blocks in definitions {
+                        deep_texts(blocks, depth + 1, out);
+                    }
+                }
+                BlockKind::List { items, .. } => {
+                    for item in items {
+                        deep_texts(&item.blocks, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_nested_too_deep_join_the_deepest_level_after_their_titles() {
+        let n = 150;
+        let mut details = String::new();
+        for i in 0..n {
+            details.push_str(&format!("<details><summary>s{i}</summary>\n\n"));
+        }
+        details.push_str("deep\n\n");
+        details.push_str(&"</details>\n\n".repeat(n));
+        let mut defs = String::new();
+        for i in 0..n {
+            let pad = "  ".repeat(i);
+            defs.push_str(&format!("{pad}t{i}\n{pad}: d{i}\n\n"));
+        }
+        let callout = format!("{}[!note] title\n{}body\n", "> ".repeat(n), "> ".repeat(n));
+        let list = format!("{}a\n{}- b\n", "- ".repeat(n), "  ".repeat(n - 1));
+        let at = |d: usize, texts: &[&str]| -> Vec<(usize, String)> {
+            texts.iter().map(|t| (d, t.to_string())).collect()
+        };
+        for (md, want) in [
+            (details, at(99, &["s148", "s149", "deep"])),
+            (defs, at(49, &["d148", "t149", "d149"])),
+            (callout, at(99, &["title", "body"])),
+            (list, at(50, &["a", "b"])),
+        ] {
+            let mut out = Vec::new();
+            deep_texts(&parse(&md).blocks, 0, &mut out);
+            assert_eq!(out[out.len() - want.len()..], want);
+        }
     }
 }

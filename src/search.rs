@@ -16,8 +16,8 @@ pub struct Match {
     /// The first line it is on.
     pub row: usize,
     /// Each line it is on, more than one where the text wrapped, with the
-    /// columns it takes there. None for a heading drawn as an image, which
-    /// has no text cells to mark.
+    /// columns it takes there. For a heading drawn as an image, each line
+    /// of the image with no columns, as it has no text cells to mark.
     pub cells: Vec<(usize, Range<u16>)>,
 }
 
@@ -213,10 +213,8 @@ pub fn find(term: &str, layout: &Layout, doc: &Document) -> Vec<Match> {
                     text.windows(wanted.len()).any(|w| w == wanted)
                 })
             {
-                out.push(Match {
-                    row,
-                    cells: Vec::new(),
-                });
+                let cells = b.rows.clone().map(|r| (r, 0..0)).collect();
+                out.push(Match { row, cells });
             }
             continue;
         }
@@ -425,10 +423,11 @@ mod tests {
 
     #[test]
     fn a_heading_drawn_as_an_image_matches_by_its_text() {
-        let on = |row| {
+        // Each line of the image, with no columns to mark.
+        let on = |rows: Range<usize>| {
             vec![Match {
-                row,
-                cells: Vec::new(),
+                row: rows.start,
+                cells: rows.map(|r| (r, 0..0)).collect(),
             }]
         };
         for (md, row) in [
@@ -442,22 +441,23 @@ mod tests {
             ("- # Big Title\n", 0),
             ("Term\n: # Big Title\n", 1),
         ] {
-            assert_eq!(found_in_image(md, "#", 0, "big title"), on(row), "{md:?}");
-            assert_eq!(found_in_image(md, "#", 0, "Big Title"), on(row), "{md:?}");
+            let on = on(row..row + 1);
+            assert_eq!(found_in_image(md, "#", 0, "big title"), on, "{md:?}");
+            assert_eq!(found_in_image(md, "#", 0, "Big Title"), on, "{md:?}");
             assert_eq!(found_in_image(md, "#", 0, "Big title"), [], "{md:?}");
             assert_eq!(found_in_image(md, "#", 0, "big titles"), [], "{md:?}");
         }
         // Only its first line matches: the lines under it are the image.
         let md = "# Big Title\n\nbig title\n";
-        assert_eq!(found_in_image(md, "#", 2, "big title"), on(0));
+        assert_eq!(found_in_image(md, "#", 2, "big title"), on(0..3));
         // The text is that of the heading drawn, not of another one.
         let md = "# Other\n\n# Big Title\n";
-        assert_eq!(found_in_image(md, "# Big", 0, "big title"), on(2));
+        assert_eq!(found_in_image(md, "# Big", 0, "big title"), on(2..3));
         assert_eq!(found_in_image(md, "# Big", 0, "other"), [at(0, 0..5)]);
         // A hard break in the heading reads as a space.
         assert_eq!(
             found_in_image("Big\\\nTitle\n===\n", "Big", 0, "big title"),
-            on(0)
+            on(0..2)
         );
     }
 

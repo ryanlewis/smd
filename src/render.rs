@@ -2928,4 +2928,23 @@ graph TD
         assert!(layout.joins.iter().any(|j| j.end.is_some()));
         assert!(cols.iter().all(|&c| c == u16::MAX), "{cols:?}");
     }
+
+    #[test]
+    fn nesting_too_deep_to_draw_shows_its_text_at_the_deepest_level() {
+        // Far deeper than smd used to manage before running out of stack,
+        // on a small stack so that would show quickly.
+        for unit in ["> ", "- ", "> - "] {
+            let md = format!("{}deep\n", unit.repeat(5000));
+            let run = move || {
+                let lines = plain(&md, 400);
+                (lines.last().cloned(), lines.len())
+            };
+            let thread = std::thread::Builder::new().stack_size(512 << 10);
+            let (last, rows) = thread.spawn(run).unwrap().join().unwrap();
+            let last = last.unwrap_or_default();
+            assert!(last.ends_with("deep"), "{unit:?}: {last:?}");
+            assert!(last.width() < 250, "{unit:?}: {}", last.width());
+            assert!(rows < 100, "{unit:?}: {rows}");
+        }
+    }
 }

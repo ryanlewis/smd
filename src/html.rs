@@ -10,6 +10,16 @@ pub enum Piece<'a> {
     Tag(Tag<'a>),
 }
 
+impl<'a> Piece<'a> {
+    /// The piece as written.
+    pub fn source(&self) -> &'a str {
+        match self {
+            Piece::Text(s) | Piece::Comment(s) => s,
+            Piece::Tag(t) => t.raw,
+        }
+    }
+}
+
 /// An opening or closing tag.
 #[derive(Debug, PartialEq)]
 pub struct Tag<'a> {

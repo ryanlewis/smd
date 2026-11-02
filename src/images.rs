@@ -916,6 +916,7 @@ pub fn fit(px: (u32, u32), cell: (u16, u16), max_cols: u16) -> Option<(u16, u16)
 pub mod tests {
     use super::*;
     use crate::doc::parse;
+    use crate::testdir::TempDir;
     use std::time::{Duration, Instant};
 
     /// A PNG header for an image `w` by `h` pixels; enough for `Png::new`.
@@ -1101,8 +1102,7 @@ pub mod tests {
 
     #[test]
     fn a_web_svg_reads_no_files() {
-        let dir = std::env::temp_dir().join(format!("smd-images-web-svg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("images-web-svg");
         let jpeg = dir.join("red.jpg");
         std::fs::write(&jpeg, include_bytes!("../tests/fixtures/red-5x3.jpg")).unwrap();
         let body = format!(
@@ -1251,8 +1251,7 @@ pub mod tests {
 
     #[test]
     fn images_load_from_the_markdown_directory() {
-        let dir = std::env::temp_dir().join(format!("smd-images-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("images");
         std::fs::write(dir.join("a.png"), png(30, 40)).unwrap();
         let doc = parse("![a](a.png)\n\n![gone](missing.png)\n");
         let mut images = Images::new((10, 20));
@@ -1267,8 +1266,7 @@ pub mod tests {
 
     #[test]
     fn a_failed_image_is_tried_again_on_the_next_reload() {
-        let dir = std::env::temp_dir().join(format!("smd-images-retry-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("images-retry");
         let doc = parse("![d](d.png)\n");
         let want = |images: &mut Images| {
             images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
@@ -1286,13 +1284,10 @@ pub mod tests {
 
     /// `data` written to a file and loaded from it.
     fn load_bytes(name: &str, data: &[u8]) -> Result<Png, String> {
-        let dir = std::env::temp_dir().join(format!("smd-images-load-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new(&format!("images-load-{name}"));
         let path = dir.join(name);
         std::fs::write(&path, data).unwrap();
-        let png = load(&path);
-        let _ = std::fs::remove_file(&path);
-        png
+        load(&path)
     }
 
     /// A GIF of `frames` on a screen `width` by `height`.
@@ -1460,8 +1455,7 @@ pub mod tests {
 
     #[test]
     fn an_svg_reads_images_beside_it_and_sets_text() {
-        let dir = std::env::temp_dir().join(format!("smd-images-svg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("images-svg");
         std::fs::write(
             dir.join("red.jpg"),
             include_bytes!("../tests/fixtures/red-5x3.jpg"),
@@ -1484,7 +1478,7 @@ pub mod tests {
 
     #[test]
     fn a_fragment_or_query_is_dropped_only_when_the_file_is_not_there() {
-        let dir = std::env::temp_dir().join(format!("smd-images-suffix-{}", std::process::id()));
+        let dir = TempDir::new("images-suffix");
         std::fs::create_dir_all(dir.join("img")).unwrap();
         std::fs::write(dir.join("img/logo.png"), png(10, 20)).unwrap();
         std::fs::write(dir.join("issue#12.png"), png(30, 40)).unwrap();
@@ -1523,8 +1517,7 @@ pub mod tests {
 
     #[test]
     fn escaped_paths_are_decoded() {
-        let dir = std::env::temp_dir().join(format!("smd-images-escape-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("images-escape");
         std::fs::write(dir.join("my diagram.png"), png(10, 20)).unwrap();
         let doc = parse("![d](my%20diagram.png)\n");
         let mut images = Images::new((10, 20));

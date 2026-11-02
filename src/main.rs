@@ -15,6 +15,8 @@ mod remote;
 mod render;
 mod search;
 mod table;
+#[cfg(test)]
+mod testdir;
 mod theme;
 mod vault;
 mod watch;

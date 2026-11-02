@@ -2175,6 +2175,7 @@ fn run_browser<W: Write>(
 mod tests {
     use super::*;
     use crate::doc::parse;
+    use crate::testdir::TempDir;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2305,13 +2306,11 @@ mod tests {
     /// A view of `md` read from a fresh directory holding `files`, with every
     /// image it names loaded.
     fn view_with_files(name: &str, md: &str, files: &[(&str, Vec<u8>)]) -> View {
-        let dir = std::env::temp_dir().join(format!("smd-app-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new(&format!("app-{name}"));
         for (file, data) in files {
             std::fs::write(dir.join(file), data).unwrap();
         }
-        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        let mut v = View::new(parse(md), dir.to_path_buf(), Images::new((10, 20)));
         crate::images::tests::settle(&mut v.images);
         let _ = std::fs::remove_dir_all(&dir);
         v
@@ -2441,11 +2440,9 @@ mod tests {
     /// arrives.
     fn arriving(name: &str, md: &str, down: usize) -> View {
         use crate::images::tests::png;
-        let dir = std::env::temp_dir().join(format!("smd-app-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new(&format!("app-{name}"));
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
-        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        let mut v = View::new(parse(md), dir.to_path_buf(), Images::new((10, 20)));
         v.resize(20, 5);
         v.scroll_by(down as isize);
         assert_eq!(v.scroll, down);
@@ -2468,12 +2465,10 @@ mod tests {
     #[test]
     fn the_current_match_stays_when_images_arrive_or_the_width_changes() {
         use crate::images::tests::png;
-        let dir = std::env::temp_dir().join(format!("smd-app-{}-kept", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("app-kept");
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
         let md = "pin\n\n![a](a.png)\n\npin one pin two\n\npin\n";
-        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        let mut v = View::new(parse(md), dir.to_path_buf(), Images::new((10, 20)));
         v.resize(20, 5);
         // The second "pin" in the paragraph after the image.
         on_match(&mut v, "pin", 2);
@@ -3176,7 +3171,7 @@ mod tests {
         // A new note starts with its callouts as they are written.
         enter(&mut b, KeyCode::Enter);
         assert_eq!(rows(&b), 4);
-        b.view.show(parse(note), dir.clone());
+        b.view.show(parse(note), dir.to_path_buf());
         assert_eq!(rows(&b), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3334,7 +3329,7 @@ mod tests {
         enter(&mut b, KeyCode::Tab);
         enter(&mut b, KeyCode::Enter);
         assert_eq!(b.path, dir.join("sub/two.md"));
-        assert_eq!(b.vault.root, dir);
+        assert_eq!(b.vault.root, dir.path());
         // A note outside it has a vault of its own. Its text is given, so
         // no file need be there.
         let far = dir.with_file_name(format!("smd-far-{}.md", std::process::id()));
@@ -3726,9 +3721,8 @@ mod tests {
     }
 
     /// A browser on `files` in a fresh vault, showing the first.
-    fn browser(name: &str, files: &[(&str, &str)]) -> (Browser, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("smd-browse-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn browser(name: &str, files: &[(&str, &str)]) -> (Browser, TempDir) {
+        let dir = TempDir::new(&format!("browse-{name}"));
         std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
         for (file, text) in files {
             let path = dir.join(file);
@@ -4330,7 +4324,7 @@ mod tests {
 
     /// A browser as `browser` makes, with the syntaxes loaded first, so
     /// they cannot arrive part way through a test and cause a redraw.
-    fn loaded(name: &str, files: &[(&str, &str)]) -> (Browser, PathBuf) {
+    fn loaded(name: &str, files: &[(&str, &str)]) -> (Browser, TempDir) {
         highlight::syntax_set();
         browser(name, files)
     }
@@ -4564,7 +4558,7 @@ mod tests {
         use crate::images::tests::png;
         let (mut b, dir) = loaded("loop-image", &[("a.md", "one\n")]);
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
-        b.view.show(parse("![a](a.png)\n"), dir.clone());
+        b.view.show(parse("![a](a.png)\n"), dir.to_path_buf());
         let lines = b.view.layout.lines.len();
         let (result, frames, _) = run_script(&mut b, vec![Step::Drawn, quit()]);
         assert!(result.is_ok());
@@ -4578,7 +4572,7 @@ mod tests {
         use crate::images::tests::png;
         let (mut b, dir) = loaded("loop-image-first", &[("a.md", "one\n")]);
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
-        b.view.show(parse("![a](a.png)\n"), dir.clone());
+        b.view.show(parse("![a](a.png)\n"), dir.to_path_buf());
         let out = Shared::default();
         let options = ratatui::TerminalOptions {
             viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 30, 7)),
@@ -4665,7 +4659,7 @@ mod tests {
         }
     }
 
-    fn handing_on(name: &str, web_links: WebLinks) -> (Browser, PathBuf) {
+    fn handing_on(name: &str, web_links: WebLinks) -> (Browser, TempDir) {
         let (mut b, dir) = browser(name, &[("a.md", "one\n")]);
         b.config.web_links = web_links;
         b.opener = |target| panic!("opened {target}");
@@ -4722,7 +4716,7 @@ mod tests {
     /// A browser that read `HOME.md`, with an image above a link to
     /// `Other.md`, waited for the image, scrolled below it and followed the
     /// link. Also the scroll it left `HOME.md` at.
-    fn gone_past_an_image(name: &str) -> (Browser, PathBuf, usize) {
+    fn gone_past_an_image(name: &str) -> (Browser, TempDir, usize) {
         use crate::images::tests::png;
         let home = format!("![a](a.png)\n\n{0}[[Other]]\n\n{0}", paragraphs(6));
         let (mut b, dir) = loaded(name, &[("HOME.md", "one\n"), ("Other.md", "other\n")]);

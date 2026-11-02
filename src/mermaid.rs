@@ -438,11 +438,8 @@ mod tests {
         draw(PROGRAM, || mmdc(program, source, theme), cache)
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("smd-mermaid-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> crate::testdir::TempDir {
+        crate::testdir::TempDir::new(&format!("mermaid-{name}"))
     }
 
     /// Write a script with file mode `mode` from a child process. Written
@@ -496,7 +493,8 @@ mod tests {
             got.starts_with("mermaid: ") && got.contains("parse error"),
             "{got}"
         );
-        let cache = scratch("merman-bad").join("bad.png");
+        let dir = scratch("merman-bad");
+        let cache = dir.join("bad.png");
         let got = draw(
             "merman",
             || merman("flowchart LR\n  A[a(b] --> B\n", Theme::Dark),

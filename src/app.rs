@@ -2923,6 +2923,9 @@ mod tests {
         v.selected = Some(Stop::Link(0));
         v.relayout(None);
         assert_eq!(v.selected, Some(Stop::Link(0)));
+        v.selected = Some(Stop::Link(1));
+        v.relayout(None);
+        assert_eq!(v.selected, None);
         v.selected = Some(Stop::Fold(0));
         v.relayout(None);
         assert_eq!(v.selected, None);

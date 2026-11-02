@@ -1814,7 +1814,7 @@ fn ignored(signal: libc::c_int) -> bool {
     // current one.
     unsafe {
         let mut old: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(signal, std::ptr::null(), &mut old) == 0
+        libc::sigaction(signal, std::ptr::null(), &raw mut old) == 0
             && old.sa_sigaction == libc::SIG_IGN
     }
 }
@@ -1832,8 +1832,8 @@ fn handle(signal: libc::c_int, once: bool) {
         if once {
             action.sa_flags |= libc::SA_RESETHAND;
         }
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(signal, &action, std::ptr::null_mut());
+        libc::sigemptyset(&raw mut action.sa_mask);
+        libc::sigaction(signal, &raw const action, std::ptr::null_mut());
     }
 }
 
@@ -1928,27 +1928,27 @@ fn woken(read: libc::c_int, out: Option<libc::c_int>, wait: Option<Duration>) ->
         tv_sec: wait.as_secs() as libc::time_t,
         tv_usec: wait.subsec_micros() as libc::suseconds_t,
     });
-    let timeout = timeval
-        .as_mut()
-        .map_or(std::ptr::null_mut(), |t| t as *mut libc::timeval);
+    let timeout = timeval.as_mut().map_or(std::ptr::null_mut(), |t| {
+        std::ptr::from_mut::<libc::timeval>(t)
+    });
     // SAFETY: zeroed fd_sets are valid and both descriptors are below
     // FD_SETSIZE; select only looks at them and writes to the sets and the
     // timeval.
     let (readable, writable) = unsafe {
         let mut reads: libc::fd_set = std::mem::zeroed();
         let mut writes: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut reads);
-        libc::FD_ZERO(&mut writes);
-        libc::FD_SET(read, &mut reads);
+        libc::FD_ZERO(&raw mut reads);
+        libc::FD_ZERO(&raw mut writes);
+        libc::FD_SET(read, &raw mut reads);
         let mut top = read;
         if let Some(out) = out {
-            libc::FD_SET(out, &mut writes);
+            libc::FD_SET(out, &raw mut writes);
             top = top.max(out);
         }
         let ready = libc::select(
             top + 1,
-            &mut reads,
-            &mut writes,
+            &raw mut reads,
+            &raw mut writes,
             std::ptr::null_mut(),
             timeout,
         );
@@ -1956,8 +1956,8 @@ fn woken(read: libc::c_int, out: Option<libc::c_int>, wait: Option<Duration>) ->
             return Err(io::Error::last_os_error());
         }
         (
-            libc::FD_ISSET(read, &reads),
-            out.is_some_and(|out| libc::FD_ISSET(out, &writes)),
+            libc::FD_ISSET(read, &raw const reads),
+            out.is_some_and(|out| libc::FD_ISSET(out, &raw const writes)),
         )
     };
     if readable {
@@ -2022,7 +2022,7 @@ fn hung_up(fd: libc::c_int) -> bool {
     };
     loop {
         // SAFETY: one valid pollfd for the duration of the call.
-        let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+        let ready = unsafe { libc::poll(&raw mut pfd, 1, -1) };
         if ready < 0 && kitty::interrupted() {
             continue;
         }

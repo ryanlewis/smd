@@ -14,7 +14,9 @@ impl TempDir {
     /// tests that run at once. Anything left there by an earlier run is
     /// removed first.
     pub fn new(name: &str) -> TempDir {
-        let dir = std::env::temp_dir().join(format!("smd-{name}-{}", std::process::id()));
+        // The process id first: it has no "-", so no two names and ids
+        // give the same folder.
+        let dir = std::env::temp_dir().join(format!("smd-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)

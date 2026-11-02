@@ -716,4 +716,75 @@ mod tests {
         assert_eq!(error_line("  boom  \n"), Some("boom".into()));
         assert_eq!(error_line("\n\n"), None);
     }
+
+    #[test]
+    fn renderers_are_named_as_the_config_writes_them() {
+        assert_eq!(Renderer::Builtin.name(), "builtin");
+        assert_eq!(Renderer::Mmdc.name(), "mmdc");
+    }
+
+    #[test]
+    fn cache_names_stay_the_same_from_one_release_to_the_next() {
+        // A cache name that changes leaves every cached diagram unused.
+        // Change VERSION, and these, when drawing changes on purpose.
+        assert_eq!(
+            name("graph LR\n  A-->B\n", Theme::Dark),
+            "dark-c8e135bf1a48abef"
+        );
+        assert_eq!(
+            name("graph LR\n  A-->B\n", Theme::Light),
+            "light-9e650fbb3e2765e7"
+        );
+    }
+
+    #[test]
+    fn the_cache_holds_100_mib_unless_told_otherwise() {
+        if std::env::var_os("SMD_MERMAID_CACHE_MAX").is_none() {
+            assert_eq!(cache_cap(), 104_857_600);
+        }
+    }
+
+    #[test]
+    fn the_cache_is_in_the_platform_cache_directory_from_the_environment() {
+        let root = cache_root(
+            cfg!(target_os = "macos"),
+            std::env::var_os("HOME"),
+            std::env::var_os("XDG_CACHE_HOME"),
+        );
+        assert_eq!(cache_dir(), root.map(|r| r.join("smd").join("mermaid")));
+    }
+
+    #[test]
+    fn eviction_counts_down_what_is_left_after_each_file() {
+        // 30 bytes over a cap of 15: the oldest goes, leaving 20, still
+        // over, so the next goes too.
+        let dir = scratch("evict-count");
+        aged(&dir, "old.png", 10, 300);
+        aged(&dir, "mid.png", 10, 200);
+        aged(&dir, "new.png", 10, 100);
+        evict(&dir, 15);
+        assert_eq!(names(&dir), ["new.png"]);
+    }
+
+    #[test]
+    fn merman_measures_labels_in_the_fonts_found() {
+        if raster::sans_files().is_none() {
+            return;
+        }
+        // The same diagram measured with merman's estimates instead.
+        let source = "flowchart LR\n  A[A label wide enough to measure] --> B[Done]\n";
+        let config = MermaidConfig::from_value(serde_json::json!({ "theme": "dark" }));
+        let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
+        let request = PngRequest {
+            svg: SvgRequest::default(),
+            options: RasterOptions::default().with_scale(f32::from(SCALE)),
+        };
+        let control = OperationControl::new().with_deadline(TIMEOUT);
+        let Ok(RenderOutput::Png(Some(estimated))) =
+            renderer.render(RenderRequest::png(source, control, request))
+        else {
+            panic!("merman did not draw the diagram");
+        };
+        assert_ne!(merman(source, Theme::Dark).unwrap(), estimated.bytes);
+    }
 }

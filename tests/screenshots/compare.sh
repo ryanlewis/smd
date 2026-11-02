@@ -9,6 +9,8 @@
 #
 # --update copies the screenshots over the references instead.
 #
+# A reference with no screenshot fails too, as when its note was removed.
+#
 # A pixel counts as changed when a colour channel moves by more than FUZZ;
 # a screenshot fails when more than MAX_PIXELS pixels change. Both allow
 # for small antialiasing differences between runs.
@@ -82,5 +84,17 @@ for shot in "${shots[@]}"; do
     echo "ok   $name: $changed pixels changed"
     rm "$out/$name.reference.png" "$out/$name.diff.png"
   fi
+done
+# A reference with no screenshot is for a note that was removed, renamed or
+# not captured.
+for ref in "$refs"/*.png; do
+  name=$(basename "$ref" .png)
+  [ -f "$out/$name.png" ] && continue
+  if [ -f "$here/$name.md" ]; then
+    echo "FAIL $name: no screenshot to compare with reference/$name.png"
+  else
+    echo "FAIL $name: reference/$name.png has no note; remove it"
+  fi
+  status=1
 done
 exit "$status"

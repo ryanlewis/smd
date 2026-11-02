@@ -10,7 +10,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use merman::svg::export::{NativeFontOptions, RasterOptions};
@@ -38,7 +38,7 @@ const CACHE_CAP: u64 = 100 * 1024 * 1024;
 
 /// How old a temporary cache file must be before eviction deletes it. A write
 /// takes well under a second, so one this old was left by a crash.
-const STALE_TMP: Duration = Duration::from_secs(60 * 60);
+const STALE_TMP: Duration = Duration::from_hours(1);
 
 /// How long one diagram may take before it is given up on.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -390,9 +390,9 @@ static RUNNING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
 impl Slot {
     fn take() -> Slot {
         let (lock, freed) = &RUNNING;
-        let mut running = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = lock.lock().unwrap_or_else(PoisonError::into_inner);
         while *running >= MAX_RUNNING {
-            running = freed.wait(running).unwrap_or_else(|e| e.into_inner());
+            running = freed.wait(running).unwrap_or_else(PoisonError::into_inner);
         }
         *running += 1;
         Slot
@@ -402,7 +402,7 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         let (lock, freed) = &RUNNING;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
         freed.notify_one();
     }
 }
@@ -536,7 +536,6 @@ mod tests {
             Theme::Dark,
             Some(&path),
         );
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Png::new(png(30, 10)));
     }
 
@@ -551,7 +550,6 @@ mod tests {
             Some(&path),
         );
         let cached = path.exists();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Err("mermaid: mmdc not found on PATH".into()));
         assert!(!cached);
     }
@@ -576,7 +574,6 @@ mod tests {
         let cached = std::fs::read(&path).ok();
         let bad = draw_mmdc(program, "bad", Theme::Light, Some(&dir.join("bad.png")));
         let not_png = draw_mmdc(program, "text", Theme::Light, None);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Png::new(png(12, 34)));
         assert_eq!(cached, Some(png(12, 34)));
         assert_eq!(bad, Err("mermaid: Parse error on line 2".into()));
@@ -596,7 +593,6 @@ mod tests {
         let timeout = Duration::from_secs(10);
         let cannot = run(plain.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
         let failed = run(quiet.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
-        let _ = std::fs::remove_dir_all(&dir);
         let cannot = cannot.unwrap_err();
         assert!(
             cannot.starts_with("mermaid: cannot run mmdc: ") && cannot.contains("ermission denied"),
@@ -641,7 +637,6 @@ mod tests {
         if !gone {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Err("mermaid: mmdc took over 2s".into()));
         assert!(gone, "the child outlived the timeout");
     }
@@ -680,7 +675,6 @@ mod tests {
         assert_eq!(names(&dir), ["new.png"]);
         evict(&dir, 10);
         assert_eq!(names(&dir), ["new.png"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -691,7 +685,6 @@ mod tests {
         aged(&dir, "b.png", 10, 100);
         evict(&dir, 0);
         assert_eq!(names(&dir), ["a.png.1.0.tmp"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -711,7 +704,6 @@ mod tests {
         assert!(got.is_ok());
         evict(&dir, std::fs::metadata(&used).unwrap().len());
         let left = names(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(left, ["used.png"]);
     }
 

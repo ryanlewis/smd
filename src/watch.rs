@@ -110,12 +110,8 @@ mod tests {
     use std::fs;
 
     /// A fresh directory under the system temp dir, removed when dropped.
-    struct Scratch(crate::testdir::TempDir);
-
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            Scratch(crate::testdir::TempDir::new(&format!("watch-{name}")))
-        }
+    fn scratch(name: &str) -> crate::testdir::TempDir {
+        crate::testdir::TempDir::new(&format!("watch-{name}"))
     }
 
     /// Check twice, as the run loop does over two ticks.
@@ -126,8 +122,8 @@ mod tests {
 
     #[test]
     fn nothing_changed() {
-        let dir = Scratch::new("same");
-        let path = dir.0.join("a.md");
+        let dir = scratch("same");
+        let path = dir.join("a.md");
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path);
         assert_eq!(w.check(), None);
@@ -135,8 +131,8 @@ mod tests {
 
     #[test]
     fn append_is_seen() {
-        let dir = Scratch::new("append");
-        let path = dir.0.join("a.md");
+        let dir = scratch("append");
+        let path = dir.join("a.md");
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         fs::write(&path, "one\ntwo\n").unwrap();
@@ -146,9 +142,9 @@ mod tests {
 
     #[test]
     fn rename_over_is_seen() {
-        let dir = Scratch::new("rename");
-        let path = dir.0.join("a.md");
-        let tmp = dir.0.join("a.md.tmp");
+        let dir = scratch("rename");
+        let path = dir.join("a.md");
+        let tmp = dir.join("a.md.tmp");
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         // Same length, written straight away: only the inode (or the mtime)
@@ -160,8 +156,8 @@ mod tests {
 
     #[test]
     fn delete_is_reported_once_and_return_is_seen() {
-        let dir = Scratch::new("delete");
-        let path = dir.0.join("a.md");
+        let dir = scratch("delete");
+        let path = dir.join("a.md");
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         fs::remove_file(&path).unwrap();
@@ -173,8 +169,8 @@ mod tests {
 
     #[test]
     fn unreadable_contents_are_reported() {
-        let dir = Scratch::new("utf8");
-        let path = dir.0.join("a.md");
+        let dir = scratch("utf8");
+        let path = dir.join("a.md");
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
@@ -184,8 +180,8 @@ mod tests {
 
     #[test]
     fn half_written_save_is_not_reported() {
-        let dir = Scratch::new("truncate");
-        let path = dir.0.join("a.md");
+        let dir = scratch("truncate");
+        let path = dir.join("a.md");
         fs::write(&path, "one\n").unwrap();
         let mut w = Watcher::new(path.clone());
         // Truncated, and seen once before the write lands.

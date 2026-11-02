@@ -484,7 +484,7 @@ fn fill(words: Vec<(Chars, Chars)>, width: usize) -> (Vec<Chars>, usize) {
             lines.push(Vec::new());
         }
         let mut rest = &word[..];
-        while chars_width(rest) > width {
+        while wider_than(rest, width) {
             let (cut, soft) = break_point(rest, width);
             hard += usize::from(!soft);
             lines.last_mut().unwrap().extend_from_slice(&rest[..cut]);
@@ -528,18 +528,32 @@ impl Wrapped {
 /// Where to break a word too wide for `width`: how many characters stay on
 /// this line, and whether the break is after punctuation.
 fn break_point(word: &[(char, usize)], width: usize) -> (usize, bool) {
-    let text: String = word.iter().map(|(c, _)| *c).collect();
-    let mut pieces = clusters(&text).map(|piece| (piece.chars().count(), piece.width()));
-    // At least one character and those drawn with it, so a character wider
-    // than the line still moves on.
-    let (mut fit, mut used) = pieces.next().unwrap_or((0, 0));
-    for (chars, w) in pieces {
-        used += w;
-        if used > width {
-            break;
+    // Only as much of a long word as the line takes is measured: the start
+    // of it, longer each time that is not enough.
+    let mut take = width + 4;
+    let fit = loop {
+        let end = take.min(word.len());
+        let text: String = word[..end].iter().map(|(c, _)| *c).collect();
+        let mut pieces = clusters(&text).map(|piece| (piece.chars().count(), piece.width()));
+        // At least one character and those drawn with it, so a character
+        // wider than the line still moves on.
+        let (mut fit, mut used) = pieces.next().unwrap_or((0, 0));
+        let mut over = false;
+        for (chars, w) in pieces.by_ref() {
+            used += w;
+            if used > width {
+                over = true;
+                break;
+            }
+            fit += chars;
         }
-        fit += chars;
-    }
+        // The last piece may carry on past the start measured; those
+        // before it are whole.
+        if end == word.len() || (over && pieces.next().is_some()) {
+            break fit;
+        }
+        take *= 2;
+    };
     let after = word[..fit]
         .iter()
         .rposition(|(c, _)| BREAK_AFTER.contains(*c))
@@ -548,6 +562,21 @@ fn break_point(word: &[(char, usize)], width: usize) -> (usize, bool) {
         Some(p) if p * 2 >= fit && p < word.len() => (p, true),
         _ => (fit, false),
     }
+}
+
+/// Whether `chars` measured as a whole are wider than `width`, measuring
+/// only as much of a long word as it takes. A character changes the width
+/// of those before it by one column at most, as U+FE0E after ⌚ does, so
+/// a start more than one column wider is wider whatever follows.
+fn wider_than(chars: &[(char, usize)], width: usize) -> bool {
+    let mut take = width + 4;
+    while take < chars.len() {
+        if chars_width(&chars[..take]) > width + 1 {
+            return true;
+        }
+        take *= 2;
+    }
+    chars_width(chars) > width
 }
 
 /// The columns `chars` take, measured as a whole so an emoji with U+FE0F
@@ -1382,5 +1411,22 @@ mod tests {
                 "────────────────────"
             ]
         );
+    }
+
+    #[test]
+    fn a_long_word_is_measured_whole_where_its_end_changes_its_width() {
+        // U+FE0E makes ⌚ one column, not two, so this fits in three.
+        let narrowed = "ab\u{301}\u{301}\u{301}\u{301}⌚\u{fe0e}";
+        assert_eq!(wrapped(narrowed, 3), (vec![narrowed.to_string()], 0));
+        // Marks that draw nothing add nothing.
+        for start in ["a", "abc"] {
+            let marks = format!("{start}{}", "\u{301}".repeat(10));
+            assert_eq!(wrapped(&marks, 3), (vec![marks.clone()], 0));
+        }
+        // A break measures ⌚ with the U+FE0E after it.
+        let cut = "a\u{301}\u{301}\u{301}\u{301}⌚\u{fe0e}bcd";
+        let lines = ["a\u{301}\u{301}\u{301}\u{301}⌚\u{fe0e}", "bc", "d"];
+        let lines = lines.map(String::from).to_vec();
+        assert_eq!(wrapped(cut, 2), (lines, 2));
     }
 }

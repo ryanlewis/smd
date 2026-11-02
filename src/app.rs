@@ -1814,7 +1814,7 @@ fn ignored(signal: libc::c_int) -> bool {
     // current one.
     unsafe {
         let mut old: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(signal, std::ptr::null(), &mut old) == 0
+        libc::sigaction(signal, std::ptr::null(), &raw mut old) == 0
             && old.sa_sigaction == libc::SIG_IGN
     }
 }
@@ -1832,8 +1832,8 @@ fn handle(signal: libc::c_int, once: bool) {
         if once {
             action.sa_flags |= libc::SA_RESETHAND;
         }
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(signal, &action, std::ptr::null_mut());
+        libc::sigemptyset(&raw mut action.sa_mask);
+        libc::sigaction(signal, &raw const action, std::ptr::null_mut());
     }
 }
 
@@ -1928,27 +1928,27 @@ fn woken(read: libc::c_int, out: Option<libc::c_int>, wait: Option<Duration>) ->
         tv_sec: wait.as_secs() as libc::time_t,
         tv_usec: wait.subsec_micros() as libc::suseconds_t,
     });
-    let timeout = timeval
-        .as_mut()
-        .map_or(std::ptr::null_mut(), |t| t as *mut libc::timeval);
+    let timeout = timeval.as_mut().map_or(std::ptr::null_mut(), |t| {
+        std::ptr::from_mut::<libc::timeval>(t)
+    });
     // SAFETY: zeroed fd_sets are valid and both descriptors are below
     // FD_SETSIZE; select only looks at them and writes to the sets and the
     // timeval.
     let (readable, writable) = unsafe {
         let mut reads: libc::fd_set = std::mem::zeroed();
         let mut writes: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut reads);
-        libc::FD_ZERO(&mut writes);
-        libc::FD_SET(read, &mut reads);
+        libc::FD_ZERO(&raw mut reads);
+        libc::FD_ZERO(&raw mut writes);
+        libc::FD_SET(read, &raw mut reads);
         let mut top = read;
         if let Some(out) = out {
-            libc::FD_SET(out, &mut writes);
+            libc::FD_SET(out, &raw mut writes);
             top = top.max(out);
         }
         let ready = libc::select(
             top + 1,
-            &mut reads,
-            &mut writes,
+            &raw mut reads,
+            &raw mut writes,
             std::ptr::null_mut(),
             timeout,
         );
@@ -1956,8 +1956,8 @@ fn woken(read: libc::c_int, out: Option<libc::c_int>, wait: Option<Duration>) ->
             return Err(io::Error::last_os_error());
         }
         (
-            libc::FD_ISSET(read, &reads),
-            out.is_some_and(|out| libc::FD_ISSET(out, &writes)),
+            libc::FD_ISSET(read, &raw const reads),
+            out.is_some_and(|out| libc::FD_ISSET(out, &raw const writes)),
         )
     };
     if readable {
@@ -2022,7 +2022,7 @@ fn hung_up(fd: libc::c_int) -> bool {
     };
     loop {
         // SAFETY: one valid pollfd for the duration of the call.
-        let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+        let ready = unsafe { libc::poll(&raw mut pfd, 1, -1) };
         if ready < 0 && kitty::interrupted() {
             continue;
         }
@@ -2312,7 +2312,6 @@ mod tests {
         }
         let mut v = View::new(parse(md), dir.to_path_buf(), Images::new((10, 20)));
         crate::images::tests::settle(&mut v.images);
-        let _ = std::fs::remove_dir_all(&dir);
         v
     }
 
@@ -2451,7 +2450,6 @@ mod tests {
             assert!(Instant::now() < deadline, "image not ready");
             std::thread::sleep(Duration::from_millis(1));
         }
-        let _ = std::fs::remove_dir_all(&dir);
         v
     }
 
@@ -2478,7 +2476,6 @@ mod tests {
             assert!(Instant::now() < deadline, "image not ready");
             std::thread::sleep(Duration::from_millis(1));
         }
-        let _ = std::fs::remove_dir_all(&dir);
         // The image is five lines, not one, so the match moved down.
         assert_eq!(v.search.current, Some(2));
         assert_eq!(v.search.matches[2].row, before.row + 4);
@@ -2896,7 +2893,6 @@ mod tests {
         assert_eq!(b.view.selected, Some(Stop::Link(0)));
         b.mouse(click(BACK_BUTTON.width() as u16 + 2, 0));
         assert_eq!(b.path, dir.join("Plan.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2940,7 +2936,6 @@ mod tests {
         b.back();
         b.mouse(toolbar(BACK_BUTTON.width() as u16));
         assert_eq!(b.path, dir.join("Plan.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3107,7 +3102,6 @@ mod tests {
         assert_eq!(b.path, dir.join("HOME.md"));
         b.mouse(click(24));
         assert_eq!(b.path, dir.join("Plan.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3139,7 +3133,6 @@ mod tests {
         enter(&mut b, KeyCode::BackTab);
         enter(&mut b, KeyCode::Char('x'));
         assert_eq!(b.path, path);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3173,13 +3166,12 @@ mod tests {
         assert_eq!(rows(&b), 4);
         b.view.show(parse(note), dir.to_path_buf());
         assert_eq!(rows(&b), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn enter_on_a_details_summary_opens_it() {
         let note = "<details><summary>More</summary>\n\nsee [[Plan]]\n\n</details>\n";
-        let (mut b, dir) = browser("details", &[("HOME.md", note), ("Plan.md", "p\n")]);
+        let (mut b, _dir) = browser("details", &[("HOME.md", note), ("Plan.md", "p\n")]);
         let rows = |b: &Browser| b.view.layout.lines.len();
         assert_eq!(rows(&b), 1);
         enter(&mut b, KeyCode::Tab);
@@ -3189,7 +3181,6 @@ mod tests {
         assert_eq!(b.view.stops(), [Stop::Fold(0), Stop::Link(0)]);
         enter(&mut b, KeyCode::Enter);
         assert_eq!(rows(&b), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3205,7 +3196,6 @@ mod tests {
         b.back();
         assert_eq!(b.view.layout.lines.len(), 4);
         assert_eq!(b.view.selected, Some(Stop::Link(0)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3220,7 +3210,6 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(b.path, dir.join("Plan.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3285,25 +3274,23 @@ mod tests {
         // Forward shows it again, from where it was left.
         enter(&mut b, KeyCode::Char('L'));
         assert_eq!(b.view.doc.source, source);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn r_on_a_note_read_from_stdin_says_there_is_nothing_to_reload() {
-        let (b, dir) = browser("reload-piped", &[("stdin", "piped\n")]);
+        let (b, _dir) = browser("reload-piped", &[("stdin", "piped\n")]);
         let mut b = b.piped();
         // A file of the same name is not read in its place.
         std::fs::write(&b.path, "on disk\n").unwrap();
         press_all(&mut b, "r");
         assert_eq!(top(&b.view), "piped");
         assert!(status_row(&mut b).starts_with("nothing to reload"));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn back_in_the_same_note_reads_it_again_once_its_text_has_changed() {
         let home = format!("[down](#later)\n\n{}## Later\n", paragraphs(8));
-        let (mut b, dir) = browser("back-same", &[("HOME.md", &home)]);
+        let (mut b, _dir) = browser("back-same", &[("HOME.md", &home)]);
         enter(&mut b, KeyCode::Tab);
         enter(&mut b, KeyCode::Enter);
         assert_eq!(b.history.len(), 1);
@@ -3314,7 +3301,6 @@ mod tests {
         std::fs::write(&b.path, "third\n").unwrap();
         b.back();
         assert_eq!(top(&b.view), "third");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3334,19 +3320,17 @@ mod tests {
         // no file need be there.
         let far = dir.with_file_name(format!("smd-far-{}.md", std::process::id()));
         b.show(far.clone(), "far\n", false);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(b.vault.root, far.parent().unwrap());
     }
 
     #[test]
     fn the_help_opens_from_a_note_read_from_stdin() {
-        let (b, dir) = browser("help-piped", &[("stdin", "piped\n")]);
+        let (b, _dir) = browser("help-piped", &[("stdin", "piped\n")]);
         let mut b = b.piped();
         press_all(&mut b, "?");
         assert!(b.toolbar().to_string().trim_end().ends_with(" help"));
         b.back();
         assert_eq!(top(&b.view), "piped");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3369,7 +3353,6 @@ mod tests {
             std::fs::read_to_string(dir.join("HOME.md")).unwrap(),
             "- [x] one\n"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3402,7 +3385,6 @@ mod tests {
         b.config.tasks = Tasks::ReadOnly;
         b.check_tasks();
         assert_eq!(b.view.selected, None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3420,7 +3402,6 @@ mod tests {
         // A mark that is no longer a checkbox is not written either.
         let got = toggle_task(&path, "- [ ] one\n- [ ] two\n", 0, false);
         assert!(got.unwrap_err().contains("not where it was"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3447,12 +3428,11 @@ mod tests {
         enter(&mut b, KeyCode::Enter);
         assert_eq!(b.path, dir.join("B.md"));
         assert!(b.ahead.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_toolbar_shows_the_buttons_and_the_note_name() {
-        let (mut b, dir) = browser(
+        let (mut b, _dir) = browser(
             "toolbar",
             &[("HOME.md", "[[work/Plan]]\n"), ("work/Plan.md", "p\n")],
         );
@@ -3490,7 +3470,6 @@ mod tests {
                 .modifier
                 .contains(Modifier::BOLD)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3524,7 +3503,6 @@ mod tests {
         assert_eq!(addr("https://e.com", false), Some("https://e.com".into()));
         assert_eq!(addr("#Top", true), None);
         assert_eq!(addr("gone", true), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3754,7 +3732,7 @@ mod tests {
                 _ => format!("line {n}\n\n"),
             })
             .collect();
-        let (mut b, dir) = browser("search", &[("note.md", &md)]);
+        let (mut b, _dir) = browser("search", &[("note.md", &md)]);
         let notice = |b: &Browser| b.view.notice.clone().unwrap_or_default();
         enter(&mut b, KeyCode::Char('/'));
         for c in "needle".chars() {
@@ -3811,7 +3789,6 @@ mod tests {
         assert!(!b.view.search.active());
         assert!(b.view.search.matches.is_empty());
         assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3854,7 +3831,7 @@ mod tests {
             "> [!note]- Shut\n> needle\n\nneedle a\n\nneedle b\n\n{}",
             paragraphs(6)
         );
-        let (mut b, dir) = browser("prompt", &[("note.md", &md), ("Plan.md", "# Plan\n")]);
+        let (mut b, _dir) = browser("prompt", &[("note.md", &md), ("Plan.md", "# Plan\n")]);
         let search = |b: &mut Browser, term: &str| {
             enter(b, KeyCode::Char('/'));
             for c in term.chars() {
@@ -3888,13 +3865,12 @@ mod tests {
         // Another note starts with no search.
         b.follow(&wiki("Plan"));
         assert!(!b.view.search.active());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_number_before_n_or_n_steps_that_many_matches() {
         // Five matches, all on the first row, so all in view.
-        let (mut b, dir) = browser("count-match", &[("a.md", "ab ab ab ab ab\n")]);
+        let (mut b, _dir) = browser("count-match", &[("a.md", "ab ab ab ab ab\n")]);
         let notice = |b: &Browser| b.view.notice.clone().unwrap_or_default();
         press_all(&mut b, "/ab");
         enter(&mut b, KeyCode::Enter);
@@ -3915,7 +3891,6 @@ mod tests {
                 "match 5/5",
             ]
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3933,7 +3908,6 @@ mod tests {
         };
         b.mouse(click);
         assert_eq!(b.path, dir.join("HOME.md"));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn wiki(dest: &str) -> Link {
@@ -3958,7 +3932,7 @@ mod tests {
 
     #[test]
     fn a_number_before_a_key_repeats_it_or_goes_to_that_line() {
-        let (mut b, dir) = browser("count", &[("a.md", &paragraphs(30))]);
+        let (mut b, _dir) = browser("count", &[("a.md", &paragraphs(30))]);
         assert_eq!(status_row(&mut b).trim(), "page 1/10");
         press_all(&mut b, "5j");
         assert_eq!(b.view.scroll, 5);
@@ -3992,21 +3966,19 @@ mod tests {
         // Esc with no number still quits.
         b.view.count = None;
         assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn digits_typed_into_the_search_prompt_are_not_a_number() {
-        let (mut b, dir) = browser("count-search", &[("a.md", &paragraphs(30))]);
+        let (mut b, _dir) = browser("count-search", &[("a.md", &paragraphs(30))]);
         press_all(&mut b, "/12");
         assert_eq!(b.view.count, None);
         assert!(b.view.prompt.as_deref().unwrap().starts_with("/12"));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_digit_bound_to_an_action_is_not_a_number() {
-        let (mut b, dir) = browser("count-bound", &[("a.md", &paragraphs(30))]);
+        let (mut b, _dir) = browser("count-bound", &[("a.md", &paragraphs(30))]);
         b.config = Config::from_str("[keys]\ndown = [\"2\"]").unwrap();
         press_all(&mut b, "2");
         assert_eq!(b.view.scroll, 1);
@@ -4016,12 +3988,11 @@ mod tests {
             b.key(KeyEvent::new(KeyCode::Char('5'), modifiers));
             assert_eq!(b.view.count, None);
         }
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn r_reloads_the_file_and_says_when_it_cannot() {
-        let (mut b, dir) = browser("reload", &[("a.md", "old\n")]);
+        let (mut b, _dir) = browser("reload", &[("a.md", "old\n")]);
         std::fs::write(&b.path, "new\n").unwrap();
         press_all(&mut b, "r");
         assert_eq!(top(&b.view), "new");
@@ -4032,7 +4003,6 @@ mod tests {
         // The message goes at the next key.
         press_all(&mut b, "j");
         assert_eq!(status_row(&mut b).trim(), "page 1/1");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4042,31 +4012,28 @@ mod tests {
         press_all(&mut b, "r");
         let text: Vec<String> = b.view.layout.lines.iter().map(|l| l.to_string()).collect();
         assert!(text.iter().any(|l| l.contains("new")), "{text:?}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_failed_reload_leaves_the_deleted_notice_after_the_next_key() {
-        let (mut b, dir) = browser("reload-deleted", &[("a.md", "text\n")]);
+        let (mut b, _dir) = browser("reload-deleted", &[("a.md", "text\n")]);
         std::fs::remove_file(&b.path).unwrap();
         apply(&mut b.view, &b.path, &b.vault, Change::Deleted);
         press_all(&mut b, "r");
         assert!(status_row(&mut b).starts_with("cannot reload: "));
         press_all(&mut b, "j");
         assert!(status_row(&mut b).starts_with("file deleted"));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_message_shows_when_the_note_has_one_row() {
-        let (mut b, dir) = browser("one-row", &[("a.md", "[[Gone]]\n")]);
+        let (mut b, _dir) = browser("one-row", &[("a.md", "[[Gone]]\n")]);
         enter(&mut b, KeyCode::Tab);
         enter(&mut b, KeyCode::Enter);
         let mut terminal = Terminal::new(TestBackend::new(30, 2)).unwrap();
         terminal.draw(|f| b.draw(f)).unwrap();
         let row = rows(terminal.backend().buffer()).pop().unwrap();
         assert!(row.starts_with("no note found"), "{row:?}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4091,7 +4058,7 @@ mod tests {
 
     #[test]
     fn an_error_shows_on_the_bottom_row_until_the_next_key() {
-        let (mut b, dir) = browser("error", &[("a.md", "[[Gone]]\n")]);
+        let (mut b, _dir) = browser("error", &[("a.md", "[[Gone]]\n")]);
         enter(&mut b, KeyCode::Tab);
         enter(&mut b, KeyCode::Enter);
         let row = status_row(&mut b);
@@ -4101,7 +4068,6 @@ mod tests {
         // Any key clears it, even one that does nothing.
         enter(&mut b, KeyCode::Char('z'));
         assert_eq!(status_row(&mut b).trim(), "page 1/1");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4150,7 +4116,6 @@ mod tests {
         assert_eq!(b.path, dir.join("Plan.md"));
         assert_eq!(b.view.notice.as_deref(), Some("no heading found: Missing"));
         assert_eq!(b.history.len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4208,13 +4173,12 @@ mod tests {
         assert_eq!(top(&b.view), "Top");
         b.back();
         assert_eq!(top(&b.view), "Later");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn back_keeps_only_the_latest_places() {
         let home = format!("# Top\n\n{0}## Later\n\n{0}", paragraphs(8));
-        let (mut b, dir) = browser("limit", &[("HOME.md", &home)]);
+        let (mut b, _dir) = browser("limit", &[("HOME.md", &home)]);
         for _ in 0..HISTORY_LIMIT + 5 {
             b.follow(&wiki("#Later"));
             b.follow(&wiki("#Top"));
@@ -4227,7 +4191,6 @@ mod tests {
             b.back();
         }
         assert_eq!(b.ahead.len(), HISTORY_LIMIT);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4259,7 +4222,6 @@ mod tests {
         assert!(b.ahead.is_empty());
         b.forward();
         assert_eq!(b.path, dir.join("C.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The sources of the image blocks in `blocks`, and in quotes in them.
@@ -4319,7 +4281,6 @@ mod tests {
         // Nothing to go back to.
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(b.path, dir.join("HOME.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A browser as `browser` makes, with the syntaxes loaded first, so
@@ -4440,27 +4401,25 @@ mod tests {
 
     #[test]
     fn the_loop_draws_once_and_quits_on_a_quit_key() {
-        let (mut b, dir) = loaded("loop-quit", &[("a.md", "one\n")]);
+        let (mut b, _dir) = loaded("loop-quit", &[("a.md", "one\n")]);
         let (result, frames, timeouts) = run_script(&mut b, vec![quit()]);
         assert!(result.is_ok());
         assert_eq!(frames, 1);
         assert_eq!(timeouts, [CHECK_EVERY]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_signal_to_stop_ends_the_loop_like_a_quit_key() {
-        let (mut b, dir) = loaded("loop-stop", &[("a.md", "one\n")]);
+        let (mut b, _dir) = loaded("loop-stop", &[("a.md", "one\n")]);
         let (result, frames, timeouts) = run_script(&mut b, vec![Step::Wait, Step::Stop]);
         assert!(result.is_ok());
         assert_eq!(frames, 1);
         assert_eq!(timeouts, [CHECK_EVERY]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_loop_redraws_after_events_but_not_while_nothing_changes() {
-        let (mut b, dir) = loaded("loop-idle", &[("a.md", "one\n")]);
+        let (mut b, _dir) = loaded("loop-idle", &[("a.md", "one\n")]);
         let release = KeyEvent::new_with_kind(
             KeyCode::Char('q'),
             KeyModifiers::NONE,
@@ -4497,21 +4456,19 @@ mod tests {
                 CHECK_EVERY
             ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_loop_ends_with_an_error_from_the_input() {
-        let (mut b, dir) = loaded("loop-error", &[("a.md", "one\n")]);
+        let (mut b, _dir) = loaded("loop-error", &[("a.md", "one\n")]);
         let (result, frames, _) = run_script(&mut b, vec![Step::Wait]);
         assert_eq!(result.unwrap_err().to_string(), "the script ran out");
         assert_eq!(frames, 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_loop_scrolls_with_the_wheel() {
-        let (mut b, dir) = loaded("loop-mouse", &[("a.md", &paragraphs(10))]);
+        let (mut b, _dir) = loaded("loop-mouse", &[("a.md", &paragraphs(10))]);
         let wheel = MouseEvent {
             kind: MouseEventKind::ScrollDown,
             column: 0,
@@ -4523,7 +4480,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 2);
         assert_eq!(b.view.scroll, WHEEL_LINES as usize);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4536,7 +4492,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 2);
         assert_eq!(top(&b.view), "something else");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4550,7 +4505,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 1);
         assert_eq!(top(&b.view), "one");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4564,7 +4518,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 2);
         assert!(b.view.layout.lines.len() > lines, "the image took no rows");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4601,12 +4554,11 @@ mod tests {
         assert!(sent.rfind(repaint).is_some_and(|r| r > cells), "{sent:?}");
         let repaints = sent.matches(repaint).count();
         assert!((5..=7).contains(&repaints), "{repaints} repaints");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_loop_redraws_when_the_syntaxes_arrive() {
-        let (mut b, dir) = loaded("loop-syntaxes", &[("a.md", "```rust\nfn main() {}\n```\n")]);
+        let (mut b, _dir) = loaded("loop-syntaxes", &[("a.md", "```rust\nfn main() {}\n```\n")]);
         highlight::syntax_set();
         // As if the note were laid out before the syntaxes had loaded.
         b.view.highlighted = false;
@@ -4614,7 +4566,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(frames, 2);
         assert!(b.view.highlighted);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4669,7 +4620,7 @@ mod tests {
 
     #[test]
     fn handing_on_opens_with_the_opener() {
-        let (mut b, dir) = handing_on("hand-open", WebLinks::Open);
+        let (mut b, _dir) = handing_on("hand-open", WebLinks::Open);
         b.opener = |target| {
             assert_eq!(target, "https://example.com/");
             Ok(())
@@ -4682,12 +4633,11 @@ mod tests {
             b.view.notice.as_deref(),
             Some("cannot open https://example.com/: nothing opens https://example.com/")
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn handing_on_copies_through_the_terminal() {
-        let (mut b, dir) = handing_on("hand-copy", WebLinks::Copy);
+        let (mut b, _dir) = handing_on("hand-copy", WebLinks::Copy);
         let out = Shared::default();
         b.clipboard = Box::new(out.clone());
         b.hand_on("https://example.com/");
@@ -4702,15 +4652,13 @@ mod tests {
         b.clipboard = Box::new(Broken);
         b.hand_on("https://example.com/");
         assert_eq!(b.view.notice.as_deref(), Some("cannot copy: no terminal"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn handing_on_can_do_nothing() {
-        let (mut b, dir) = handing_on("hand-ignore", WebLinks::Ignore);
+        let (mut b, _dir) = handing_on("hand-ignore", WebLinks::Ignore);
         b.hand_on("https://example.com/");
         assert_eq!(b.view.notice, None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A browser that read `HOME.md`, with an image above a link to
@@ -4749,7 +4697,6 @@ mod tests {
             b.view.receive_images();
         }
         assert_eq!(b.view.scroll, scroll);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4758,7 +4705,6 @@ mod tests {
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(b.path, dir.join("HOME.md"));
         assert_eq!(b.view.layout.placements().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4798,7 +4744,6 @@ mod tests {
         assert_eq!(wait(&mut b), (40, 40));
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(wait(&mut b), (20, 100));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The keys crossterm makes of `reply`, a terminal's reply to a query
@@ -4820,7 +4765,7 @@ mod tests {
 
     #[test]
     fn late_terminal_replies_are_not_taken_as_keys() {
-        let (mut b, dir) = browser("replies", &[("a.md", &paragraphs(20))]);
+        let (mut b, _dir) = browser("replies", &[("a.md", &paragraphs(20))]);
         b.view.scroll_by(5);
         let replies = [
             // The background colour, ended by ST and by BEL.
@@ -4838,12 +4783,11 @@ mod tests {
         enter(&mut b, KeyCode::Char('j'));
         assert_eq!(b.view.scroll, 6);
         assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_reply_ends_at_its_terminator_or_a_key_it_cannot_hold() {
-        let (mut b, dir) = browser("reply-ends", &[("a.md", "a\n")]);
+        let (mut b, _dir) = browser("reply-ends", &[("a.md", "a\n")]);
         let key = |code, modifiers| KeyEvent::new(KeyCode::Char(code), modifiers);
         let (none, alt, ctrl) = (KeyModifiers::NONE, KeyModifiers::ALT, KeyModifiers::CONTROL);
         // A backslash without Alt is part of it, and so is what follows.
@@ -4862,27 +4806,24 @@ mod tests {
         assert!(b.reply(key(']', alt)));
         assert!(!b.reply(key('x', ctrl)));
         assert!(!b.reply(key('j', none)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn keys_after_the_readers_own_alt_bracket_still_work() {
-        let (mut b, dir) = browser("alt-bracket", &[("a.md", &paragraphs(20))]);
+        let (mut b, _dir) = browser("alt-bracket", &[("a.md", &paragraphs(20))]);
         b.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
         // Later than any part of a reply would come.
         std::thread::sleep(REPLY_GAP);
         enter(&mut b, KeyCode::Char('j'));
         assert_eq!(b.view.scroll, 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_bracket_without_alt_does_not_start_a_reply() {
-        let (mut b, dir) = browser("bracket", &[("a.md", &paragraphs(20))]);
+        let (mut b, _dir) = browser("bracket", &[("a.md", &paragraphs(20))]);
         enter(&mut b, KeyCode::Char(']'));
         enter(&mut b, KeyCode::Char('j'));
         assert_eq!(b.view.scroll, 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4915,7 +4856,6 @@ mod tests {
         std::fs::rename(dir.join("away"), dir.join("Other.md")).unwrap();
         enter(&mut b, KeyCode::Char('L'));
         assert_eq!(b.path, dir.join("Other.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4939,7 +4879,6 @@ mod tests {
             notice.starts_with("passed") && notice.contains("B.md"),
             "{notice}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4974,7 +4913,6 @@ mod tests {
         std::fs::rename(dir.join("away"), dir.join("B.md")).unwrap();
         enter(&mut b, KeyCode::Backspace);
         assert_eq!(b.path, dir.join("B.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

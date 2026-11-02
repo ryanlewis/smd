@@ -536,7 +536,6 @@ mod tests {
             Theme::Dark,
             Some(&path),
         );
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Png::new(png(30, 10)));
     }
 
@@ -551,7 +550,6 @@ mod tests {
             Some(&path),
         );
         let cached = path.exists();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Err("mermaid: mmdc not found on PATH".into()));
         assert!(!cached);
     }
@@ -576,7 +574,6 @@ mod tests {
         let cached = std::fs::read(&path).ok();
         let bad = draw_mmdc(program, "bad", Theme::Light, Some(&dir.join("bad.png")));
         let not_png = draw_mmdc(program, "text", Theme::Light, None);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Png::new(png(12, 34)));
         assert_eq!(cached, Some(png(12, 34)));
         assert_eq!(bad, Err("mermaid: Parse error on line 2".into()));
@@ -596,7 +593,6 @@ mod tests {
         let timeout = Duration::from_secs(10);
         let cannot = run(plain.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
         let failed = run(quiet.to_str().unwrap(), "graph LR\n", Theme::Dark, timeout);
-        let _ = std::fs::remove_dir_all(&dir);
         let cannot = cannot.unwrap_err();
         assert!(
             cannot.starts_with("mermaid: cannot run mmdc: ") && cannot.contains("ermission denied"),
@@ -641,7 +637,6 @@ mod tests {
         if !gone {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Err("mermaid: mmdc took over 2s".into()));
         assert!(gone, "the child outlived the timeout");
     }
@@ -680,7 +675,6 @@ mod tests {
         assert_eq!(names(&dir), ["new.png"]);
         evict(&dir, 10);
         assert_eq!(names(&dir), ["new.png"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -691,7 +685,6 @@ mod tests {
         aged(&dir, "b.png", 10, 100);
         evict(&dir, 0);
         assert_eq!(names(&dir), ["a.png.1.0.tmp"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -711,7 +704,6 @@ mod tests {
         assert!(got.is_ok());
         evict(&dir, std::fs::metadata(&used).unwrap().len());
         let left = names(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(left, ["used.png"]);
     }
 

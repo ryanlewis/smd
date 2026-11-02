@@ -369,7 +369,7 @@ pub(crate) fn readable(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
         };
         let ms = wait.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
         // SAFETY: one valid pollfd for the duration of the call.
-        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        let ready = unsafe { libc::poll(&raw mut pfd, 1, ms) };
         if ready < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -383,14 +383,14 @@ pub(crate) fn readable(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
     // only looks at the descriptor and writes to the set and the timeval.
     let ready = unsafe {
         let mut set: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut set);
-        libc::FD_SET(fd, &mut set);
+        libc::FD_ZERO(&raw mut set);
+        libc::FD_SET(fd, &raw mut set);
         libc::select(
             fd + 1,
-            &mut set,
+            &raw mut set,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut wait,
+            &raw mut wait,
         )
     };
     if ready < 0 {
@@ -854,10 +854,10 @@ mod tests {
         // read and write it.
         unsafe {
             let mut limit: libc::rlimit = std::mem::zeroed();
-            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit);
             if limit.rlim_cur <= high as libc::rlim_t {
                 limit.rlim_cur = limit.rlim_max.min(high as libc::rlim_t + 1);
-                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit);
             }
         }
         let pipe = Pipe::new(b"\x1b[?62c", true);
@@ -1058,7 +1058,10 @@ mod tests {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
             let mut old: libc::sigaction = std::mem::zeroed();
-            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, &mut old), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &raw const action, &raw mut old),
+                0
+            );
             old
         };
         let pipe = Pipe::new(b"", false);
@@ -1086,7 +1089,7 @@ mod tests {
         );
         terminal.join().unwrap();
         // SAFETY: puts back the handler saved above.
-        unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) };
+        unsafe { libc::sigaction(libc::SIGUSR1, &raw const old, std::ptr::null_mut()) };
         assert_eq!(reply, b"\x1b[?62c");
     }
 
@@ -1125,5 +1128,129 @@ mod tests {
             read_chunk(pipe.read, REPLY_TIMEOUT).as_deref(),
             Some(&b"\x1b[?62c"[..])
         );
+    }
+
+    #[test]
+    fn an_empty_upload_is_one_command() {
+        let mut out = Vec::new();
+        upload(&mut out, 5, &[]).unwrap();
+        assert_eq!(out, b"\x1b_Ga=t,f=100,i=5,q=2;\x1b\\");
+    }
+
+    #[test]
+    fn a_cell_size_of_nothing_is_skipped() {
+        assert_eq!(parse_cell_reply(b"\x1b[6;0;8t"), None);
+        assert_eq!(parse_cell_reply(b"\x1b[6;16;0t"), None);
+        assert_eq!(parse_cell_reply(b"\x1b[6;16;8;2t"), None);
+        assert_eq!(
+            parse_cell_reply(b"\x1b[6;0;8t\x1b[6;16;8;2t\x1b[6;16;8t"),
+            Some((8, 16))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_shared_memory_the_graphics_reply_ends_the_wait() {
+        // Anything after the replies, a key press say, is left for the key
+        // reader.
+        let chunks: [Option<&[u8]>; 2] = [Some(b"\x1b_Gi=31;OK\x1b\\\x1b[?62c"), Some(b"x")];
+        let mut waits = Vec::new();
+        let reply = exchange(
+            &mut Vec::new(),
+            scripted(&chunks, &mut waits),
+            LONG_GRACE,
+            LONG_GRACE,
+            LONG_GRACE,
+            None,
+        );
+        assert_eq!(reply, chunks[0].unwrap());
+        assert_eq!(waits.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_says_whether_input_is_waiting() {
+        let empty = Pipe::new(b"", false);
+        assert!(!readable(empty.read, Duration::ZERO).unwrap());
+        let full = Pipe::new(b"x", false);
+        assert!(readable(full.read, Duration::ZERO).unwrap());
+        let err = readable(-1, Duration::ZERO).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// `fd` duplicated onto a descriptor too high for select, raising the
+    /// limit on open files if need be, or `None` if it cannot be.
+    #[cfg(unix)]
+    fn high_fd(fd: libc::c_int) -> Option<libc::c_int> {
+        let high = libc::FD_SETSIZE as libc::c_int + 11;
+        // SAFETY: a zeroed rlimit is valid; getrlimit and setrlimit only
+        // read and write it.
+        unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            if limit.rlim_cur <= high as libc::rlim_t {
+                limit.rlim_cur = limit.rlim_max.min(high as libc::rlim_t + 1);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+        // SAFETY: duplicates an open descriptor onto the lowest free number
+        // at or above FD_SETSIZE, so it never takes one another test uses.
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD, libc::FD_SETSIZE as libc::c_int) };
+        (dup >= libc::FD_SETSIZE as libc::c_int).then_some(dup)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_says_whether_input_is_waiting_too_high_for_select() {
+        for (input, waiting) in [(&b""[..], false), (&b"x"[..], true)] {
+            let pipe = Pipe::new(input, false);
+            let Some(high) = high_fd(pipe.read) else {
+                return; // The limit cannot be raised here.
+            };
+            let ready = readable(high, Duration::ZERO);
+            // SAFETY: high was opened just above and is closed once.
+            unsafe { libc::close(high) };
+            assert_eq!(ready.unwrap(), waiting);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_chunk_gives_up_at_once_on_a_bad_descriptor() {
+        let start = Instant::now();
+        assert_eq!(read_chunk(-1, Duration::from_secs(5)), None);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Set errno, as a system call that failed would.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn set_errno(code: libc::c_int) {
+        // SAFETY: errno is this thread's own.
+        unsafe {
+            #[cfg(target_os = "linux")]
+            let errno = libc::__errno_location();
+            #[cfg(target_os = "macos")]
+            let errno = libc::__error();
+            *errno = code;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interrupted_reads_the_last_error() {
+        set_errno(libc::EINTR);
+        assert!(interrupted());
+        set_errno(libc::EAGAIN);
+        assert!(!interrupted());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn read_chunk_ends_with_the_input_after_an_earlier_signal() {
+        // A read that returns nothing has ended, whatever errno an earlier
+        // call left behind.
+        let pipe = Pipe::new(b"", true);
+        set_errno(libc::EINTR);
+        assert_eq!(read_chunk(pipe.read, REPLY_TIMEOUT), None);
     }
 }

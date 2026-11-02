@@ -14,7 +14,7 @@ const ENDS_WITHIN: Duration = Duration::from_secs(1);
 /// A new pseudo-terminal, 80 by 24: its master and its slave.
 fn pty() -> (OwnedFd, OwnedFd) {
     let (mut master, mut slave) = (-1, -1);
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 24,
         ws_col: 80,
         ws_xpixel: 0,
@@ -26,8 +26,8 @@ fn pty() -> (OwnedFd, OwnedFd) {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &size,
+            std::ptr::null_mut(),
+            &raw mut size,
         )
     };
     assert_eq!(made, 0, "openpty: {}", std::io::Error::last_os_error());

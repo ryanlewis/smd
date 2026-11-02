@@ -802,7 +802,7 @@ fn with_colons<'a>(event: Event<'a>, colon: char) -> Event<'a> {
 /// reads as it reads a colon, so `_` or a quote after it works as after `:`.
 /// It is used only in a source with no `&`, as punctuation can be written as
 /// a character reference, such as `&#64;`. Then a control character: whitespace, which the parser reads as a space,
-/// is never used, nor is U+000B, which CommonMark counts as whitespace.
+/// is never used, nor is U+000B, which `CommonMark` counts as whitespace.
 /// `None` if the source has them all.
 fn colon_marker(source: &str) -> Option<char> {
     let mut seen = [false; 128];

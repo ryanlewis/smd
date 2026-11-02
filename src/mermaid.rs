@@ -38,7 +38,7 @@ const CACHE_CAP: u64 = 100 * 1024 * 1024;
 
 /// How old a temporary cache file must be before eviction deletes it. A write
 /// takes well under a second, so one this old was left by a crash.
-const STALE_TMP: Duration = Duration::from_secs(60 * 60);
+const STALE_TMP: Duration = Duration::from_hours(1);
 
 /// How long one diagram may take before it is given up on.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -390,9 +390,13 @@ static RUNNING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
 impl Slot {
     fn take() -> Slot {
         let (lock, freed) = &RUNNING;
-        let mut running = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *running >= MAX_RUNNING {
-            running = freed.wait(running).unwrap_or_else(|e| e.into_inner());
+            running = freed
+                .wait(running)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         *running += 1;
         Slot
@@ -402,7 +406,9 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         let (lock, freed) = &RUNNING;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
         freed.notify_one();
     }
 }

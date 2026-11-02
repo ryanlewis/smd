@@ -235,7 +235,6 @@ fn queries(shm: Option<&str>) -> String {
 #[cfg(unix)]
 fn query(shm: Option<&str>) -> Option<Vec<u8>> {
     use ratatui::crossterm::terminal;
-    use std::os::fd::AsRawFd;
 
     // SAFETY: isatty only looks at the descriptor.
     let stdin_is_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
@@ -245,7 +244,9 @@ fn query(shm: Option<&str>) -> Option<Vec<u8>> {
     } else {
         Some(std::fs::File::open("/dev/tty").ok()?)
     };
-    let fd = tty.as_ref().map_or(libc::STDIN_FILENO, |t| t.as_raw_fd());
+    let fd = tty
+        .as_ref()
+        .map_or(libc::STDIN_FILENO, std::os::fd::AsRawFd::as_raw_fd);
     let was_raw = terminal::is_raw_mode_enabled().ok()?;
     if !was_raw {
         terminal::enable_raw_mode().ok()?;

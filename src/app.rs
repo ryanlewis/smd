@@ -939,12 +939,13 @@ fn hyperlink(cell: &mut Cell, id: usize, url: &str) {
 /// A `file://` address for `path`, with the bytes a URL cannot hold as is
 /// escaped.
 fn file_url(path: &Path) -> String {
+    use std::fmt::Write as _;
     let mut url = String::from("file://");
     for &b in path.as_os_str().as_encoded_bytes() {
         if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
             url.push(b as char);
         } else {
-            url.push_str(&format!("%{b:02X}"));
+            let _ = write!(url, "%{b:02X}");
         }
     }
     url
@@ -963,7 +964,7 @@ fn apply(view: &mut View, path: &Path, vault: &Vault, change: Change) {
             path.display()
         ))),
         Change::Unreadable(err) => {
-            view.set_notice(Some(format!("cannot read file: {err}: {}", path.display())))
+            view.set_notice(Some(format!("cannot read file: {err}: {}", path.display())));
         }
     }
 }
@@ -1434,7 +1435,7 @@ impl Browser {
         }
         // Folds are kept by where they start, so only in the same text.
         if self.view.doc.source == visited.doc.source {
-            self.view.flipped = visited.flipped.clone();
+            self.view.flipped.clone_from(&visited.flipped);
         }
         self.view.scroll = visited.scroll;
         self.view.selected = visited.selected;

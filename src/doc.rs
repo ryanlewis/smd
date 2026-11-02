@@ -150,7 +150,10 @@ pub enum CalloutKind {
 
 impl CalloutKind {
     fn from_name(name: &str) -> CalloutKind {
-        use CalloutKind::*;
+        use CalloutKind::{
+            Abstract, Bug, Caution, Danger, Example, Failure, Important, Info, Note, Question,
+            Quote, Success, Tip, Todo, Warning,
+        };
         match name.to_ascii_lowercase().as_str() {
             "abstract" | "summary" | "tldr" => Abstract,
             "info" => Info,
@@ -802,7 +805,7 @@ fn with_colons<'a>(event: Event<'a>, colon: char) -> Event<'a> {
 /// reads as it reads a colon, so `_` or a quote after it works as after `:`.
 /// It is used only in a source with no `&`, as punctuation can be written as
 /// a character reference, such as `&#64;`. Then a control character: whitespace, which the parser reads as a space,
-/// is never used, nor is U+000B, which CommonMark counts as whitespace.
+/// is never used, nor is U+000B, which `CommonMark` counts as whitespace.
 /// `None` if the source has them all.
 fn colon_marker(source: &str) -> Option<char> {
     let mut seen = [false; 128];
@@ -1306,12 +1309,11 @@ impl<'a> Builder<'a> {
     }
 
     fn text_event(&mut self, text: &str, range: Range<usize>) {
-        match &mut self.top().kind {
-            FrameKind::Code { code, .. } => code.push_str(text),
-            _ => {
-                let text = typed_dashes(self.source, range.clone()).unwrap_or(text);
-                self.prose(text, range);
-            }
+        if let FrameKind::Code { code, .. } = &mut self.top().kind {
+            code.push_str(text);
+        } else {
+            let text = typed_dashes(self.source, range.clone()).unwrap_or(text);
+            self.prose(text, range);
         }
     }
 
@@ -1491,6 +1493,22 @@ impl<'a> Builder<'a> {
 
     /// Pop the top frame and add what it built to its parent.
     fn close(&mut self) {
+        // An image left out at the end of a block leaves no space, unless
+        // the space is code's, is all the text there is, or comes before an
+        // open `==` that ends as text.
+        if std::mem::take(&mut self.gap)
+            && self.top().highlight.is_none()
+            && let Some(Inline::Text { text, style }) = self.top().inlines.last_mut()
+            && !style.code
+            && !style.kbd
+        {
+            let len = text
+                .trim_end_matches(|c: char| c.is_ascii_whitespace())
+                .len();
+            if len > 0 {
+                text.truncate(len);
+            }
+        }
         let mut frame = self.stack.pop().expect("frame to close");
         frame.end_highlight();
         let span = frame.span.clone();
@@ -2056,14 +2074,17 @@ impl<'a> Builder<'a> {
             alt.push_str(text);
             return self.push_text(text, style, range);
         }
-        // An image left out between words leaves one space. Code keeps its
-        // spaces.
+        // An image left out between words leaves one space, and at the start
+        // of a block or line none, unless an open `==` is there, which ends
+        // as text. Code keeps its spaces.
         let mut text = text;
-        if std::mem::take(&mut self.gap)
-            && !style.code
-            && let Some(Inline::Text { text: last, .. }) = self.top().inlines.last()
-            && last.ends_with(|c: char| c.is_ascii_whitespace())
-        {
+        let space_before = match self.top().inlines.last() {
+            Some(Inline::Text { text: last, .. }) => {
+                last.ends_with(|c: char| c.is_ascii_whitespace())
+            }
+            _ => self.top().highlight.is_none(),
+        };
+        if std::mem::take(&mut self.gap) && !style.code && !style.kbd && space_before {
             // Not a no-break space, which keeps its words together.
             text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
         }
@@ -2126,9 +2147,12 @@ impl<'a> Builder<'a> {
             };
             head.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
         };
-        let piece = |s: usize, e: usize| match exact {
-            true => range.start + s..range.start + e,
-            false => range.clone(),
+        let piece = |s: usize, e: usize| {
+            if exact {
+                range.start + s..range.start + e
+            } else {
+                range.clone()
+            }
         };
         // An image's alt text is kept as written.
         if self.image.is_some() {
@@ -2144,17 +2168,19 @@ impl<'a> Builder<'a> {
                 && after(i + 2) != Some('=')
             {
                 let open = self.top().highlight.is_some();
-                let touches = match open {
-                    true => prev.is_some_and(|c| !c.is_whitespace()),
-                    false => after(i + 2).is_some_and(|c| !c.is_whitespace()),
+                let touches = if open {
+                    prev.is_some_and(|c| !c.is_whitespace())
+                } else {
+                    after(i + 2).is_some_and(|c| !c.is_whitespace())
                 };
                 if touches {
                     self.plain(&text[start..i], piece(start, i));
                     let style = self.style();
                     let top = self.top();
-                    top.highlight = match open {
-                        true => None,
-                        false => Some((top.inlines.len(), style)),
+                    top.highlight = if open {
+                        None
+                    } else {
+                        Some((top.inlines.len(), style))
                     };
                     i += 2;
                     start = i;
@@ -2226,9 +2252,10 @@ fn tag_len(text: &str) -> usize {
         .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '/')))
         .unwrap_or(text.len());
     let name = &text[..len];
-    match name.chars().all(|c| c.is_ascii_digit() || c == '/') {
-        true => 0,
-        false => len,
+    if name.chars().all(|c| c.is_ascii_digit() || c == '/') {
+        0
+    } else {
+        len
     }
 }
 
@@ -3086,7 +3113,7 @@ paragraph @23..37
         );
         assert_eq!(
             themed(md, Theme::Light),
-            "paragraph @0..71\n  \" \"\n  \"[image: l]\" link=\"v\" wiki=false\n"
+            "paragraph @0..71\n  \"[image: l]\" link=\"v\" wiki=false\n"
         );
         // A wiki embed, whose fragment is not part of its name.
         let md = "![[logo.png#gh-dark-mode-only]]\n\nafter\n";
@@ -3130,6 +3157,44 @@ paragraph @23..37
         );
         // With no theme known, both logos stay.
         assert_eq!(parse_for(md, None).blocks, parse(md).blocks);
+    }
+
+    #[test]
+    fn a_logo_left_out_at_the_edge_of_a_block_leaves_no_space() {
+        let l = "![b](b.png#gh-light-mode-only)";
+        let dark = |md: String| themed(&md, Theme::Dark);
+        assert_eq!(dark(format!("{l} y\n")), "paragraph @0..33\n  \"y\"\n");
+        assert_eq!(dark(format!("# {l} y\n")), "heading 1 @0..35\n  \"y\"\n");
+        assert_eq!(dark(format!("x {l}\n")), "paragraph @0..33\n  \"x\"\n");
+        assert_eq!(dark(format!("# x {l}\n")), "heading 1 @0..35\n  \"x\"\n");
+        // Code keeps its spaces, at either edge.
+        assert_eq!(
+            dark(format!("{l}` a`\n")),
+            "paragraph @0..35\n  \" a\" code\n"
+        );
+        assert_eq!(
+            dark(format!("x `a `{l}\n")),
+            "paragraph @0..37\n  \"x \"\n  \"a \" code\n"
+        );
+        // An open `==`, put back as text when the block ends, keeps its space.
+        assert_eq!(
+            dark(format!("x =={l}\n")),
+            "paragraph @0..35\n  \"x \"\n  \"==\"\n"
+        );
+        assert_eq!(
+            dark(format!("=={l} a\n")),
+            "paragraph @0..35\n  \"==\"\n  \" a\"\n"
+        );
+        // Inside a highlight, between words, one space.
+        assert_eq!(
+            dark(format!("==a {l} b==\n")),
+            "paragraph @0..39\n  \"a b\" highlight\n"
+        );
+        // A highlight open at the logo still ends well.
+        assert_eq!(
+            dark(format!("*a*\n=={l}\n")),
+            "paragraph @0..37\n  \"a\" em\n  \" \"\n  \"==\"\n"
+        );
     }
 
     #[test]
@@ -3209,7 +3274,7 @@ paragraph @23..37
     #[test]
     fn a_logo_left_out_takes_an_image_in_its_alt_text_with_it() {
         let md = "![a ![b](b.png) c](l.png#gh-light-mode-only) after\n";
-        assert_eq!(themed(md, Theme::Dark), "paragraph @0..51\n  \" after\"\n");
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..51\n  \"after\"\n");
     }
 
     #[test]
@@ -4155,6 +4220,24 @@ quote @45..55
         assert_outline(
             "a \u{1}\u{2} b %%\n: c\n%%\n",
             "paragraph @0..17\n  \"a \\u{1}\\u{2} b \"\n",
+        );
+    }
+
+    #[test]
+    fn a_quote_goes_only_when_it_held_nothing_but_footnotes() {
+        // An empty quote stays, as does one with text beside its footnote.
+        assert_outline(">\n", "quote @0..2\n");
+        let blocks = parse("> [^1]: n\n>\n> text\n\nx[^1]\n").blocks;
+        assert!(
+            matches!(&blocks[0].kind, BlockKind::Quote(inner)
+                if matches!(inner.as_slice(), [b] if matches!(b.kind, BlockKind::Paragraph(_)))),
+            "{blocks:?}"
+        );
+        // One that held only the footnote goes.
+        let blocks = parse("> [^1]: n\n\nx[^1]\n").blocks;
+        assert!(
+            !blocks.iter().any(|b| matches!(b.kind, BlockKind::Quote(_))),
+            "{blocks:?}"
         );
     }
 

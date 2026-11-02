@@ -231,4 +231,33 @@ mod tests {
         assert_eq!(img.attr("hidden"), Some(""));
         assert_eq!(img.attr("title"), None);
     }
+
+    #[test]
+    fn an_attribute_can_follow_a_quoted_value_with_no_space() {
+        let pieces = pieces("<a x=\"1\"y='2'z=3>");
+        let [Piece::Tag(a)] = pieces.as_slice() else {
+            panic!("{pieces:?}");
+        };
+        assert_eq!(a.attr("x"), Some("1"));
+        assert_eq!(a.attr("y"), Some("2"));
+        assert_eq!(a.attr("z"), Some("3"));
+    }
+
+    #[test]
+    fn a_name_must_start_with_a_letter() {
+        assert_eq!(tags("<3a> <-b>"), ["text \"<3a> <-b>\""]);
+    }
+
+    #[test]
+    fn a_comment_stays_inside_a_pre_nested_in_a_pre() {
+        let kept = without_comments(pieces("<pre>a<pre>b</pre><!-- c --></pre><!-- d -->"));
+        let comments: Vec<&str> = kept
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Comment(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(comments, ["<!-- c -->"]);
+    }
 }

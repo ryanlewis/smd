@@ -107,7 +107,7 @@ impl Vault {
         let found = if link.wiki {
             self.wiki(name, from)
         } else {
-            self.relative(&percent_decode(name), from)
+            Self::relative(&percent_decode(name), from)
         };
         match found {
             Some(path) if is_markdown(&path) => Target::Note { path, heading },
@@ -143,7 +143,7 @@ impl Vault {
 
     /// The file a markdown link points at, relative to the linking note. A
     /// path with no extension may leave off `.md`.
-    fn relative(&self, name: &str, from: &Path) -> Option<PathBuf> {
+    fn relative(name: &str, from: &Path) -> Option<PathBuf> {
         let path = folder(from).join(name);
         if path.is_file() {
             return Some(path);
@@ -796,6 +796,17 @@ mod tests {
     }
 
     #[test]
+    fn the_index_stops_at_max_files() {
+        let v = TempVault::empty("vault-max-files", &[]);
+        for i in 0..=MAX_FILES {
+            std::fs::File::create(v.path(&format!("n{i}.md"))).unwrap();
+        }
+        let vault = Vault::for_file(&v.path("n0.md"));
+        let indexed: usize = vault.index().values().map(Vec::len).sum();
+        assert_eq!(indexed, MAX_FILES);
+    }
+
+    #[test]
     fn a_note_outside_a_vault_looks_in_its_own_folder_and_below() {
         // Removes the folder on drop, even when an assertion fails.
         let root = crate::testdir::TempDir::new("vault-novault");
@@ -888,9 +899,30 @@ mod tests {
                         out.extend(srcs(&item.blocks));
                     }
                 }
+                BlockKind::Definition { definitions, .. } => {
+                    for details in definitions {
+                        out.extend(srcs(details));
+                    }
+                }
                 _ => {}
             }
         }
         out
+    }
+
+    #[test]
+    fn embeds_in_definitions_are_resolved_and_plain_images_are_not() {
+        let v = TempVault::empty("vault-definitions", &["HOME.md", "pics/a.png", "b.png"]);
+        let vault = Vault::for_file(&v.path("HOME.md"));
+        let mut doc = crate::doc::parse("Term\n: ![[a.png]]\n\n![](b.png)\n");
+        vault.resolve_embeds(&mut doc.blocks, &v.path("HOME.md"));
+        assert_eq!(
+            srcs(&doc.blocks),
+            [
+                (v.path("pics/a.png").to_string_lossy().to_string(), false),
+                // A markdown image is read beside the note, as written.
+                ("b.png".to_string(), false),
+            ]
+        );
     }
 }

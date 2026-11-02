@@ -4,6 +4,8 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -1623,7 +1625,22 @@ pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 /// Run the browser until the reader quits, reloading the note when its file
 /// changes. Images are deleted from the terminal however it ends.
 pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<()> {
-    let result = run_browser(terminal, &mut browser, &mut Live);
+    let mut live = Live {
+        #[cfg(unix)]
+        keys: key_terminal(),
+    };
+    #[cfg(unix)]
+    if let Some(keys) = live.keys.as_ref().and_then(|keys| keys.try_clone().ok()) {
+        let _ = std::thread::Builder::new()
+            .name("hangup".into())
+            .spawn(move || end_on_hangup(&keys));
+    }
+    let result = run_browser(terminal, &mut browser, &mut live);
+    // On macOS reading or writing the gone terminal may fail first. The
+    // error is then not reported, as after SIGHUP.
+    if result.is_err() {
+        live.hung_up();
+    }
     let deleted = browser.view.images.delete_all(terminal.backend_mut());
     // After SIGHUP the terminal is gone, so failing to write to it is
     // expected and not worth reporting.
@@ -1961,6 +1978,77 @@ fn woken(read: libc::c_int, out: Option<libc::c_int>, wait: Option<Duration>) ->
     })
 }
 
+/// The terminal keys are read from, as crossterm picks it: stdin when it is
+/// one, else /dev/tty.
+#[cfg(unix)]
+fn key_terminal() -> Option<std::fs::File> {
+    use std::os::fd::AsFd;
+
+    // SAFETY: isatty only looks at the descriptor.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        let owned = io::stdin().as_fd().try_clone_to_owned().ok()?;
+        return Some(owned.into());
+    }
+    std::fs::File::open("/dev/tty").ok()
+}
+
+/// Whether the terminal on `fd` has gone: it reads as ready, yet has no
+/// bytes waiting, or cannot say how many (`waiting` then stays 0). Only
+/// right for a raw terminal that nothing else reads at the same time, as
+/// with the run loop's. A descriptor too high for select is never gone:
+/// `readable` asks poll for it, which on macOS takes any terminal as ready.
+#[cfg(unix)]
+fn gone(fd: libc::c_int) -> bool {
+    if fd >= libc::FD_SETSIZE as libc::c_int
+        || !kitty::readable(fd, Duration::ZERO).unwrap_or(false)
+    {
+        return false;
+    }
+    let mut waiting: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int to waiting.
+    unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut waiting) };
+    waiting == 0
+}
+
+/// Wait until the terminal on `fd` hangs up and say whether it did. False
+/// at once where poll cannot watch a terminal, as on macOS. Key presses do
+/// not wake it, as it asks only for the hang-up.
+#[cfg(unix)]
+fn hung_up(fd: libc::c_int) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if ready < 0 && kitty::interrupted() {
+            continue;
+        }
+        return ready > 0 && pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0;
+    }
+}
+
+/// End smd as SIGHUP would once the terminal `keys` come from hangs up,
+/// whether SIGHUP reaches smd or not. crossterm reads the gone terminal
+/// again and again without returning, so the run loop cannot end itself;
+/// only the shared memory objects are removed, as nothing can be written.
+#[cfg(unix)]
+fn end_on_hangup(keys: &std::fs::File) {
+    if hung_up(keys.as_raw_fd()) {
+        hang_up();
+        remove_objects();
+        raise(stop_signal().unwrap_or(libc::SIGHUP));
+    }
+}
+
+/// Stop as if SIGHUP came, unless a stop signal already did.
+#[cfg(unix)]
+fn hang_up() {
+    let _ = STOP.compare_exchange(0, libc::SIGHUP, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// Where the run loop gets the terminal's events and the time, so a test
 /// can stand in for both.
 trait Input {
@@ -1972,7 +2060,28 @@ trait Input {
 }
 
 /// The real terminal and clock.
-struct Live;
+struct Live {
+    /// The terminal keys come from, to see whether it has gone.
+    #[cfg(unix)]
+    keys: Option<std::fs::File>,
+}
+
+impl Live {
+    /// Stop as if SIGHUP came when the terminal keys come from has gone,
+    /// and say whether it has.
+    fn hung_up(&self) -> bool {
+        #[cfg(unix)]
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|keys| gone(keys.as_raw_fd()))
+        {
+            hang_up();
+            return true;
+        }
+        false
+    }
+}
 
 impl Input for Live {
     fn now(&self) -> Instant {
@@ -1980,6 +2089,11 @@ impl Input for Live {
     }
 
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        // crossterm waits again at once when the terminal has gone, until
+        // the timeout on macOS, so it is not asked then.
+        if self.hung_up() {
+            return Ok(false);
+        }
         event::poll(timeout)
     }
 
@@ -4521,6 +4635,76 @@ mod tests {
         assert!(ignored(libc::SIGUSR2));
         unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
         assert!(!ignored(libc::SIGUSR2));
+    }
+
+    /// A new pseudo-terminal: its master and its slave. Both are opened
+    /// close-on-exec, so a child another test starts meanwhile cannot hold
+    /// the master open, which would keep the pty up.
+    #[cfg(unix)]
+    fn pty() -> (std::fs::File, std::fs::File) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        /// ptsname writes the name to a buffer every caller shares.
+        static PTSNAME: Mutex<()> = Mutex::new(());
+        let open = |path: &std::ffi::OsStr| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(path)
+                .unwrap()
+        };
+        let master = open("/dev/ptmx".as_ref());
+        let fd = master.as_raw_fd();
+        let _shared = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: fd is a pty master; ptsname's name is copied before the
+        // lock is let go.
+        let name = unsafe {
+            assert_eq!(libc::grantpt(fd), 0, "{}", io::Error::last_os_error());
+            assert_eq!(libc::unlockpt(fd), 0, "{}", io::Error::last_os_error());
+            let name = libc::ptsname(fd);
+            assert!(!name.is_null(), "{}", io::Error::last_os_error());
+            std::ffi::CStr::from_ptr(name).to_owned()
+        };
+        let slave = open(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        (master, slave)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_is_gone_only_once_its_other_end_closes() {
+        let (mut master, slave) = pty();
+        assert!(!gone(slave.as_raw_fd()), "nothing waiting");
+        master.write_all(b"j\n").unwrap();
+        assert!(kitty::readable(slave.as_raw_fd(), Duration::from_secs(1)).unwrap());
+        assert!(!gone(slave.as_raw_fd()), "a key waiting");
+        drop(master);
+        assert!(gone(slave.as_raw_fd()));
+        assert!(
+            !gone(libc::FD_SETSIZE as libc::c_int),
+            "too high for select"
+        );
+    }
+
+    // poll cannot watch a terminal on macOS, so `hung_up` does not wait there.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_hang_up_is_waited_for_but_keys_do_not_end_the_wait() {
+        let (mut master, slave) = pty();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(hung_up(slave.as_raw_fd())));
+        master.write_all(b"j\n").unwrap();
+        let waited = rx.recv_timeout(Duration::from_millis(200));
+        assert!(waited.is_err(), "ended on a key: {waited:?}");
+        drop(master);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_descriptor_poll_cannot_watch_is_not_taken_for_a_hang_up() {
+        // Far above any open descriptor, so poll says it is not valid.
+        assert!(!hung_up(libc::c_int::MAX));
     }
 
     #[cfg(unix)]

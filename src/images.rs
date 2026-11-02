@@ -1818,4 +1818,141 @@ pub mod tests {
         assert!(!images.receive());
         assert_eq!(images.ready(&file_key("a.png")), None);
     }
+
+    #[test]
+    fn only_a_job_thread_is_in_a_job() {
+        assert!(!in_job());
+        let thread = std::thread::Builder::new().name(JOB_THREAD.into());
+        assert!(thread.spawn(in_job).unwrap().join().unwrap());
+    }
+
+    #[test]
+    fn a_panic_with_no_first_line_is_just_a_crash() {
+        assert_eq!(panicked(&""), "crashed");
+        assert_eq!(panicked(&String::from("\nsecond")), "crashed");
+        assert_eq!(panicked(&"first\nsecond"), "crashed: first");
+    }
+
+    #[test]
+    fn image_ids_go_round_after_the_last() {
+        let mut images = Images::new((10, 20));
+        images.next_id = kitty::MAX_ID - 1;
+        for name in ["a", "b", "c"] {
+            images.request(Key(format!("test:{name}")), job(png(1, 1)));
+        }
+        let id = |name: &str| images.entries[&Key(format!("test:{name}"))].id;
+        assert_eq!(
+            [id("a"), id("b"), id("c")],
+            [kitty::MAX_ID - 1, kitty::MAX_ID, 1]
+        );
+        settle(&mut images);
+    }
+
+    #[test]
+    fn images_inside_other_blocks_are_wanted() {
+        let md = "> ![q](q.png)\n\n- ![l](l.png)\n\nterm\n: ![d](d.png)\n\n\
+                  <details><summary>s</summary>\n\n![s](s.png)\n\n</details>\n\n\
+                  > [!note]\n> ![c](c.png)\n";
+        let mut doc = parse(md);
+        let embedded = parse("![e](e.png)\n");
+        doc.blocks.push(Block {
+            kind: BlockKind::Embed {
+                title: "e".into(),
+                link: crate::doc::Link::from("e"),
+                doc: embedded,
+            },
+            span: 0..0,
+        });
+        let base = Path::new("/notes");
+        let mut out = Vec::new();
+        wanted_in(&doc.blocks, base, &mut out);
+        let keys: Vec<String> = out.into_iter().map(|(key, _)| key.0).collect();
+        let want: Vec<String> = ["q", "l", "d", "s", "c", "e"]
+            .iter()
+            .map(|n| path_key(base, &format!("{n}.png")).0)
+            .collect();
+        assert_eq!(keys, want);
+    }
+
+    #[test]
+    fn a_mermaid_diagram_is_wanted() {
+        let doc = parse("```mermaid\ngraph TD; a-->b\n```\n");
+        let (key, _) = wanted(&doc.blocks[0], Path::new(".")).unwrap();
+        assert!(key.0.starts_with("mermaid:"), "{key:?}");
+    }
+
+    #[test]
+    fn text_is_not_an_svg() {
+        assert!(!looks_like_svg(b"just some text"));
+        assert!(looks_like_svg(b"<?xml?><svg/>"));
+    }
+
+    #[test]
+    fn a_jpeg_as_large_as_allowed_loads() {
+        let data = include_bytes!("../tests/fixtures/red-5x3.jpg");
+        assert!(jpeg(data, 15).is_ok());
+        assert_eq!(jpeg(data, 14).unwrap_err(), "JPEG too large");
+    }
+
+    #[test]
+    fn fit_shrinks_only_past_the_limits() {
+        // Exactly the widest allowed, with part of a row left over: as it is.
+        assert_eq!(fit((79, 20), (8, 16), 10), Some((10, 2)));
+        // Exactly the most rows a placeholder can address.
+        let limit = u32::from(kitty::MAX_CELLS);
+        let h = (limit - 1) * 16 + 1;
+        assert_eq!(fit((8, h), (8, 16), 10), Some((1, kitty::MAX_CELLS)));
+    }
+
+    /// A GIF header for an image `w` by `h` pixels; enough to be measured.
+    fn gif_header(w: u16, h: u16) -> Vec<u8> {
+        let mut data = b"GIF89a".to_vec();
+        data.extend(w.to_le_bytes());
+        data.extend(h.to_le_bytes());
+        data.extend([0, 0, 0]);
+        data
+    }
+
+    /// A WebP header for an image `w` by `h` pixels; enough to be measured.
+    fn webp_header(w: u32, h: u32) -> Vec<u8> {
+        let mut data = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+        data.extend(&(w - 1).to_le_bytes()[..3]);
+        data.extend(&(h - 1).to_le_bytes()[..3]);
+        data
+    }
+
+    #[test]
+    fn a_web_svg_draws_gifs_and_webps_up_to_the_largest_allowed() {
+        use resvg::usvg::ImageKind;
+        let data = |bytes: Vec<u8>| Arc::new(bytes);
+        let gif = web_data("image/gif", data(gif_header(4, 3)));
+        assert!(matches!(gif, Some(ImageKind::GIF(_))));
+        let webp = web_data("image/webp", data(webp_header(4, 3)));
+        assert!(matches!(webp, Some(ImageKind::WEBP(_))));
+        // 8000 by 5000 is exactly the most pixels allowed.
+        let largest = web_data("image/png", data(png(8000, 5000)));
+        assert!(matches!(largest, Some(ImageKind::PNG(_))));
+        assert!(web_data("image/png", data(png(8000, 5001))).is_none());
+    }
+
+    #[test]
+    fn css_fallbacks_need_no_space_after_the_comma() {
+        assert_eq!(css_fallbacks("fill:var(--x,red)"), "fill:red");
+    }
+
+    #[test]
+    fn placements_of_unknown_or_failed_images_send_nothing() {
+        let mut images = Images::new((10, 20));
+        images.request(Key("test:bad".into()), Box::new(|| Err("broken".into())));
+        settle(&mut images);
+        let failed = images.entries[&Key("test:bad".into())].id;
+        let mut out = Vec::new();
+        let placements = [failed, failed.wrapping_add(1)].map(|id| Placement {
+            id,
+            cols: 1,
+            rows: 1,
+        });
+        assert!(!images.flush(&mut out, &placements).unwrap());
+        assert!(out.is_empty());
+    }
 }

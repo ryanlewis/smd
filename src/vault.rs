@@ -188,14 +188,18 @@ impl Vault {
 }
 
 /// Every file under `root`, outside the folders in [`SKIP`], by its name in
-/// lower case: at most `max` of them. Gives the index and how many folders
-/// it read.
+/// lower case: at most `max` of them, after which no more folders are read.
+/// Gives the index and how many folders it read.
 fn index_files(root: &Path, max: usize) -> (HashMap<String, Vec<PathBuf>>, usize) {
     let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
     let mut seen = 0;
     let mut read = 0;
     while let Some(dir) = dirs.pop() {
+        // A full index needs no more folders read.
+        if seen >= max {
+            break;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -801,6 +805,16 @@ mod tests {
             vault.follow(&wiki("Kept"), &home),
             note(v.path("kept/Kept.md"), None)
         );
+    }
+
+    #[test]
+    fn the_walk_stops_once_the_index_is_full() {
+        // Two notes fill it, so the folders below are not read.
+        let files = ["a.md", "b.md", "deep/c.md", "deep/er/d.md", "wide/e.md"];
+        let v = TempVault::empty("vault-walk-stops", &files);
+        let (index, read) = index_files(&v.0, 2);
+        assert_eq!(index.values().map(Vec::len).sum::<usize>(), 2);
+        assert_eq!(read, 1);
     }
 
     #[test]

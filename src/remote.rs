@@ -341,7 +341,6 @@ mod tests {
         // A day later it is fetched again.
         assert_eq!(get(now + FRESH), want);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -359,7 +358,6 @@ mod tests {
         let now = SystemTime::now();
         let first = get(now);
         let later = get(now + FRESH + Duration::from_secs(60));
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(first, Png::new(png(4, 2)));
         assert_eq!(later, first);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
@@ -384,7 +382,6 @@ mod tests {
         };
         assert!(get().is_err());
         let second = get();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(second, Png::new(png(4, 2)));
     }
 
@@ -518,7 +515,6 @@ mod tests {
         });
         // Nothing was written anywhere else in it.
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(got, Png::new(png(4, 2)));
     }

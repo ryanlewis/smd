@@ -1114,7 +1114,6 @@ pub mod tests {
         std::fs::write(dir.join("a.svg"), &data).unwrap();
         let local = load(&dir.join("a.svg")).unwrap();
         let web = decode_remote(data).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(pixels_rgba(&local)[0][3], 255);
         assert!(pixels_rgba(&web).iter().all(|p| p[3] == 0));
     }
@@ -1258,7 +1257,6 @@ pub mod tests {
         images.set_base(&dir);
         images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
         settle(&mut images);
-        let _ = std::fs::remove_dir_all(&dir);
         let a = images.ready(&file_key("a.png")).unwrap();
         assert_eq!(a.px, (30, 40));
         assert_eq!(images.ready(&file_key("missing.png")), None);
@@ -1278,7 +1276,6 @@ pub mod tests {
         assert_eq!(images.ready(&file_key("d.png")), None);
         std::fs::write(dir.join("d.png"), png(10, 20)).unwrap();
         want(&mut images);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(images.ready(&file_key("d.png")).unwrap().px, (10, 20));
     }
 
@@ -1467,7 +1464,6 @@ pub mod tests {
         std::fs::write(dir.join("t.svg"), svg_bytes(60, 40, text)).unwrap();
         let image = load(&dir.join("a.svg"));
         let text = load(&dir.join("t.svg"));
-        let _ = std::fs::remove_dir_all(&dir);
         let [r, g, b, a] = pixels_rgba(&image.unwrap())[0];
         assert!(r > 150 && g < 80 && b < 80 && a == 255, "{r} {g} {b} {a}");
         // Set in the fallback font, when the machine has one.
@@ -1501,7 +1497,6 @@ pub mod tests {
         images.set_base(&dir);
         images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
         settle(&mut images);
-        let _ = std::fs::remove_dir_all(&dir);
         let px = |src| images.ready(&file_key(src)).map(|r| r.px);
         assert_eq!(px("img/logo.png#gh-dark-mode-only"), Some((10, 20)));
         assert_eq!(px("img/logo.png?raw=true"), Some((10, 20)));
@@ -1524,7 +1519,6 @@ pub mod tests {
         images.set_base(&dir);
         images.want(doc.blocks.iter().filter_map(|b| wanted(b, &dir)).collect());
         settle(&mut images);
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(images.ready(&file_key("my%20diagram.png")).is_some());
         assert_eq!(percent_decode("a%2"), Some("a%2".into()));
         assert_eq!(percent_decode("%e6%97%a5.png"), Some("日.png".into()));

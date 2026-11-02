@@ -1200,4 +1200,68 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_grid_counts_words_broken_mid_word_in_every_cell() {
+        let table = Table::parse("| abcdefgh | ijklmnop |\n|---|---|\n| q | r |");
+        assert_eq!(table.grid(&[4, 4], |base, _| base).hard, 2);
+    }
+
+    #[test]
+    fn a_header_only_table_is_cards_when_its_grid_would_wrap() {
+        let table = Table::parse("| aaaa bbbb |\n|-|");
+        assert_eq!(
+            plain(&table, 12),
+            vec!["────────────", "aaaa bbbb", "────────────"]
+        );
+    }
+
+    #[test]
+    fn dashed_rules_do_not_count_against_a_grid() {
+        let md = "| k | v |\n|---|---|\n| a | one two three four |\n\
+                  | b | five six seven ten |\n| c | nine ten eleven |\n| d | x |";
+        // The grid's text takes as many lines as the cards' text would.
+        assert_eq!(
+            plain(&Table::parse(md), 22),
+            vec![
+                "┌───┬────────────────┐",
+                "│ k │ v              │",
+                "├───┼────────────────┤",
+                "│ a │ one two three  │",
+                "│   │ four           │",
+                "├╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤",
+                "│ b │ five six seven │",
+                "│   │ ten            │",
+                "├╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤",
+                "│ c │ nine ten       │",
+                "│   │ eleven         │",
+                "├╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤",
+                "│ d │ x              │",
+                "└───┴────────────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn spaces_before_a_cells_first_word_are_dropped() {
+        assert_eq!(wrapped("  ab", 5), (vec!["ab".into()], 0));
+    }
+
+    #[test]
+    fn links_next_to_each_other_stay_apart_and_one_link_spans_its_styles() {
+        let table = Table::parse("| [a](x)[b](y) | [c **d**](z) |\n|---|---|\n| 1 | 2 |");
+        let dests: Vec<&str> = table.links.iter().map(|l| l.dest.as_str()).collect();
+        assert_eq!(dests, ["x", "y", "z"]);
+        assert_eq!(
+            table.run_links[0],
+            vec![vec![Some(0), Some(1)], vec![Some(2), Some(2)]]
+        );
+    }
+
+    #[test]
+    fn a_link_of_only_zero_width_characters_is_left_out() {
+        let table = Table::parse("| [\u{200b}](x) | [a](y) |\n|---|---|\n| 1 | 2 |");
+        let dests: Vec<&str> = table.links.iter().map(|l| l.dest.as_str()).collect();
+        assert_eq!(dests, ["y"]);
+    }
 }

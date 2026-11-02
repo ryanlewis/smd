@@ -496,7 +496,8 @@ mod tests {
     use super::*;
 
     /// The action after `action` in `Action::ALL`. A new action does not
-    /// compile here until it is given a place in the list.
+    /// compile here until it has an arm, and the test below fails until it
+    /// is in both this chain and the list.
     fn after(action: Action) -> Option<Action> {
         use Action::*;
         match action {
@@ -525,7 +526,9 @@ mod tests {
 
     #[test]
     fn all_lists_every_action_once() {
-        let every: Vec<Action> = std::iter::successors(Some(Action::Quit), |&a| after(a)).collect();
+        let every: Vec<Action> = std::iter::successors(Some(Action::Quit), |&a| after(a))
+            .take(Action::ALL.len() + 1)
+            .collect();
         assert_eq!(Action::ALL.to_vec(), every);
     }
 

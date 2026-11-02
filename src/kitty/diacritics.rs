@@ -1,5 +1,5 @@
 //! Row and column diacritics for kitty Unicode placeholders, in order, from
-//! https://raw.githubusercontent.com/kovidgoyal/kitty/master/gen/rowcolumn-diacritics.txt
+//! <https://raw.githubusercontent.com/kovidgoyal/kitty/master/gen/rowcolumn-diacritics.txt>
 
 pub const DIACRITICS: [char; 297] = [
     '\u{0305}',

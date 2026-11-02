@@ -6,7 +6,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use crate::images::{self, Job, Png};
@@ -25,7 +25,7 @@ const MAX_REDIRECTS: u32 = 5;
 const MAX_FETCHES: usize = 4;
 
 /// How long a cached image is used before it is fetched again.
-const FRESH: Duration = Duration::from_secs(24 * 60 * 60);
+const FRESH: Duration = Duration::from_hours(24);
 
 /// The most the cache may hold, in bytes.
 const CACHE_CAP: u64 = 100 * 1024 * 1024;
@@ -190,9 +190,9 @@ static RUNNING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
 impl Slot {
     fn take() -> Slot {
         let (lock, freed) = &RUNNING;
-        let mut running = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut running = lock.lock().unwrap_or_else(PoisonError::into_inner);
         while *running >= MAX_FETCHES {
-            running = freed.wait(running).unwrap_or_else(|e| e.into_inner());
+            running = freed.wait(running).unwrap_or_else(PoisonError::into_inner);
         }
         *running += 1;
         Slot
@@ -202,7 +202,7 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         let (lock, freed) = &RUNNING;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
         freed.notify_one();
     }
 }

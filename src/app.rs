@@ -963,7 +963,7 @@ fn apply(view: &mut View, path: &Path, vault: &Vault, change: Change) {
             path.display()
         ))),
         Change::Unreadable(err) => {
-            view.set_notice(Some(format!("cannot read file: {err}: {}", path.display())))
+            view.set_notice(Some(format!("cannot read file: {err}: {}", path.display())));
         }
     }
 }
@@ -1434,7 +1434,7 @@ impl Browser {
         }
         // Folds are kept by where they start, so only in the same text.
         if self.view.doc.source == visited.doc.source {
-            self.view.flipped = visited.flipped.clone();
+            self.view.flipped.clone_from(&visited.flipped);
         }
         self.view.scroll = visited.scroll;
         self.view.selected = visited.selected;

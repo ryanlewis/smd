@@ -4587,7 +4587,10 @@ mod tests {
         assert!(!gone(slave.as_raw_fd()), "a key waiting");
         drop(master);
         assert!(gone(slave.as_raw_fd()));
-        assert!(!gone(libc::FD_SETSIZE as libc::c_int), "too high for select");
+        assert!(
+            !gone(libc::FD_SETSIZE as libc::c_int),
+            "too high for select"
+        );
     }
 
     // poll cannot watch a terminal on macOS, so `hung_up` does not wait there.

@@ -150,7 +150,10 @@ pub enum CalloutKind {
 
 impl CalloutKind {
     fn from_name(name: &str) -> CalloutKind {
-        use CalloutKind::*;
+        use CalloutKind::{
+            Abstract, Bug, Caution, Danger, Example, Failure, Important, Info, Note, Question,
+            Quote, Success, Tip, Todo, Warning,
+        };
         match name.to_ascii_lowercase().as_str() {
             "abstract" | "summary" | "tldr" => Abstract,
             "info" => Info,
@@ -1306,12 +1309,11 @@ impl<'a> Builder<'a> {
     }
 
     fn text_event(&mut self, text: &str, range: Range<usize>) {
-        match &mut self.top().kind {
-            FrameKind::Code { code, .. } => code.push_str(text),
-            _ => {
-                let text = typed_dashes(self.source, range.clone()).unwrap_or(text);
-                self.prose(text, range);
-            }
+        if let FrameKind::Code { code, .. } = &mut self.top().kind {
+            code.push_str(text);
+        } else {
+            let text = typed_dashes(self.source, range.clone()).unwrap_or(text);
+            self.prose(text, range);
         }
     }
 
@@ -2145,9 +2147,12 @@ impl<'a> Builder<'a> {
             };
             head.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
         };
-        let piece = |s: usize, e: usize| match exact {
-            true => range.start + s..range.start + e,
-            false => range.clone(),
+        let piece = |s: usize, e: usize| {
+            if exact {
+                range.start + s..range.start + e
+            } else {
+                range.clone()
+            }
         };
         // An image's alt text is kept as written.
         if self.image.is_some() {
@@ -2163,17 +2168,19 @@ impl<'a> Builder<'a> {
                 && after(i + 2) != Some('=')
             {
                 let open = self.top().highlight.is_some();
-                let touches = match open {
-                    true => prev.is_some_and(|c| !c.is_whitespace()),
-                    false => after(i + 2).is_some_and(|c| !c.is_whitespace()),
+                let touches = if open {
+                    prev.is_some_and(|c| !c.is_whitespace())
+                } else {
+                    after(i + 2).is_some_and(|c| !c.is_whitespace())
                 };
                 if touches {
                     self.plain(&text[start..i], piece(start, i));
                     let style = self.style();
                     let top = self.top();
-                    top.highlight = match open {
-                        true => None,
-                        false => Some((top.inlines.len(), style)),
+                    top.highlight = if open {
+                        None
+                    } else {
+                        Some((top.inlines.len(), style))
                     };
                     i += 2;
                     start = i;
@@ -2245,9 +2252,10 @@ fn tag_len(text: &str) -> usize {
         .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '/')))
         .unwrap_or(text.len());
     let name = &text[..len];
-    match name.chars().all(|c| c.is_ascii_digit() || c == '/') {
-        true => 0,
-        false => len,
+    if name.chars().all(|c| c.is_ascii_digit() || c == '/') {
+        0
+    } else {
+        len
     }
 }
 

@@ -76,9 +76,8 @@ static DRAWN: OnceLock<Drawn> = OnceLock::new();
 /// (`text_sizing`) draw larger text.
 pub fn choose(mode: Mode, text_sizing: bool) -> Drawn {
     match (mode, text_sizing) {
-        (Mode::Image, _) => Drawn::Image,
+        (Mode::Image, _) | (Mode::Auto, false) => Drawn::Image,
         (Mode::Auto | Mode::Text, true) => Drawn::Sized,
-        (Mode::Auto, false) => Drawn::Image,
         (Mode::Text, false) => Drawn::Plain,
     }
 }

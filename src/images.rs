@@ -774,19 +774,16 @@ fn css_fallbacks(text: &str) -> String {
             at = open + 1;
             continue;
         };
-        match text[open + 1..close].find(',') {
-            Some(comma) => {
-                // Copy the fallback, trimmed, then go on after the bracket.
-                let fallback = text[open + 2 + comma..close].trim_start();
-                let from = close - fallback.len();
-                outer.push((end, close + 1));
-                (at, end) = (from, from + fallback.trim_end().len());
-            }
-            None => {
-                // No fallback here, nor in any `var(` inside it.
-                out.push_str(&text[var..=close]);
-                at = close + 1;
-            }
+        if let Some(comma) = text[open + 1..close].find(',') {
+            // Copy the fallback, trimmed, then go on after the bracket.
+            let fallback = text[open + 2 + comma..close].trim_start();
+            let from = close - fallback.len();
+            outer.push((end, close + 1));
+            (at, end) = (from, from + fallback.trim_end().len());
+        } else {
+            // No fallback here, nor in any `var(` inside it.
+            out.push_str(&text[var..=close]);
+            at = close + 1;
         }
     }
 }

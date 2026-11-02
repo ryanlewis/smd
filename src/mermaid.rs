@@ -81,9 +81,14 @@ fn renderer() -> Renderer {
 /// A name for the diagram drawn from `source` for `theme`, used both as the
 /// image key and as the cache file name.
 pub fn name(source: &str, theme: Theme) -> String {
+    name_for(source, theme, renderer())
+}
+
+/// [`name`] for a diagram drawn by `renderer`.
+fn name_for(source: &str, theme: Theme, renderer: Renderer) -> String {
     let mut hash = Fnv::new();
     let scale = SCALE.to_string();
-    for part in [VERSION, renderer().name(), theme.name(), &scale, source] {
+    for part in [VERSION, renderer.name(), theme.name(), &scale, source] {
         hash.write(part.as_bytes());
         hash.write(&[0]);
     }
@@ -196,10 +201,13 @@ fn touch(path: &Path) {
 
 /// The most the cache may hold, in bytes. `SMD_MERMAID_CACHE_MAX` overrides it.
 fn cache_cap() -> u64 {
-    std::env::var("SMD_MERMAID_CACHE_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CACHE_CAP)
+    cache_cap_from(std::env::var("SMD_MERMAID_CACHE_MAX").ok())
+}
+
+/// [`cache_cap`] for `SMD_MERMAID_CACHE_MAX` set to `value`, or unset. A
+/// value that is not a whole number of bytes is ignored.
+fn cache_cap_from(value: Option<String>) -> u64 {
+    value.and_then(|v| v.parse().ok()).unwrap_or(CACHE_CAP)
 }
 
 /// Delete the least recently used `.png` files in `dir` until the rest fit in
@@ -727,18 +735,27 @@ mod tests {
     fn cache_names_stay_the_same_from_one_release_to_the_next() {
         // A cache name that changes leaves every cached diagram unused.
         // Change VERSION, and these, when drawing changes on purpose.
-        assert_eq!(
-            name("graph LR\n  A-->B\n", Theme::Dark),
-            "dark-c8e135bf1a48abef"
-        );
-        assert_eq!(
-            name("graph LR\n  A-->B\n", Theme::Light),
-            "light-9e650fbb3e2765e7"
-        );
+        let source = "graph LR\n  A-->B\n";
+        let dark = name_for(source, Theme::Dark, Renderer::Builtin);
+        assert_eq!(dark, "dark-c8e135bf1a48abef");
+        let light = name_for(source, Theme::Light, Renderer::Builtin);
+        assert_eq!(light, "light-9e650fbb3e2765e7");
+        // Drawn by mmdc, a diagram has a cache file of its own.
+        assert_ne!(name_for(source, Theme::Dark, Renderer::Mmdc), dark);
+        // Nothing is set in tests, so diagrams are drawn by merman.
+        assert_eq!(name(source, Theme::Dark), dark);
     }
 
     #[test]
     fn the_cache_holds_100_mib_unless_told_otherwise() {
+        // The default cap, written out so a change to it is seen.
+        assert_eq!(cache_cap_from(None), 104_857_600);
+        assert_eq!(cache_cap_from(Some("1048576".into())), 1_048_576);
+        assert_eq!(cache_cap_from(Some("0".into())), 0);
+        // A value that is not a whole number of bytes gives the default.
+        for bad in ["", "abc", "-5", "1.5", " 10", "10MB"] {
+            assert_eq!(cache_cap_from(Some(bad.into())), 104_857_600, "{bad:?}");
+        }
         if std::env::var_os("SMD_MERMAID_CACHE_MAX").is_none() {
             assert_eq!(cache_cap(), 104_857_600);
         }
@@ -768,9 +785,27 @@ mod tests {
 
     #[test]
     fn merman_measures_labels_in_the_fonts_found() {
-        if raster::sans_files().is_none() {
+        // With no font found, or none merman can load, labels are measured
+        // with its estimates, as below, and there is nothing to compare.
+        let Some((regular, bold)) = raster::sans_files() else {
+            return;
+        };
+        let mut options = NativeFontOptions::default().with_font_file(regular);
+        if let Some(bold) = bold {
+            options = options.with_font_file(bold);
+        }
+        let loaded = options
+            .load(&OperationControl::new())
+            .ok()
+            .and_then(|fonts| {
+                let estimated = SvgEnvironment::deterministic();
+                estimated.with_native_font_context(fonts).ok()
+            });
+        if loaded.is_none() {
             return;
         }
+        let estimates = SvgEnvironment::deterministic().text_measurement_routes();
+        assert_ne!(environment().text_measurement_routes(), estimates);
         // The same diagram measured with merman's estimates instead.
         let source = "flowchart LR\n  A[A label wide enough to measure] --> B[Done]\n";
         let config = MermaidConfig::from_value(serde_json::json!({ "theme": "dark" }));

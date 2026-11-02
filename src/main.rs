@@ -181,7 +181,7 @@ fn is_piped(kind: Option<libc::mode_t>) -> bool {
 fn file_kind(fd: libc::c_int) -> Option<libc::mode_t> {
     // SAFETY: a stat is plain data, and fstat only writes the one it is given.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+    if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
         return None;
     }
     Some(st.st_mode & libc::S_IFMT)

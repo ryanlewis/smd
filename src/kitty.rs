@@ -369,7 +369,7 @@ pub(crate) fn readable(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
         };
         let ms = wait.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
         // SAFETY: one valid pollfd for the duration of the call.
-        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        let ready = unsafe { libc::poll(&raw mut pfd, 1, ms) };
         if ready < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -383,14 +383,14 @@ pub(crate) fn readable(fd: libc::c_int, wait: Duration) -> io::Result<bool> {
     // only looks at the descriptor and writes to the set and the timeval.
     let ready = unsafe {
         let mut set: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut set);
-        libc::FD_SET(fd, &mut set);
+        libc::FD_ZERO(&raw mut set);
+        libc::FD_SET(fd, &raw mut set);
         libc::select(
             fd + 1,
-            &mut set,
+            &raw mut set,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut wait,
+            &raw mut wait,
         )
     };
     if ready < 0 {
@@ -854,10 +854,10 @@ mod tests {
         // read and write it.
         unsafe {
             let mut limit: libc::rlimit = std::mem::zeroed();
-            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit);
             if limit.rlim_cur <= high as libc::rlim_t {
                 limit.rlim_cur = limit.rlim_max.min(high as libc::rlim_t + 1);
-                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit);
             }
         }
         let pipe = Pipe::new(b"\x1b[?62c", true);
@@ -1058,7 +1058,10 @@ mod tests {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
             let mut old: libc::sigaction = std::mem::zeroed();
-            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, &mut old), 0);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &raw const action, &raw mut old),
+                0
+            );
             old
         };
         let pipe = Pipe::new(b"", false);
@@ -1086,7 +1089,7 @@ mod tests {
         );
         terminal.join().unwrap();
         // SAFETY: puts back the handler saved above.
-        unsafe { libc::sigaction(libc::SIGUSR1, &old, std::ptr::null_mut()) };
+        unsafe { libc::sigaction(libc::SIGUSR1, &raw const old, std::ptr::null_mut()) };
         assert_eq!(reply, b"\x1b[?62c");
     }
 

@@ -484,7 +484,7 @@ fn fill(words: Vec<(Chars, Chars)>, width: usize) -> (Vec<Chars>, usize) {
             lines.push(Vec::new());
         }
         let mut rest = &word[..];
-        while chars_width(rest) > width {
+        while wider_than(rest, width) {
             let (cut, soft) = break_point(rest, width);
             hard += usize::from(!soft);
             lines.last_mut().unwrap().extend_from_slice(&rest[..cut]);
@@ -528,18 +528,32 @@ impl Wrapped {
 /// Where to break a word too wide for `width`: how many characters stay on
 /// this line, and whether the break is after punctuation.
 fn break_point(word: &[(char, usize)], width: usize) -> (usize, bool) {
-    let text: String = word.iter().map(|(c, _)| *c).collect();
-    let mut pieces = clusters(&text).map(|piece| (piece.chars().count(), piece.width()));
-    // At least one character and those drawn with it, so a character wider
-    // than the line still moves on.
-    let (mut fit, mut used) = pieces.next().unwrap_or((0, 0));
-    for (chars, w) in pieces {
-        used += w;
-        if used > width {
-            break;
+    // Only as much of a long word as the line takes is measured: the start
+    // of it, longer each time that is not enough.
+    let mut take = width + 4;
+    let fit = loop {
+        let end = take.min(word.len());
+        let text: String = word[..end].iter().map(|(c, _)| *c).collect();
+        let mut pieces = clusters(&text).map(|piece| (piece.chars().count(), piece.width()));
+        // At least one character and those drawn with it, so a character
+        // wider than the line still moves on.
+        let (mut fit, mut used) = pieces.next().unwrap_or((0, 0));
+        let mut over = false;
+        for (chars, w) in pieces.by_ref() {
+            used += w;
+            if used > width {
+                over = true;
+                break;
+            }
+            fit += chars;
         }
-        fit += chars;
-    }
+        // The last piece may carry on past the start measured; those
+        // before it are whole.
+        if end == word.len() || (over && pieces.next().is_some()) {
+            break fit;
+        }
+        take *= 2;
+    };
     let after = word[..fit]
         .iter()
         .rposition(|(c, _)| BREAK_AFTER.contains(*c))
@@ -548,6 +562,21 @@ fn break_point(word: &[(char, usize)], width: usize) -> (usize, bool) {
         Some(p) if p * 2 >= fit && p < word.len() => (p, true),
         _ => (fit, false),
     }
+}
+
+/// Whether `chars` measured as a whole are wider than `width`, measuring
+/// only as much of a long word as it takes. A character changes the width
+/// of those before it by one column at most, as U+FE0E after ⌚ does, so
+/// a start more than one column wider is wider whatever follows.
+fn wider_than(chars: &[(char, usize)], width: usize) -> bool {
+    let mut take = width + 4;
+    while take < chars.len() {
+        if chars_width(&chars[..take]) > width + 1 {
+            return true;
+        }
+        take *= 2;
+    }
+    chars_width(chars) > width
 }
 
 /// The columns `chars` take, measured as a whole so an emoji with U+FE0F
@@ -1314,5 +1343,90 @@ mod tests {
         let table = Table::parse("| [\u{200b}](x) | [a](y) |\n|---|---|\n| 1 | 2 |");
         let dests: Vec<&str> = table.links.iter().map(|l| l.dest.as_str()).collect();
         assert_eq!(dests, ["y"]);
+    }
+
+    #[test]
+    fn long_words_break_the_same_whatever_their_characters() {
+        let cases: &[(&str, usize, &[&str], usize)] = &[
+            (
+                "abcdefghijklmnopqrstuvwxyz0123456789",
+                10,
+                &["abcdefghij", "klmnopqrst", "uvwxyz0123", "456789"],
+                3,
+            ),
+            (
+                "日本語のテキストがとても長い単語です",
+                7,
+                &["日本語", "のテキ", "ストが", "とても", "長い単", "語です"],
+                5,
+            ),
+            (
+                "❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}",
+                3,
+                &["❤\u{fe0f}"; 5],
+                4,
+            ),
+            (
+                "👨\u{200d}👩\u{200d}👧👨\u{200d}👩\u{200d}👧👨\u{200d}👩\u{200d}👧",
+                3,
+                &["👨\u{200d}👩\u{200d}👧"; 3],
+                2,
+            ),
+            (
+                "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+                3,
+                &[
+                    "e\u{301}e\u{301}e\u{301}",
+                    "e\u{301}e\u{301}e\u{301}",
+                    "e\u{301}",
+                ],
+                2,
+            ),
+            (
+                "path/to/some/very/long/file_name.txt",
+                9,
+                &["path/to/", "some/", "very/", "long/", "file_", "name.txt"],
+                0,
+            ),
+            // Lam and alef together are one column, so the rest fits.
+            ("لالالالالالا", 3, &["لال", "الا", "لالالا"], 2),
+            ("a日b本c語d", 2, &["a", "日", "b", "本", "c", "語", "d"], 6),
+        ];
+        for &(word, width, lines, hard) in cases {
+            let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            assert_eq!(wrapped(word, width), (lines, hard), "{word:?}");
+        }
+        let table = Table::parse(
+            "| k | v |\n|-|-|\n| a | abcdefghijklmnopqrstuvwxyz日本語のテキスト0123456789 |\n",
+        );
+        assert_eq!(
+            plain(&table, 20),
+            [
+                "────────────────────",
+                "k: a",
+                "v: abcdefghijklmnopq",
+                "   rstuvwxyz日本語の",
+                "   テキスト012345678",
+                "   9",
+                "────────────────────"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_word_is_measured_whole_where_its_end_changes_its_width() {
+        // U+FE0E makes ⌚ one column, not two, so this fits in three.
+        let narrowed = "ab\u{301}\u{301}\u{301}\u{301}⌚\u{fe0e}";
+        assert_eq!(wrapped(narrowed, 3), (vec![narrowed.to_string()], 0));
+        // Marks that draw nothing add nothing.
+        for start in ["a", "abc"] {
+            let marks = format!("{start}{}", "\u{301}".repeat(10));
+            assert_eq!(wrapped(&marks, 3), (vec![marks.clone()], 0));
+        }
+        // A break measures ⌚ with the U+FE0E after it.
+        let cut = "a\u{301}\u{301}\u{301}\u{301}⌚\u{fe0e}bcd";
+        let lines = ["a\u{301}\u{301}\u{301}\u{301}⌚\u{fe0e}", "bc", "d"];
+        let lines = lines.map(String::from).to_vec();
+        assert_eq!(wrapped(cut, 2), (lines, 2));
     }
 }

@@ -924,4 +924,273 @@ mod tests {
             assert_eq!(colours(7, theme).0, colours(4, theme).0);
         }
     }
+
+    use crate::raster::tests::{
+        OPEN_STAR, STAR, emoji_font, solid_png, square_font, square_font_from,
+    };
+
+    const TEXT: Rgba = [1, 1, 1, 255];
+    const CODE: Rgba = [2, 2, 2, 255];
+
+    #[test]
+    fn plan_centres_the_line_in_its_rows_on_a_whole_pixel() {
+        let (sans, mono) = (square_font(), square_font_from('b'));
+        // At 24 pixels "ab" advances 19.2 and inks 17 up. The line is 24
+        // tall in 30, so it is centred 3 down, on the baseline 22.
+        let runs = [("ab".to_string(), false)];
+        let p = plan((&sans, &mono), 1, &runs, (1, 10), Theme::Dark).unwrap();
+        assert_eq!(p.size, 24.0);
+        assert_eq!((p.left, p.baseline), (1.0, 22.0));
+        assert_eq!((p.width, p.height), (22, 30));
+    }
+
+    #[test]
+    fn plan_lifts_a_descender_off_the_bottom_of_the_image() {
+        let (sans, mono) = (square_font(), square_font_from('b'));
+        // 'c' goes 8 pixels below the baseline at 20, so the baseline 16
+        // the line would be centred on moves up to 12.
+        let runs = [("c".to_string(), false)];
+        let p = plan((&sans, &mono), 4, &runs, (1, 20), Theme::Dark).unwrap();
+        assert_eq!(p.size, 20.0);
+        assert_eq!((p.left, p.baseline), (1.0, 12.0));
+        assert_eq!((p.width, p.height), (8, 20));
+    }
+
+    #[test]
+    fn plan_shrinks_type_whose_ink_is_taller_than_the_image() {
+        let (sans, mono) = (square_font(), square_font_from('b'));
+        // "bc" inks 14 up and 8 down at 20: 22 in 20 rows, so it shrinks
+        // to fit in 19, after which it inks 13 up and 7 down.
+        let runs = [("bc".to_string(), false)];
+        let p = plan((&sans, &mono), 4, &runs, (1, 20), Theme::Dark).unwrap();
+        assert_eq!(p.size, 20.0 * (19.0 / 22.0));
+        assert_eq!((p.baseline, p.width, p.height), (13.0, 15, 20));
+    }
+
+    #[test]
+    fn plan_takes_up_to_the_most_cells_kitty_can_place() {
+        let (sans, mono) = (square_font(), square_font_from('b'));
+        // Each 'a' is one 6 pixel cell, and the margins take one more.
+        let max = usize::from(kitty::MAX_CELLS);
+        let runs = [("a".repeat(max - 1), false)];
+        let p = plan((&sans, &mono), 4, &runs, (6, 10), Theme::Dark).unwrap();
+        assert_eq!(p.width, u32::from(kitty::MAX_CELLS) * 6);
+        let runs = [("a".repeat(max), false)];
+        assert!(plan((&sans, &mono), 4, &runs, (6, 10), Theme::Dark).is_err());
+    }
+
+    /// Each piece as which of `faces` it is drawn in, its text and colour.
+    fn faces_of<'a>(
+        pieces: &[Piece],
+        faces: &[(&'a str, &FontVec)],
+    ) -> Vec<(&'a str, String, Rgba)> {
+        pieces
+            .iter()
+            .map(|p| {
+                let face = match p.face {
+                    Face::Emoji(_) => "emoji",
+                    Face::Outline(f) => {
+                        faces
+                            .iter()
+                            .find(|(_, font)| std::ptr::eq(*font, f))
+                            .unwrap()
+                            .0
+                    }
+                };
+                (face, p.text.clone(), p.colour)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pieces_split_where_the_face_or_colour_changes() {
+        // Code is drawn in the code font where it has the glyph, and in the
+        // text font where only that does. Text is never in the code font.
+        let (sans, mono) = (square_font(), square_font_from('b'));
+        let runs = [("ab".to_string(), false), ("bdab".to_string(), true)];
+        let got = pieces(&runs, &sans, &mono, None, (TEXT, CODE)).unwrap();
+        let faces = [("sans", &sans), ("mono", &mono)];
+        assert_eq!(
+            faces_of(&got, &faces),
+            [
+                ("sans", "ab".to_string(), TEXT),
+                ("mono", "bd".to_string(), CODE),
+                ("sans", "a".to_string(), CODE),
+                ("mono", "b".to_string(), CODE),
+            ]
+        );
+        // A character in neither font, with no emoji font or one without it.
+        let missing = [("ad".to_string(), false)];
+        assert!(pieces(&missing, &sans, &mono, None, (TEXT, CODE)).is_none());
+        let png = solid_png(1, 1, [9, 9, 9, 255]);
+        let emoji = emoji_font(&[(20, [None, Some(&png), None])]);
+        assert!(pieces(&missing, &sans, &mono, Some(&emoji), (TEXT, CODE)).is_none());
+    }
+
+    #[test]
+    fn pieces_draw_a_character_asking_to_be_an_emoji_from_the_emoji_font() {
+        let png = solid_png(1, 1, [9, 9, 9, 255]);
+        let emoji = emoji_font(&[(20, [None, Some(&png), None])]);
+        let (sans, mono) = (square_font_from(STAR), square_font());
+        // With U+FE0F the star is an emoji, as the emoji font has it;
+        // without, it is text. The open star has no emoji image, so it is
+        // text even when asked.
+        let text = format!("{STAR}\u{FE0F}{STAR}\u{FE0F}{STAR}{OPEN_STAR}\u{FE0F}");
+        let runs = [(text, false)];
+        let got = pieces(&runs, &sans, &mono, Some(&emoji), (TEXT, CODE)).unwrap();
+        let faces = [("sans", &sans), ("mono", &mono)];
+        assert_eq!(
+            faces_of(&got, &faces),
+            [
+                ("emoji", format!("{STAR}{STAR}"), TEXT),
+                ("sans", format!("{STAR}{OPEN_STAR}"), TEXT),
+            ]
+        );
+    }
+
+    #[test]
+    fn shaping_marks_are_the_joiner_keycap_skin_tones_flags_and_tags() {
+        for c in [
+            '\u{200D}',
+            '\u{20E3}',
+            '\u{1F3FB}',
+            '\u{1F3FF}',
+            '\u{1F1E6}',
+            '\u{1F1FF}',
+            '\u{E0020}',
+            '\u{E007F}',
+        ] {
+            assert!(needs_shaping(c), "{:04X}", c as u32);
+        }
+        for c in ['a', '\u{FE0F}', '\u{1F3FA}', '\u{1F200}', '\u{E0080}', '🏠'] {
+            assert!(!needs_shaping(c), "{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn emoji_are_as_tall_as_their_image_and_centred_on_the_capitals() {
+        // A 4 by 2 image from a 20 pixel strike is 2 by 1 at 10 pixels.
+        let png = solid_png(4, 2, [9, 9, 9, 255]);
+        let emoji = emoji_font(&[(20, [None, Some(&png), None])]);
+        // 'H' inks 4 up, so emoji centre 2 up.
+        let with_h = square_font_from('H');
+        assert_eq!(
+            emoji_box(&with_h, &emoji, STAR, 10.0, 3.0),
+            [3.0, -2.5, 5.0, -1.5]
+        );
+        // An 'H' that inks 3 up and 4 down puts the middle half a pixel down.
+        let low_h = square_font_from('F');
+        assert_eq!(
+            emoji_box(&low_h, &emoji, STAR, 10.0, 3.0),
+            [3.0, 0.0, 5.0, 1.0]
+        );
+        // With no image, an emoji is a square as tall as the type.
+        assert_eq!(
+            emoji_box(&with_h, &emoji, OPEN_STAR, 10.0, 3.0),
+            [3.0, -7.0, 13.0, 3.0]
+        );
+        // With no 'H', the middle is guessed at 0.35 of the type up.
+        let without_h = square_font();
+        assert_eq!(
+            emoji_box(&without_h, &emoji, STAR, 10.0, 3.0),
+            [3.0, -4.0, 5.0, -3.0]
+        );
+    }
+
+    #[test]
+    fn measure_follows_each_piece_on_from_the_last() {
+        let png = solid_png(4, 2, [9, 9, 9, 255]);
+        let emoji = emoji_font(&[(20, [None, Some(&png), None])]);
+        let (sans, other) = (square_font(), square_font());
+        let piece = |face, text: &str| Piece {
+            face,
+            text: text.to_string(),
+            colour: TEXT,
+        };
+        // "a" advances 6, then "b" from there 4, then the emoji 2.
+        let pieces = [
+            piece(Face::Outline(&sans), "a"),
+            piece(Face::Outline(&other), "b"),
+            piece(Face::Emoji(&emoji), &STAR.to_string()),
+        ];
+        assert_eq!(
+            measure(&sans, &pieces, 10.0),
+            (12.0, [0.0, -7.0, 12.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn runs_join_text_of_the_same_kind_across_styles() {
+        let (_, content) = heading("# a *b* c\n");
+        assert_eq!(runs(&content), vec![("a b c".to_string(), false)]);
+    }
+
+    #[test]
+    fn the_name_has_the_default_cell_size() {
+        assert_eq!(fonts().is_some(), raster::sans_bold().is_ok());
+        if fonts().is_none() {
+            return;
+        }
+        let (level, content) = heading("# Title\n");
+        assert_eq!(
+            name(level, &content, Theme::Dark).as_deref(),
+            Some("heading:1:dark:8x16:[(\"Title\", false)]")
+        );
+    }
+
+    #[test]
+    fn one_row_is_erased_without_moving() {
+        assert_eq!(erase(1, 3), "\x1b[3X");
+    }
+
+    #[test]
+    fn scale_stays_at_one_and_keeps_twenty_columns() {
+        // A level drawn at the size of text stays there in a narrow pane.
+        assert_eq!(scale_for(Drawn::Sized, 4, 10), 1);
+        // 60 columns hold exactly 20 at three times the size; 59 do not.
+        assert_eq!(scale_for(Drawn::Sized, 1, 60), 3);
+        assert_eq!(scale_for(Drawn::Sized, 1, 59), 2);
+    }
+
+    #[test]
+    fn a_sized_line_ending_on_the_last_row_or_column_is_drawn_sized() {
+        let area = Rect::new(0, 0, 6, 3);
+        let mut buf = Buffer::empty(area);
+        draw_sized(&mut buf, area, 0, &[sized(1, 2, &[(0, 1, "A")])]);
+        let want = "\x1b[1B\x1b[2X\x1b[A\x1b[2X\x1b]66;s=2:w=1;A\x1b\\";
+        assert_eq!(buf[(0, 1)].symbol(), want);
+        // And one ending on the last column.
+        let mut buf = Buffer::empty(area);
+        draw_sized(&mut buf, area, 0, &[sized(0, 2, &[(4, 1, "B")])]);
+        let want = "\x1b[1B\x1b[2X\x1b[A\x1b[2X\x1b]66;s=2:w=1;B\x1b\\";
+        assert_eq!(buf[(4, 0)].symbol(), want);
+    }
+
+    #[test]
+    fn a_cut_line_at_the_size_of_text_stops_at_the_right_edge() {
+        use ratatui::style::{Color, Style};
+        let red = Style::new().fg(Color::Red);
+        // An area from column 2 to 12, its second row full of "X", with a
+        // line three times the size cut at the bottom.
+        let area = Rect::new(2, 0, 10, 2);
+        let cut = |cells: &[(u16, u8, &str)]| {
+            let mut buf = Buffer::empty(area);
+            buf.set_string(2, 1, "X".repeat(10), red);
+            draw_sized(&mut buf, area, 0, &[sized(1, 3, cells)]);
+            buf
+        };
+        let row = |parts: &[(u16, &str)]| {
+            let mut want = Buffer::empty(area);
+            for &(x, text) in parts {
+                want.set_string(x, 1, text, red);
+            }
+            want
+        };
+        // "A" clears the three columns it was laid out on, from 5.
+        assert_eq!(cut(&[(3, 1, "A")]), row(&[(2, "XXXA"), (8, "XXXX")]));
+        // A wide character that just fits on the last two columns.
+        assert_eq!(cut(&[(8, 2, "日")]), row(&[(2, "XXXXXXXX"), (10, "日")]));
+        // One that would hang over the edge is left out.
+        assert_eq!(cut(&[(9, 2, "日")]), row(&[(2, "XXXXXXXXX")]));
+    }
 }

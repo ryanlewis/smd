@@ -486,7 +486,7 @@ pub fn ink(font: &FontVec, size: f32, x: f32, text: &str) -> Option<[f32; 4]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -762,40 +762,13 @@ mod tests {
 
     /// The characters the test emoji font maps, to glyphs 1 and 2. Any
     /// other character is glyph 0.
-    const STAR: char = '\u{2605}';
-    const OPEN_STAR: char = '\u{2606}';
+    pub(crate) const STAR: char = '\u{2605}';
+    pub(crate) const OPEN_STAR: char = '\u{2606}';
 
     /// A colour emoji font of three glyphs with an `sbix` table: one strike
     /// per entry of `strikes`, each its pixels per em and the PNG data for
     /// each glyph, or `None` for a glyph with no image.
-    fn emoji_font(strikes: &[(u16, [Option<&[u8]>; 3])]) -> Emoji {
-        fn u16s(out: &mut Vec<u8>, values: &[u16]) {
-            for v in values {
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-        }
-        fn u32s(out: &mut Vec<u8>, values: &[u32]) {
-            for v in values {
-                out.extend_from_slice(&v.to_be_bytes());
-            }
-        }
-        let mut head = Vec::new();
-        u32s(&mut head, &[0x0001_0000, 0, 0, 0x5F0F_3CF5]);
-        u16s(&mut head, &[0, 1000]); // flags, units per em
-        head.resize(54, 0); // dates, bounds, style; short `loca` offsets
-        let mut hhea = Vec::new();
-        u32s(&mut hhea, &[0x0001_0000]);
-        u16s(&mut hhea, &[800, (-200i16) as u16]);
-        hhea.resize(34, 0);
-        u16s(&mut hhea, &[1]); // metrics count
-        let mut maxp = Vec::new();
-        u32s(&mut maxp, &[0x0000_5000]);
-        u16s(&mut maxp, &[3]);
-        // One Unicode subtable of format 6: two codes from STAR on.
-        let mut cmap = Vec::new();
-        u16s(&mut cmap, &[0, 1, 0, 3]);
-        u32s(&mut cmap, &[12]);
-        u16s(&mut cmap, &[6, 14, 0, STAR as u16, 2, 1, 2]);
+    pub(crate) fn emoji_font(strikes: &[(u16, [Option<&[u8]>; 3])]) -> Emoji {
         let mut strike_data = Vec::new();
         let mut strike_offsets = Vec::new();
         let header = 8 + 4 * strikes.len() as u32;
@@ -823,21 +796,72 @@ mod tests {
         u32s(&mut sbix, &[strikes.len() as u32]);
         u32s(&mut sbix, &strike_offsets);
         sbix.extend(strike_data);
-        // Tables sorted by tag, each on a four-byte boundary.
-        let tables: [(&[u8; 4], Vec<u8>); 5] = [
-            (b"cmap", cmap),
-            (b"head", head),
-            (b"hhea", hhea),
-            (b"maxp", maxp),
-            (b"sbix", sbix),
-        ];
+        let mut tables = base_tables(3, 1, STAR, &[1, 2]);
+        tables.push((*b"sbix", sbix));
+        let data: &'static [u8] = font_file(tables).leak();
+        Emoji(FontRef::try_from_slice(data).unwrap())
+    }
+
+    fn u16s(out: &mut Vec<u8>, values: &[u16]) {
+        for v in values {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    fn u32s(out: &mut Vec<u8>, values: &[u32]) {
+        for v in values {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    fn i16s(out: &mut Vec<u8>, values: &[i16]) {
+        for v in values {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    /// The `head`, `hhea`, `maxp` and `cmap` tables of a test font of
+    /// `glyphs` glyphs and `metrics` horizontal metrics, at 1000 units per em,
+    /// 800 up and 200 down. `cmap` maps the codes from `first` on to `ids`,
+    /// in one Unicode subtable of format 6.
+    fn base_tables(glyphs: u16, metrics: u16, first: char, ids: &[u16]) -> Vec<([u8; 4], Vec<u8>)> {
+        let mut head = Vec::new();
+        u32s(&mut head, &[0x0001_0000, 0, 0, 0x5F0F_3CF5]);
+        u16s(&mut head, &[0, 1000]); // flags, units per em
+        head.resize(54, 0); // dates, bounds, style; short `loca` offsets
+        let mut hhea = Vec::new();
+        u32s(&mut hhea, &[0x0001_0000]);
+        i16s(&mut hhea, &[800, -200]);
+        hhea.resize(34, 0);
+        u16s(&mut hhea, &[metrics]);
+        let mut maxp = Vec::new();
+        u32s(&mut maxp, &[0x0000_5000]);
+        u16s(&mut maxp, &[glyphs]);
+        let mut cmap = Vec::new();
+        u16s(&mut cmap, &[0, 1, 0, 3]);
+        u32s(&mut cmap, &[12]);
+        let count = ids.len() as u16;
+        u16s(&mut cmap, &[6, 10 + 2 * count, 0, first as u16, count]);
+        u16s(&mut cmap, ids);
+        vec![
+            (*b"cmap", cmap),
+            (*b"head", head),
+            (*b"hhea", hhea),
+            (*b"maxp", maxp),
+        ]
+    }
+
+    /// A font file holding `tables`, sorted by tag, each on a four-byte
+    /// boundary.
+    fn font_file(mut tables: Vec<([u8; 4], Vec<u8>)>) -> Vec<u8> {
+        tables.sort_by_key(|&(tag, _)| tag);
         let mut font = Vec::new();
         u32s(&mut font, &[0x0001_0000]);
         u16s(&mut font, &[tables.len() as u16, 0, 0, 0]);
-        let mut offset = 12 + 16 * tables.len() as u32;
+        let offset = 12 + 16 * tables.len() as u32;
         let mut body = Vec::new();
         for (tag, data) in &tables {
-            font.extend_from_slice(*tag);
+            font.extend_from_slice(tag);
             u32s(
                 &mut font,
                 &[0, offset + body.len() as u32, data.len() as u32],
@@ -845,15 +869,55 @@ mod tests {
             body.extend_from_slice(data);
             body.resize(body.len().next_multiple_of(4), 0);
         }
-        offset += body.len() as u32;
         font.extend(body);
-        assert_eq!(font.len() as u32, offset);
-        let data: &'static [u8] = font.leak();
-        Emoji(FontRef::try_from_slice(data).unwrap())
+        font
+    }
+
+    /// A font whose glyphs are squares on whole pixels at size 10, where a
+    /// unit is a hundredth of a pixel. 'a' is ink from 1 to 5 pixels across
+    /// and 0 to 4 up, with an advance of 6. 'b' is ink from 0 to 3 across
+    /// and 0 to 7 up, with an advance of 4. 'c' is ink from 0 to 2 across,
+    /// 3 up to 4 down, with an advance of 3. 'b' after 'a' moves 2 pixels
+    /// left. Any other character has no ink and no advance.
+    pub(crate) fn square_font() -> FontVec {
+        square_font_from('a')
+    }
+
+    /// The glyphs of [`square_font`] for `first` and the two characters
+    /// after it.
+    pub(crate) fn square_font_from(first: char) -> FontVec {
+        let squares: [[i16; 4]; 3] = [[100, 0, 500, 400], [0, 0, 300, 700], [0, -400, 200, 300]];
+        let mut glyf = Vec::new();
+        let mut loca = vec![0u16, 0];
+        for [x0, y0, x1, y1] in squares {
+            // One contour of four points on the curve, coordinates as
+            // words, each a step from the last point.
+            i16s(&mut glyf, &[1, x0, y0, x1, y1, 3, 0]);
+            glyf.extend([1u8; 4]);
+            i16s(&mut glyf, &[x0, x1 - x0, 0, x0 - x1]);
+            i16s(&mut glyf, &[y0, 0, y1 - y0, 0]);
+            loca.push(glyf.len() as u16 / 2);
+        }
+        let mut loca_bytes = Vec::new();
+        u16s(&mut loca_bytes, &loca);
+        let mut hmtx = Vec::new();
+        i16s(&mut hmtx, &[0, 0, 600, 100, 400, 0, 300, 0]);
+        // One horizontal subtable of format 0 with one pair.
+        let mut kern = Vec::new();
+        u16s(&mut kern, &[0, 1, 0, 20, 1, 1, 6, 0, 0, 1, 2]);
+        i16s(&mut kern, &[-200]);
+        let mut tables = base_tables(4, 4, first, &[1, 2, 3]);
+        tables.extend([
+            (*b"glyf", glyf),
+            (*b"hmtx", hmtx),
+            (*b"kern", kern),
+            (*b"loca", loca_bytes),
+        ]);
+        FontVec::try_from_vec(font_file(tables)).unwrap()
     }
 
     /// An opaque PNG of `width` by `height` in `colour`.
-    fn solid_png(width: u32, height: u32, colour: Rgba) -> Vec<u8> {
+    pub(crate) fn solid_png(width: u32, height: u32, colour: Rgba) -> Vec<u8> {
         let mut canvas = Canvas::new(width, height);
         for y in 0..height {
             for x in 0..width {
@@ -910,5 +974,138 @@ mod tests {
         assert!(font.has(STAR));
         assert!(!font.has(OPEN_STAR));
         assert!(!font.has('a'));
+    }
+
+    #[test]
+    fn square_font_text_is_measured_with_its_kerning() {
+        let font = square_font();
+        assert_eq!(measure(&font, 10.0, ""), 0.0);
+        assert_eq!(measure(&font, 10.0, "a"), 6.0);
+        assert_eq!(measure(&font, 10.0, "b"), 4.0);
+        assert_eq!(measure(&font, 10.0, "ab"), 8.0);
+        assert_eq!(measure(&font, 10.0, "ba"), 10.0);
+        assert_eq!(measure(&font, 20.0, "ab"), 16.0);
+    }
+
+    #[test]
+    fn square_font_ink_covers_every_glyph_from_where_it_starts() {
+        let font = square_font();
+        assert_eq!(ink(&font, 10.0, 0.0, "a"), Some([1.0, -4.0, 5.0, 0.0]));
+        assert_eq!(ink(&font, 10.0, 0.0, "b"), Some([0.0, -7.0, 3.0, 0.0]));
+        // 'b' starts 2 pixels into the advance of 'a', at 4.
+        assert_eq!(ink(&font, 10.0, 0.0, "ab"), Some([1.0, -7.0, 7.0, 0.0]));
+        assert_eq!(ink(&font, 10.0, 0.0, "ba"), Some([0.0, -7.0, 9.0, 0.0]));
+        assert_eq!(ink(&font, 10.0, 10.0, "a"), Some([11.0, -4.0, 15.0, 0.0]));
+        assert_eq!(ink(&font, 10.0, 0.0, "z"), None);
+        assert_eq!(ink(&font, 10.0, 0.0, ""), None);
+    }
+
+    #[test]
+    fn square_font_text_is_drawn_where_it_is_measured() {
+        let font = square_font();
+        let colour = [10, 200, 30, 255];
+        let mut canvas = Canvas::new(12, 9);
+        let end = canvas.text(&font, 10.0, 1.0, 8.0, "ab", colour);
+        assert_eq!(end, 9.0);
+        // 'a' fills x 2 to 6, y 4 to 8; 'b', from x 5, fills x 5 to 8, y 1
+        // to 8. Nothing else is touched.
+        let inked = |x: u32, y: u32| {
+            ((2..6).contains(&x) && (4..8).contains(&y))
+                || ((5..8).contains(&x) && (1..8).contains(&y))
+        };
+        for (i, pixel) in canvas.pixels().enumerate() {
+            let (x, y) = (i as u32 % 12, i as u32 / 12);
+            let want = if inked(x, y) { colour } else { [0; 4] };
+            assert_eq!(*pixel, want, "pixel {x}, {y}");
+        }
+    }
+
+    #[test]
+    fn average_weighs_each_pixel_by_its_cover_and_alpha() {
+        // A pixel and a half across: half of the first, opaque, and all of
+        // the second, at a fifth.
+        let row = Bitmap {
+            width: 2,
+            height: 1,
+            pixels: vec![[200, 100, 40, 255], [0, 60, 240, 51]],
+        };
+        assert_eq!(row.average(0.5, 0.0, 2.0, 1.0), [143, 89, 97, 119]);
+        // Three quarters of a white pixel over all of a black one.
+        let column = Bitmap {
+            width: 1,
+            height: 2,
+            pixels: vec![[255, 255, 255, 255], [0, 0, 0, 255]],
+        };
+        assert_eq!(column.average(0.0, 0.25, 1.0, 2.0), [109, 109, 109, 255]);
+        // Each pixel of a square on its own.
+        let square = Bitmap {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                [1, 2, 3, 255],
+                [4, 5, 6, 255],
+                [7, 8, 9, 255],
+                [10, 11, 12, 255],
+            ],
+        };
+        assert_eq!(square.average(0.0, 0.0, 1.0, 1.0), [1, 2, 3, 255]);
+        assert_eq!(square.average(1.0, 0.0, 2.0, 1.0), [4, 5, 6, 255]);
+        assert_eq!(square.average(0.0, 1.0, 1.0, 2.0), [7, 8, 9, 255]);
+        assert_eq!(square.average(1.0, 1.0, 2.0, 2.0), [10, 11, 12, 255]);
+        // Clear pixels, and an area off the image, average to clear.
+        let clear = Bitmap {
+            width: 1,
+            height: 1,
+            pixels: vec![[9, 9, 9, 0]],
+        };
+        assert_eq!(clear.average(0.0, 0.0, 1.0, 1.0), [0; 4]);
+        assert_eq!(square.average(3.0, 3.0, 4.0, 4.0), [0; 4]);
+    }
+
+    #[test]
+    fn blending_part_cover_over_a_part_clear_pixel_mixes_each_channel() {
+        let mut canvas = Canvas::new(1, 1);
+        canvas.pixels[0] = [0, 100, 200, 128];
+        canvas.blend(0, 0, [250, 50, 10, 204], 0.5);
+        assert_eq!(canvas.pixels[0], [143, 71, 92, 179]);
+    }
+
+    #[test]
+    fn an_image_off_the_pixel_grid_shares_edge_pixels_by_cover() {
+        // One opaque pixel drawn half a pixel right and a quarter down:
+        // the top row has three quarters of it, the bottom row a quarter,
+        // and each column half.
+        let dot = Bitmap {
+            width: 1,
+            height: 1,
+            pixels: vec![[10, 20, 30, 255]],
+        };
+        let mut canvas = Canvas::new(2, 2);
+        canvas.image(&dot, 0.5, 0.25, 1.0, 1.0);
+        let pixels: Vec<Rgba> = canvas.pixels().copied().collect();
+        assert_eq!(
+            pixels,
+            [
+                [10, 20, 30, 96],
+                [10, 20, 30, 96],
+                [10, 20, 30, 32],
+                [10, 20, 30, 32]
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_is_stretched_down_to_the_height_of_its_box() {
+        let white = [255, 255, 255, 255];
+        let black = [0, 0, 0, 255];
+        let bitmap = Bitmap {
+            width: 1,
+            height: 2,
+            pixels: vec![white, black],
+        };
+        let mut canvas = Canvas::new(1, 4);
+        canvas.image(&bitmap, 0.0, 0.0, 1.0, 4.0);
+        let pixels: Vec<Rgba> = canvas.pixels().copied().collect();
+        assert_eq!(pixels, [white, white, black, black]);
     }
 }

@@ -267,9 +267,10 @@ mod tests {
             .into()
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("smd-remote-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A cache folder, not made yet, removed when dropped.
+    fn scratch(name: &str) -> crate::testdir::TempDir {
+        let dir = crate::testdir::TempDir::new(&format!("remote-{name}"));
+        std::fs::remove_dir(&dir).unwrap();
         dir
     }
 
@@ -458,5 +459,67 @@ mod tests {
         assert!(fetch(&agent, &url, MAX_BYTES).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(listener);
+    }
+
+    #[test]
+    fn the_limits_are_ten_mb_an_image_and_a_hundred_for_the_cache() {
+        assert!(include_str!("../README.md").contains("a 10 MB limit"));
+        assert_eq!(MAX_BYTES, 10_485_760);
+        assert_eq!(CACHE_CAP, 104_857_600);
+    }
+
+    #[test]
+    fn the_cache_directory_comes_from_the_environment() {
+        assert_eq!(
+            cache_dir(),
+            cache_dir_in(
+                cfg!(target_os = "macos"),
+                std::env::var_os("HOME"),
+                std::env::var_os("XDG_CACHE_HOME"),
+            )
+        );
+    }
+
+    #[test]
+    fn no_more_than_four_fetches_run_at_once() {
+        use std::sync::mpsc;
+        // Taken on a thread, so a test that cannot take them fails, not hangs.
+        let (sent, got) = mpsc::channel();
+        std::thread::spawn(move || {
+            let slots: Vec<Slot> = (0..MAX_FETCHES).map(|_| Slot::take()).collect();
+            sent.send(slots).unwrap();
+        });
+        let slots = got.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (sent, got) = mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let slot = Slot::take();
+            sent.send(()).unwrap();
+            drop(slot);
+        });
+        // A fifth waits for a place.
+        assert!(got.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(slots);
+        assert!(got.recv_timeout(Duration::from_secs(5)).is_ok());
+        waiting.join().unwrap();
+        // Every place is given back.
+        assert_eq!(*RUNNING.0.lock().unwrap_or_else(|e| e.into_inner()), 0);
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_cached_is_still_shown() {
+        let dir = scratch("uncached");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The cache's directory is a file, so nothing can be written in it.
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let path = file.join("x.img");
+        let got = cached("http://x/a.png", Some(&path), SystemTime::now(), |_| {
+            Ok(png(4, 2))
+        });
+        // Nothing was written anywhere else in it.
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(got, Png::new(png(4, 2)));
     }
 }

@@ -2175,6 +2175,7 @@ fn run_browser<W: Write>(
 mod tests {
     use super::*;
     use crate::doc::parse;
+    use crate::testdir::TempDir;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2305,13 +2306,11 @@ mod tests {
     /// A view of `md` read from a fresh directory holding `files`, with every
     /// image it names loaded.
     fn view_with_files(name: &str, md: &str, files: &[(&str, Vec<u8>)]) -> View {
-        let dir = std::env::temp_dir().join(format!("smd-app-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new(&format!("app-{name}"));
         for (file, data) in files {
             std::fs::write(dir.join(file), data).unwrap();
         }
-        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        let mut v = View::new(parse(md), dir.to_path_buf(), Images::new((10, 20)));
         crate::images::tests::settle(&mut v.images);
         let _ = std::fs::remove_dir_all(&dir);
         v
@@ -2441,11 +2440,9 @@ mod tests {
     /// arrives.
     fn arriving(name: &str, md: &str, down: usize) -> View {
         use crate::images::tests::png;
-        let dir = std::env::temp_dir().join(format!("smd-app-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new(&format!("app-{name}"));
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
-        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        let mut v = View::new(parse(md), dir.to_path_buf(), Images::new((10, 20)));
         v.resize(20, 5);
         v.scroll_by(down as isize);
         assert_eq!(v.scroll, down);
@@ -2468,12 +2465,10 @@ mod tests {
     #[test]
     fn the_current_match_stays_when_images_arrive_or_the_width_changes() {
         use crate::images::tests::png;
-        let dir = std::env::temp_dir().join(format!("smd-app-{}-kept", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("app-kept");
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
         let md = "pin\n\n![a](a.png)\n\npin one pin two\n\npin\n";
-        let mut v = View::new(parse(md), dir.clone(), Images::new((10, 20)));
+        let mut v = View::new(parse(md), dir.to_path_buf(), Images::new((10, 20)));
         v.resize(20, 5);
         // The second "pin" in the paragraph after the image.
         on_match(&mut v, "pin", 2);
@@ -2730,6 +2725,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_one_row_tall_shows_the_text_until_there_is_a_message() {
+        let mut v = new_view("one\n\ntwo\n");
+        let mut terminal = Terminal::new(TestBackend::new(8, 1)).unwrap();
+        terminal.draw(|f| v.draw(f)).unwrap();
+        assert_eq!(v.height, 1);
+        assert_eq!(rows(terminal.backend().buffer()), ["one     "]);
+        v.set_notice(Some("hi".into()));
+        terminal.draw(|f| v.draw(f)).unwrap();
+        assert_eq!(v.height, 0);
+        assert_eq!(rows(terminal.backend().buffer()), ["hi      "]);
+    }
+
+    #[test]
     fn notice_takes_the_bottom_row_and_clears() {
         let mut v = new_view("one\n\ntwo\n");
         let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
@@ -2745,6 +2753,9 @@ mod tests {
         terminal.draw(|f| v.draw(f)).unwrap();
         let buf = terminal.backend().buffer();
         assert_eq!(rows(buf), ["back    ", "        ", "        "]);
+        apply(&mut v, Change::Unreadable("denied".into()));
+        let said = "cannot read file: denied: a.md";
+        assert_eq!(v.notice.as_deref(), Some(said));
     }
 
     /// The text of each row of `buf`.
@@ -2889,6 +2900,50 @@ mod tests {
     }
 
     #[test]
+    fn only_a_plain_left_click_follows_a_link() {
+        let home = "go [[Plan]] now\n";
+        let (mut b, dir) = browser("click-not", &[("HOME.md", home), ("Plan.md", "# Plan\n")]);
+        let on_link = |kind, modifiers| MouseEvent {
+            kind,
+            column: 4,
+            row: 1,
+            modifiers,
+        };
+        let left = MouseEventKind::Down(MouseButton::Left);
+        b.mouse(on_link(left, KeyModifiers::SHIFT));
+        b.mouse(on_link(
+            MouseEventKind::Down(MouseButton::Right),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        // Nor while a search term is typed.
+        enter(&mut b, KeyCode::Char('/'));
+        b.mouse(on_link(left, KeyModifiers::NONE));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        enter(&mut b, KeyCode::Esc);
+        b.mouse(on_link(left, KeyModifiers::NONE));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        b.back();
+        // Past the Forward button, the toolbar does nothing.
+        let past = (BACK_BUTTON.width() + FORWARD_BUTTON.width()) as u16;
+        let toolbar = |column| MouseEvent {
+            kind: left,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        b.mouse(toolbar(past));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        b.mouse(toolbar(past - 1));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        // Forward starts right after Back.
+        b.back();
+        b.mouse(toolbar(BACK_BUTTON.width() as u16));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn max_width_keeps_the_text_narrow_at_the_left_or_in_the_middle() {
         let md = format!("{}\n\n```\n{}\n```\n", "word ".repeat(40), "x".repeat(50));
         for (align, left) in [(Align::Centre, 20), (Align::Left, 0)] {
@@ -2963,6 +3018,54 @@ mod tests {
         // A click on any of its cells finds the link.
         assert!(matches!(v.stop_at(21, 1), Some(Stop::Link(0))));
         assert!(v.stop_at(1, 1).is_none());
+        // Nor is there one below the view.
+        assert!(v.stop_at(21, v.height).is_none());
+    }
+
+    #[test]
+    fn a_selection_no_longer_in_the_layout_is_dropped() {
+        let mut v = new_view("[a](a.md) [b](b.md)\n");
+        v.resize(40, 5);
+        v.selected = Some(Stop::Link(1));
+        v.reload(parse("[a](a.md)\n"));
+        assert_eq!(v.selected, None);
+        v.selected = Some(Stop::Link(0));
+        v.relayout(None);
+        assert_eq!(v.selected, Some(Stop::Link(0)));
+        v.selected = Some(Stop::Link(1));
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+        v.selected = Some(Stop::Fold(0));
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+        v.reload(parse("> [!note]- Shut\n> body\n"));
+        v.selected = Some(Stop::Fold(0));
+        v.relayout(None);
+        assert_eq!(v.selected, Some(Stop::Fold(0)));
+        // A checkbox stays selected only while it can be ticked.
+        v.reload(parse("- [ ] buy\n"));
+        v.tasks = true;
+        v.selected = Some(Stop::Task(0));
+        v.relayout(None);
+        assert_eq!(v.selected, Some(Stop::Task(0)));
+        v.selected = Some(Stop::Task(1));
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+        v.selected = Some(Stop::Task(0));
+        v.tasks = false;
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+    }
+
+    #[test]
+    fn a_click_finds_a_link_below_the_top_of_a_scrolled_view() {
+        let md = format!("{}[A](a.md)\n\n{}", paragraphs(1), paragraphs(5));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        // The link is on line 2, the second row of a view scrolled one down.
+        v.scroll = 1;
+        assert_eq!(v.stop_at(0, 1), Some(Stop::Link(0)));
+        assert_eq!(v.stop_at(0, 2), None);
     }
 
     #[test]
@@ -3068,7 +3171,7 @@ mod tests {
         // A new note starts with its callouts as they are written.
         enter(&mut b, KeyCode::Enter);
         assert_eq!(rows(&b), 4);
-        b.view.show(parse(note), dir.clone());
+        b.view.show(parse(note), dir.to_path_buf());
         assert_eq!(rows(&b), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3198,6 +3301,55 @@ mod tests {
     }
 
     #[test]
+    fn back_in_the_same_note_reads_it_again_once_its_text_has_changed() {
+        let home = format!("[down](#later)\n\n{}## Later\n", paragraphs(8));
+        let (mut b, dir) = browser("back-same", &[("HOME.md", &home)]);
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.history.len(), 1);
+        // Reloaded, the note on screen is not the one left; then the file
+        // changes again before the watcher sees it.
+        std::fs::write(&b.path, "second\n").unwrap();
+        press_all(&mut b, "r");
+        std::fs::write(&b.path, "third\n").unwrap();
+        b.back();
+        assert_eq!(top(&b.view), "third");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_with_no_obsidian_folder_stays_the_vault_for_notes_inside_it() {
+        let files = [
+            ("HOME.md", "[two](sub/two.md) [far](../far.md)\n"),
+            ("sub/two.md", "two\n"),
+        ];
+        let (mut b, dir) = browser("vault-kept", &files);
+        std::fs::remove_dir_all(dir.join(".obsidian")).unwrap();
+        b.vault = Vault::for_file(&b.path);
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("sub/two.md"));
+        assert_eq!(b.vault.root, dir.path());
+        // A note outside it has a vault of its own. Its text is given, so
+        // no file need be there.
+        let far = dir.with_file_name(format!("smd-far-{}.md", std::process::id()));
+        b.show(far.clone(), "far\n", false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(b.vault.root, far.parent().unwrap());
+    }
+
+    #[test]
+    fn the_help_opens_from_a_note_read_from_stdin() {
+        let (b, dir) = browser("help-piped", &[("stdin", "piped\n")]);
+        let mut b = b.piped();
+        press_all(&mut b, "?");
+        assert!(b.toolbar().to_string().trim_end().ends_with(" help"));
+        b.back();
+        assert_eq!(top(&b.view), "piped");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_click_ticks_a_checkbox() {
         let (mut b, dir) = browser("tick-click", &[("HOME.md", "- [ ] one\n")]);
         let click = |column| MouseEvent {
@@ -3246,6 +3398,10 @@ mod tests {
         b.view.selected = None;
         enter(&mut b, KeyCode::Tab);
         assert_eq!(b.view.selected, Some(Stop::Task(0)));
+        // A checkbox that can no longer be ticked is no longer selected.
+        b.config.tasks = Tasks::ReadOnly;
+        b.check_tasks();
+        assert_eq!(b.view.selected, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3450,6 +3606,110 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_keeps_the_view_as_far_through_the_note() {
+        let md: String = (0..20).map(|n| format!("line {n} goes on\n\n")).collect();
+        let mut v = new_view(&md);
+        v.resize(10, 5);
+        // Each paragraph is two lines at 10 columns and one at 40, with a
+        // blank line between them.
+        assert_eq!(v.layout.lines.len(), 59);
+        v.scroll = 30;
+        v.resize(40, 5);
+        assert_eq!(v.layout.lines.len(), 39);
+        assert_eq!(v.scroll, 30 * 39 / 59);
+    }
+
+    #[test]
+    fn nothing_is_laid_out_before_the_view_has_a_width() {
+        let mut v = new_view("one\n");
+        v.show(parse("two\n"), PathBuf::new());
+        assert!(v.layout.lines.is_empty());
+        v.resize(20, 5);
+        assert_eq!(top(&v), "two");
+    }
+
+    #[test]
+    fn a_byte_keeps_its_place_before_an_edit_moves_after_it_and_is_lost_in_it() {
+        assert_eq!(moved(1, "abcd", "abXcd"), Some(1));
+        assert_eq!(moved(2, "abcd", "abXcd"), Some(3));
+        assert_eq!(moved(3, "abXcd", "abcd"), Some(2));
+        assert_eq!(moved(2, "abXcd", "abcd"), None);
+        // With the same bytes on both sides of the edit, the end of the
+        // shorter text is not counted twice: the last "a" went.
+        assert_eq!(moved(2, "aaa", "aa"), None);
+        assert_eq!(moved(3, "aaa", "aa"), Some(2));
+    }
+
+    #[test]
+    fn a_count_before_tab_goes_round_as_that_many_tabs_do() {
+        let md = "[a](a.md) [b](b.md) [c](c.md)\n";
+        for action in [Action::NextLink, Action::PrevLink] {
+            for times in 1..=8 {
+                let mut one_by_one = new_view(md);
+                one_by_one.resize(40, 5);
+                for _ in 0..times {
+                    one_by_one.act(action);
+                }
+                let mut counted = new_view(md);
+                counted.resize(40, 5);
+                counted.act_counted(action, Some(times));
+                assert_eq!(counted.selected, one_by_one.selected, "{action:?} {times}");
+            }
+        }
+    }
+
+    #[test]
+    fn images_are_read_from_the_notes_folder_or_the_current_one() {
+        assert_eq!(folder(Path::new("notes/a.md")), PathBuf::from("notes"));
+        assert_eq!(folder(Path::new("/a.md")), PathBuf::from("/"));
+        assert_eq!(folder(Path::new("a.md")), PathBuf::from("."));
+        assert_eq!(folder(Path::new("/")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn folding_a_block_selects_it_only_if_it_was_selected() {
+        let md = "> [!note]- One\n> body\n\n> [!note]- Two\n> body\n";
+        let mut v = new_view(md);
+        v.resize(20, 2);
+        let at = v.layout.folds[0].at;
+        v.fold(at);
+        assert_eq!(v.selected, None);
+        // Its title stays on the top row, though the title below it moves.
+        assert_eq!(v.scroll, 0);
+        v.selected = Some(Stop::Fold(1));
+        v.fold(at);
+        assert_eq!(v.selected, Some(Stop::Fold(1)));
+        v.selected = Some(Stop::Fold(0));
+        v.fold(at);
+        assert_eq!(v.selected, Some(Stop::Fold(0)));
+    }
+
+    #[test]
+    fn a_jump_outside_a_shut_fold_leaves_it_shut() {
+        let md = format!("> [!note]- Shut\n> body\n\n{}## Later\n", paragraphs(4));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        assert!(v.jump_to_heading("later"));
+        assert!(!v.layout.folds[0].open);
+        assert!(v.flipped.is_empty());
+    }
+
+    #[test]
+    fn a_heading_is_found_in_a_quote_or_a_list_and_across_a_break() {
+        for (md, wanted, at) in [
+            ("> # Quoted\n", "quoted", "# Quoted"),
+            ("- one\n- # Listed\n", "listed", "# Listed"),
+            ("> - # Deeper\n", "deeper", "# Deeper"),
+            ("Two\\\nLines\n===\n\n# Two\n", "two lines", "Two"),
+        ] {
+            let doc = parse(md);
+            let found = heading_start(&doc.source, &doc.blocks, wanted);
+            assert_eq!(found, md.find(at), "{md:?}");
+            assert_eq!(heading_start(&doc.source, &doc.blocks, "missing"), None);
+        }
+    }
+
+    #[test]
     fn a_fold_stays_open_when_the_note_is_edited_above_it() {
         let note = "> [!note]- Shut\n> body\n";
         let mut v = new_view(note);
@@ -3461,9 +3721,8 @@ mod tests {
     }
 
     /// A browser on `files` in a fresh vault, showing the first.
-    fn browser(name: &str, files: &[(&str, &str)]) -> (Browser, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("smd-browse-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn browser(name: &str, files: &[(&str, &str)]) -> (Browser, TempDir) {
+        let dir = TempDir::new(&format!("browse-{name}"));
         std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
         for (file, text) in files {
             let path = dir.join(file);
@@ -3553,6 +3812,40 @@ mod tests {
         assert!(b.view.search.matches.is_empty());
         assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backspace_edits_the_term_and_enter_with_none_gives_the_search_up() {
+        let mut v = new_view("ab\n\nab cd\n");
+        v.resize(20, 5);
+        let typed = |v: &mut View, code| v.search_key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            v.act(Action::NextMatch),
+            Some(Go::Say("no search: press / to search".into()))
+        );
+        v.act(Action::Search);
+        for c in "abx".chars() {
+            assert_eq!(typed(&mut v, KeyCode::Char(c)), None);
+        }
+        assert_eq!(v.prompt.as_deref(), Some("/abx  no matches"));
+        typed(&mut v, KeyCode::Backspace);
+        assert_eq!(v.prompt.as_deref(), Some("/ab  2 matches"));
+        // A key that is not for the prompt leaves it as it is, Alt+C too.
+        assert_eq!(typed(&mut v, KeyCode::Tab), None);
+        let alt_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
+        assert_eq!(v.search_key(alt_c), None);
+        assert_eq!(v.prompt.as_deref(), Some("/ab  2 matches"));
+        // With the term taken off, Enter goes nowhere and ends the search.
+        typed(&mut v, KeyCode::Backspace);
+        typed(&mut v, KeyCode::Backspace);
+        assert_eq!(typed(&mut v, KeyCode::Enter), None);
+        assert_eq!((v.prompt.clone(), v.search.active()), (None, false));
+        assert_eq!(v.search.current, None);
+        // Esc while typing gives the search up too.
+        v.act(Action::Search);
+        typed(&mut v, KeyCode::Char('a'));
+        assert_eq!(typed(&mut v, KeyCode::Esc), None);
+        assert_eq!((v.prompt.clone(), v.search.active()), (None, false));
     }
 
     #[test]
@@ -3718,6 +4011,11 @@ mod tests {
         press_all(&mut b, "2");
         assert_eq!(b.view.scroll, 1);
         assert_eq!(b.view.count, None);
+        // Nor is a digit with Ctrl or Alt held.
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            b.key(KeyEvent::new(KeyCode::Char('5'), modifiers));
+            assert_eq!(b.view.count, None);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3769,6 +4067,26 @@ mod tests {
         let row = rows(terminal.backend().buffer()).pop().unwrap();
         assert!(row.starts_with("no note found"), "{row:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_page_is_shown_beside_a_message_only_with_a_space_between() {
+        // " page 1/1 " takes 10 of the 20 columns.
+        let status = |notice: &str| {
+            let mut v = new_view("one\n");
+            v.set_notice(Some(notice.into()));
+            let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+            terminal.draw(|f| v.draw(f)).unwrap();
+            rows(terminal.backend().buffer()).pop().unwrap()
+        };
+        assert_eq!(status("123456789"), "123456789  page 1/1 ");
+        // In the bar's style, not as plain text.
+        let mut v = new_view("one\n");
+        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        terminal.draw(|f| v.draw(f)).unwrap();
+        let cell = &terminal.backend().buffer()[(0, 1)];
+        assert!(cell.modifier.contains(Modifier::REVERSED) || cell.bg != Color::Reset);
+        assert_eq!(status("1234567890"), "1234567890          ");
     }
 
     #[test]
@@ -4006,7 +4324,7 @@ mod tests {
 
     /// A browser as `browser` makes, with the syntaxes loaded first, so
     /// they cannot arrive part way through a test and cause a redraw.
-    fn loaded(name: &str, files: &[(&str, &str)]) -> (Browser, PathBuf) {
+    fn loaded(name: &str, files: &[(&str, &str)]) -> (Browser, TempDir) {
         highlight::syntax_set();
         browser(name, files)
     }
@@ -4240,7 +4558,7 @@ mod tests {
         use crate::images::tests::png;
         let (mut b, dir) = loaded("loop-image", &[("a.md", "one\n")]);
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
-        b.view.show(parse("![a](a.png)\n"), dir.clone());
+        b.view.show(parse("![a](a.png)\n"), dir.to_path_buf());
         let lines = b.view.layout.lines.len();
         let (result, frames, _) = run_script(&mut b, vec![Step::Drawn, quit()]);
         assert!(result.is_ok());
@@ -4254,7 +4572,7 @@ mod tests {
         use crate::images::tests::png;
         let (mut b, dir) = loaded("loop-image-first", &[("a.md", "one\n")]);
         std::fs::write(dir.join("a.png"), png(20, 100)).unwrap();
-        b.view.show(parse("![a](a.png)\n"), dir.clone());
+        b.view.show(parse("![a](a.png)\n"), dir.to_path_buf());
         let out = Shared::default();
         let options = ratatui::TerminalOptions {
             viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 30, 7)),
@@ -4341,7 +4659,7 @@ mod tests {
         }
     }
 
-    fn handing_on(name: &str, web_links: WebLinks) -> (Browser, PathBuf) {
+    fn handing_on(name: &str, web_links: WebLinks) -> (Browser, TempDir) {
         let (mut b, dir) = browser(name, &[("a.md", "one\n")]);
         b.config.web_links = web_links;
         b.opener = |target| panic!("opened {target}");
@@ -4398,7 +4716,7 @@ mod tests {
     /// A browser that read `HOME.md`, with an image above a link to
     /// `Other.md`, waited for the image, scrolled below it and followed the
     /// link. Also the scroll it left `HOME.md` at.
-    fn gone_past_an_image(name: &str) -> (Browser, PathBuf, usize) {
+    fn gone_past_an_image(name: &str) -> (Browser, TempDir, usize) {
         use crate::images::tests::png;
         let home = format!("![a](a.png)\n\n{0}[[Other]]\n\n{0}", paragraphs(6));
         let (mut b, dir) = loaded(name, &[("HOME.md", "one\n"), ("Other.md", "other\n")]);
@@ -4524,11 +4842,44 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_ends_at_its_terminator_or_a_key_it_cannot_hold() {
+        let (mut b, dir) = browser("reply-ends", &[("a.md", "a\n")]);
+        let key = |code, modifiers| KeyEvent::new(KeyCode::Char(code), modifiers);
+        let (none, alt, ctrl) = (KeyModifiers::NONE, KeyModifiers::ALT, KeyModifiers::CONTROL);
+        // A backslash without Alt is part of it, and so is what follows.
+        assert!(b.reply(key(']', alt)));
+        assert!(b.reply(key('\\', none)));
+        assert!(b.reply(key('j', none)));
+        // ST ends it and is part of it; the key after is the reader's.
+        assert!(b.reply(key('\\', alt)));
+        assert!(!b.reply(key('j', none)));
+        // So does BEL.
+        assert!(b.reply(key(']', alt)));
+        assert!(b.reply(key('g', ctrl)));
+        assert!(!b.reply(key('j', none)));
+        // Another key with Ctrl cannot be in it, so it ends it and is the
+        // reader's.
+        assert!(b.reply(key(']', alt)));
+        assert!(!b.reply(key('x', ctrl)));
+        assert!(!b.reply(key('j', none)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn keys_after_the_readers_own_alt_bracket_still_work() {
         let (mut b, dir) = browser("alt-bracket", &[("a.md", &paragraphs(20))]);
         b.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
         // Later than any part of a reply would come.
         std::thread::sleep(REPLY_GAP);
+        enter(&mut b, KeyCode::Char('j'));
+        assert_eq!(b.view.scroll, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bracket_without_alt_does_not_start_a_reply() {
+        let (mut b, dir) = browser("bracket", &[("a.md", &paragraphs(20))]);
+        enter(&mut b, KeyCode::Char(']'));
         enter(&mut b, KeyCode::Char('j'));
         assert_eq!(b.view.scroll, 1);
         let _ = std::fs::remove_dir_all(&dir);

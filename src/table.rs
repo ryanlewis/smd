@@ -21,6 +21,9 @@ const FLOOR: usize = 12;
 /// The most words wrapped cells may break mid-word before cards are used.
 const MAX_HARD: usize = 2;
 
+/// The style of a header.
+const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
+
 /// Characters a word too long for its column may break after. A break
 /// there does not count against `MAX_HARD`.
 const BREAK_AFTER: &str = "/-_.,:=";
@@ -200,6 +203,7 @@ impl Table {
         let separate = rows[1..].iter().any(|cells| height(cells) > 1);
         let mut hard = 0;
         let mut lines = vec![rule("┌", "─", "┬", "┐")];
+        let mut rules = 2;
         for (r, cells) in rows.iter().enumerate() {
             let base = if r == 0 {
                 Style::new().add_modifier(Modifier::BOLD)
@@ -213,32 +217,47 @@ impl Table {
                 .map(|(c, cell)| pieces(cell, &self.run_links[r][c], base, &styled))
                 .collect();
             for k in 0..height(cells) {
-                let mut line = Vec::new();
-                for (c, cell) in cells.iter().enumerate() {
-                    let edge = if c == 0 { "│ " } else { " │ " };
-                    line.push((Span::styled(edge, border), None));
-                    let part = cell.lines.get(k).map_or(&[][..], Vec::as_slice);
-                    let extra = widths[c].saturating_sub(text_width(part));
-                    let (before, after) = padding(self.aligns[c], extra);
-                    line.push((Span::raw(" ".repeat(before)), None));
-                    line.extend(pieces[c].get(k).cloned().unwrap_or_default());
-                    line.push((Span::raw(" ".repeat(after)), None));
-                }
-                line.push((Span::styled(" │", border), None));
-                lines.push(line);
+                lines.push(self.grid_line(widths, cells, &pieces, k, border));
             }
-            if r + 1 < rows.len() {
-                if r == 0 {
-                    lines.push(rule("├", "─", "┼", "┤"));
-                } else if separate {
-                    lines.push(rule("├", "╌", "┼", "┤"));
-                }
+            // The header's rule under it, and dashed rules between other
+            // rows when they are set apart.
+            let fill = match r {
+                _ if r + 1 == rows.len() => None,
+                0 => Some("─"),
+                _ => separate.then_some("╌"),
+            };
+            if let Some(fill) = fill {
+                lines.push(rule("├", fill, "┼", "┤"));
+                rules += 1;
             }
         }
         lines.push(rule("└", "─", "┴", "┘"));
-        let rules =
-            2 + if rows.len() > 1 { 1 } else { 0 } + if separate { rows.len() - 2 } else { 0 };
         Grid { lines, hard, rules }
+    }
+
+    /// Line `k` of a grid row: each cell's piece of it, padded to its
+    /// column's width and alignment, between box rules.
+    fn grid_line(
+        &self,
+        widths: &[usize],
+        cells: &[Wrapped],
+        pieces: &[Lines],
+        k: usize,
+        border: Style,
+    ) -> Vec<Piece> {
+        let mut line = Vec::new();
+        for (c, cell) in cells.iter().enumerate() {
+            let edge = if c == 0 { "│ " } else { " │ " };
+            line.push((Span::styled(edge, border), None));
+            let part = cell.lines.get(k).map_or(&[][..], Vec::as_slice);
+            let extra = widths[c].saturating_sub(text_width(part));
+            let (before, after) = padding(self.aligns[c], extra);
+            line.push((Span::raw(" ".repeat(before)), None));
+            line.extend(pieces[c].get(k).cloned().unwrap_or_default());
+            line.push((Span::raw(" ".repeat(after)), None));
+        }
+        line.push((Span::styled(" │", border), None));
+        line
     }
 
     /// Each body row as a card between rules: a `Header: value` line for
@@ -249,13 +268,12 @@ impl Table {
             Span::styled("─".repeat(width), Style::new().fg(Color::DarkGray)),
             None,
         )];
-        let bold = Style::new().add_modifier(Modifier::BOLD);
         let heads = &self.rows[0];
         if self.rows.len() == 1 {
             let mut lines = vec![rule.clone()];
             for (head, ids) in heads.iter().zip(&self.run_links[0]) {
                 if !head.is_empty() {
-                    lines.extend(pieces(&wrap(head, width), ids, bold, styled));
+                    lines.extend(pieces(&wrap(head, width), ids, BOLD, styled));
                 }
             }
             lines.push(rule);
@@ -269,43 +287,58 @@ impl Table {
             .max()
             .unwrap_or(0)
             .min(width / 3);
-        let indent = label + 2;
         let mut lines = Vec::new();
         for (r, row) in self.rows.iter().enumerate().skip(1) {
             lines.push(rule.clone());
-            for (c, (head, cell)) in heads.iter().zip(row).enumerate() {
-                if cell.is_empty() {
-                    continue;
-                }
-                let head_ids = &self.run_links[0][c];
-                let value = wrap(cell, width.saturating_sub(indent));
-                let value = pieces(&value, &self.run_links[r][c], Style::default(), styled);
-                let mut values = value.into_iter();
-                let head_width = text_width(head) + 1;
-                if head_width <= label + 1 {
-                    let whole = Wrapped::whole(head);
-                    let mut line = pieces(&whole, head_ids, bold, styled).remove(0);
-                    let pad = " ".repeat(indent - head_width);
-                    line.push((Span::styled(format!(":{pad}"), bold), None));
-                    line.extend(values.next().unwrap_or_default());
-                    lines.push(line);
-                } else {
-                    // The header on lines of its own, the value under it.
-                    let head = wrap(head, width.saturating_sub(1));
-                    let mut heading = pieces(&head, head_ids, bold, styled);
-                    if let Some(last) = heading.last_mut() {
-                        last.push((Span::styled(":", bold), None));
-                    }
-                    lines.extend(heading);
-                }
-                for value in values {
-                    let mut line = vec![(Span::raw(" ".repeat(indent)), None)];
-                    line.extend(value);
-                    lines.push(line);
+            for (c, cell) in row.iter().enumerate() {
+                if !cell.is_empty() {
+                    lines.extend(self.card_field(r, c, width, label, styled));
                 }
             }
         }
         lines.push(rule);
+        lines
+    }
+
+    /// The `Header: value` lines of row `r`'s cell in column `c`, its value
+    /// wrapped under itself after `label` columns of header.
+    fn card_field(
+        &self,
+        r: usize,
+        c: usize,
+        width: usize,
+        label: usize,
+        styled: impl Fn(Style, &InlineStyle) -> Style,
+    ) -> Lines {
+        let head = &self.rows[0][c];
+        let head_ids = &self.run_links[0][c];
+        let indent = label + 2;
+        let value = wrap(&self.rows[r][c], width.saturating_sub(indent));
+        let mut values =
+            pieces(&value, &self.run_links[r][c], Style::default(), &styled).into_iter();
+        let mut lines = Vec::new();
+        let head_width = text_width(head) + 1;
+        if head_width <= label + 1 {
+            let whole = Wrapped::whole(head);
+            let mut line = pieces(&whole, head_ids, BOLD, &styled).remove(0);
+            let pad = " ".repeat(indent - head_width);
+            line.push((Span::styled(format!(":{pad}"), BOLD), None));
+            line.extend(values.next().unwrap_or_default());
+            lines.push(line);
+        } else {
+            // The header on lines of its own, the value under it.
+            let head = wrap(head, width.saturating_sub(1));
+            let mut heading = pieces(&head, head_ids, BOLD, &styled);
+            if let Some(last) = heading.last_mut() {
+                last.push((Span::styled(":", BOLD), None));
+            }
+            lines.extend(heading);
+        }
+        for value in values {
+            let mut line = vec![(Span::raw(" ".repeat(indent)), None)];
+            line.extend(value);
+            lines.push(line);
+        }
         lines
     }
 }
@@ -394,9 +427,26 @@ struct Wrapped {
 /// that keeps at least half the line, and at the width otherwise. Spaces
 /// at a break are dropped; spaces between words on a line are kept.
 fn wrap(cell: &Cell, width: usize) -> Wrapped {
-    let width = width.max(1);
-    // Each character with the index of the run it came from, as words,
-    // each with the spaces before it.
+    let (lines, hard) = fill(cell_words(cell), width.max(1));
+    let mut sources = Vec::with_capacity(lines.len());
+    let lines = lines
+        .into_iter()
+        .map(|line| {
+            let (runs, from) = runs(cell, line);
+            sources.push(from);
+            runs
+        })
+        .collect();
+    Wrapped {
+        lines,
+        sources,
+        hard,
+    }
+}
+
+/// The words of `cell`, each with the spaces before it, as characters
+/// with the index of the run each came from.
+fn cell_words(cell: &Cell) -> Vec<(Chars, Chars)> {
     let mut words: Vec<(Chars, Chars)> = Vec::new();
     let mut gap = Vec::new();
     let mut word = Vec::new();
@@ -416,8 +466,13 @@ fn wrap(cell: &Cell, width: usize) -> Wrapped {
     if !word.is_empty() {
         words.push((gap, word));
     }
+    words
+}
 
-    let mut lines: Vec<Vec<(char, usize)>> = vec![Vec::new()];
+/// `words` filled into lines no wider than `width`, and how many were
+/// broken mid-word.
+fn fill(words: Vec<(Chars, Chars)>, width: usize) -> (Vec<Chars>, usize) {
+    let mut lines: Vec<Chars> = vec![Vec::new()];
     let mut used = 0;
     let mut hard = 0;
     for (gap, word) in words {
@@ -443,31 +498,24 @@ fn wrap(cell: &Cell, width: usize) -> Wrapped {
         lines.last_mut().unwrap().extend_from_slice(rest);
         used = chars_width(rest);
     }
+    (lines, hard)
+}
 
-    let mut sources = Vec::with_capacity(lines.len());
-    let lines = lines
-        .into_iter()
-        .map(|line| {
-            let mut runs: Cell = Vec::new();
-            let mut from = Vec::new();
-            for (c, i) in line {
-                match runs.last_mut() {
-                    Some((s, _)) if from.last() == Some(&i) => s.push(c),
-                    _ => {
-                        runs.push((c.to_string(), cell[i].1.clone()));
-                        from.push(i);
-                    }
-                }
+/// A line of `cell`'s characters as runs in their styles, and the run in
+/// the cell each came from.
+fn runs(cell: &Cell, line: Chars) -> (Cell, Vec<usize>) {
+    let mut runs: Cell = Vec::new();
+    let mut from = Vec::new();
+    for (c, i) in line {
+        match runs.last_mut() {
+            Some((s, _)) if from.last() == Some(&i) => s.push(c),
+            _ => {
+                runs.push((c.to_string(), cell[i].1.clone()));
+                from.push(i);
             }
-            sources.push(from);
-            runs
-        })
-        .collect();
-    Wrapped {
-        lines,
-        sources,
-        hard,
+        }
     }
+    (runs, from)
 }
 
 impl Wrapped {
@@ -676,23 +724,7 @@ fn cell_links(rows: &[Vec<Cell>]) -> (Vec<Link>, RunLinks) {
         let mut row_links = Vec::new();
         for (c, cell) in row.iter().enumerate() {
             let hidden = r == 0 && unseen(c);
-            let mut ids: Vec<Option<usize>> = Vec::with_capacity(cell.len());
-            for (text, style) in cell {
-                let open = ids.last().copied().flatten();
-                let id = style.link.as_ref().map(|link| match open {
-                    Some(i) if found[i].0 == *link => i,
-                    _ => {
-                        found.push((link.clone(), false));
-                        found.len() - 1
-                    }
-                });
-                if let Some(i) = id {
-                    let drawn = |c: char| !breaks_at(c) && c.width().unwrap_or(0) > 0;
-                    found[i].1 |= !hidden && text.chars().any(drawn);
-                }
-                ids.push(id);
-            }
-            row_links.push(ids);
+            row_links.push(run_ids(cell, hidden, &mut found));
         }
         run_links.push(row_links);
     }
@@ -709,6 +741,29 @@ fn cell_links(rows: &[Vec<Cell>]) -> (Vec<Link>, RunLinks) {
         *id = id.and_then(|i| index[i]);
     }
     (links, run_links)
+}
+
+/// Each run's link in `found`, adding the links `cell` opens. A run with
+/// the same link as the run before it carries that link on. A link is
+/// marked as showing when a run of it that is not `hidden` draws something.
+fn run_ids(cell: &Cell, hidden: bool, found: &mut Vec<(Link, bool)>) -> Vec<Option<usize>> {
+    let drawn = |c: char| !breaks_at(c) && c.width().unwrap_or(0) > 0;
+    let mut ids: Vec<Option<usize>> = Vec::with_capacity(cell.len());
+    for (text, style) in cell {
+        let open = ids.last().copied().flatten();
+        let id = style.link.as_ref().map(|link| match open {
+            Some(i) if found[i].0 == *link => i,
+            _ => {
+                found.push((link.clone(), false));
+                found.len() - 1
+            }
+        });
+        if let Some(i) = id {
+            found[i].1 |= !hidden && text.chars().any(drawn);
+        }
+        ids.push(id);
+    }
+    ids
 }
 
 /// Go in or out of a span that nests. Returns whether still inside one.

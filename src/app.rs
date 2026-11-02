@@ -4,6 +4,8 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -1623,7 +1625,22 @@ pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 /// Run the browser until the reader quits, reloading the note when its file
 /// changes. Images are deleted from the terminal however it ends.
 pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<()> {
-    let result = run_browser(terminal, &mut browser, &mut Live);
+    let mut live = Live {
+        #[cfg(unix)]
+        keys: key_terminal(),
+    };
+    #[cfg(unix)]
+    if let Some(keys) = live.keys.as_ref().and_then(|keys| keys.try_clone().ok()) {
+        let _ = std::thread::Builder::new()
+            .name("hangup".into())
+            .spawn(move || end_on_hangup(&keys));
+    }
+    let result = run_browser(terminal, &mut browser, &mut live);
+    // On macOS reading or writing the gone terminal may fail first. The
+    // error is then not reported, as after SIGHUP.
+    if result.is_err() {
+        live.hung_up();
+    }
     let deleted = browser.view.images.delete_all(terminal.backend_mut());
     // After SIGHUP the terminal is gone, so failing to write to it is
     // expected and not worth reporting.
@@ -1961,6 +1978,77 @@ fn woken(read: libc::c_int, out: Option<libc::c_int>, wait: Option<Duration>) ->
     })
 }
 
+/// The terminal keys are read from, as crossterm picks it: stdin when it is
+/// one, else /dev/tty.
+#[cfg(unix)]
+fn key_terminal() -> Option<std::fs::File> {
+    use std::os::fd::AsFd;
+
+    // SAFETY: isatty only looks at the descriptor.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        let owned = io::stdin().as_fd().try_clone_to_owned().ok()?;
+        return Some(owned.into());
+    }
+    std::fs::File::open("/dev/tty").ok()
+}
+
+/// Whether the terminal on `fd` has gone: it reads as ready, yet has no
+/// bytes waiting, or cannot say how many (`waiting` then stays 0). Only
+/// right for a raw terminal that nothing else reads at the same time, as
+/// with the run loop's. A descriptor too high for select is never gone:
+/// `readable` asks poll for it, which on macOS takes any terminal as ready.
+#[cfg(unix)]
+fn gone(fd: libc::c_int) -> bool {
+    if fd >= libc::FD_SETSIZE as libc::c_int
+        || !kitty::readable(fd, Duration::ZERO).unwrap_or(false)
+    {
+        return false;
+    }
+    let mut waiting: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one int to waiting.
+    unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut waiting) };
+    waiting == 0
+}
+
+/// Wait until the terminal on `fd` hangs up and say whether it did. False
+/// at once where poll cannot watch a terminal, as on macOS. Key presses do
+/// not wake it, as it asks only for the hang-up.
+#[cfg(unix)]
+fn hung_up(fd: libc::c_int) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if ready < 0 && kitty::interrupted() {
+            continue;
+        }
+        return ready > 0 && pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0;
+    }
+}
+
+/// End smd as SIGHUP would once the terminal `keys` come from hangs up,
+/// whether SIGHUP reaches smd or not. crossterm reads the gone terminal
+/// again and again without returning, so the run loop cannot end itself;
+/// only the shared memory objects are removed, as nothing can be written.
+#[cfg(unix)]
+fn end_on_hangup(keys: &std::fs::File) {
+    if hung_up(keys.as_raw_fd()) {
+        hang_up();
+        remove_objects();
+        raise(stop_signal().unwrap_or(libc::SIGHUP));
+    }
+}
+
+/// Stop as if SIGHUP came, unless a stop signal already did.
+#[cfg(unix)]
+fn hang_up() {
+    let _ = STOP.compare_exchange(0, libc::SIGHUP, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// Where the run loop gets the terminal's events and the time, so a test
 /// can stand in for both.
 trait Input {
@@ -1972,7 +2060,28 @@ trait Input {
 }
 
 /// The real terminal and clock.
-struct Live;
+struct Live {
+    /// The terminal keys come from, to see whether it has gone.
+    #[cfg(unix)]
+    keys: Option<std::fs::File>,
+}
+
+impl Live {
+    /// Stop as if SIGHUP came when the terminal keys come from has gone,
+    /// and say whether it has.
+    fn hung_up(&self) -> bool {
+        #[cfg(unix)]
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|keys| gone(keys.as_raw_fd()))
+        {
+            hang_up();
+            return true;
+        }
+        false
+    }
+}
 
 impl Input for Live {
     fn now(&self) -> Instant {
@@ -1980,6 +2089,11 @@ impl Input for Live {
     }
 
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        // crossterm waits again at once when the terminal has gone, until
+        // the timeout on macOS, so it is not asked then.
+        if self.hung_up() {
+            return Ok(false);
+        }
         event::poll(timeout)
     }
 
@@ -2616,6 +2730,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_one_row_tall_shows_the_text_until_there_is_a_message() {
+        let mut v = new_view("one\n\ntwo\n");
+        let mut terminal = Terminal::new(TestBackend::new(8, 1)).unwrap();
+        terminal.draw(|f| v.draw(f)).unwrap();
+        assert_eq!(v.height, 1);
+        assert_eq!(rows(terminal.backend().buffer()), ["one     "]);
+        v.set_notice(Some("hi".into()));
+        terminal.draw(|f| v.draw(f)).unwrap();
+        assert_eq!(v.height, 0);
+        assert_eq!(rows(terminal.backend().buffer()), ["hi      "]);
+    }
+
+    #[test]
     fn notice_takes_the_bottom_row_and_clears() {
         let mut v = new_view("one\n\ntwo\n");
         let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
@@ -2631,6 +2758,9 @@ mod tests {
         terminal.draw(|f| v.draw(f)).unwrap();
         let buf = terminal.backend().buffer();
         assert_eq!(rows(buf), ["back    ", "        ", "        "]);
+        apply(&mut v, Change::Unreadable("denied".into()));
+        let said = "cannot read file: denied: a.md";
+        assert_eq!(v.notice.as_deref(), Some(said));
     }
 
     /// The text of each row of `buf`.
@@ -2775,6 +2905,50 @@ mod tests {
     }
 
     #[test]
+    fn only_a_plain_left_click_follows_a_link() {
+        let home = "go [[Plan]] now\n";
+        let (mut b, dir) = browser("click-not", &[("HOME.md", home), ("Plan.md", "# Plan\n")]);
+        let on_link = |kind, modifiers| MouseEvent {
+            kind,
+            column: 4,
+            row: 1,
+            modifiers,
+        };
+        let left = MouseEventKind::Down(MouseButton::Left);
+        b.mouse(on_link(left, KeyModifiers::SHIFT));
+        b.mouse(on_link(
+            MouseEventKind::Down(MouseButton::Right),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        // Nor while a search term is typed.
+        enter(&mut b, KeyCode::Char('/'));
+        b.mouse(on_link(left, KeyModifiers::NONE));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        enter(&mut b, KeyCode::Esc);
+        b.mouse(on_link(left, KeyModifiers::NONE));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        b.back();
+        // Past the Forward button, the toolbar does nothing.
+        let past = (BACK_BUTTON.width() + FORWARD_BUTTON.width()) as u16;
+        let toolbar = |column| MouseEvent {
+            kind: left,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        b.mouse(toolbar(past));
+        assert_eq!(b.path, dir.join("HOME.md"));
+        b.mouse(toolbar(past - 1));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        // Forward starts right after Back.
+        b.back();
+        b.mouse(toolbar(BACK_BUTTON.width() as u16));
+        assert_eq!(b.path, dir.join("Plan.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn max_width_keeps_the_text_narrow_at_the_left_or_in_the_middle() {
         let md = format!("{}\n\n```\n{}\n```\n", "word ".repeat(40), "x".repeat(50));
         for (align, left) in [(Align::Centre, 20), (Align::Left, 0)] {
@@ -2849,6 +3023,54 @@ mod tests {
         // A click on any of its cells finds the link.
         assert!(matches!(v.stop_at(21, 1), Some(Stop::Link(0))));
         assert!(v.stop_at(1, 1).is_none());
+        // Nor is there one below the view.
+        assert!(v.stop_at(21, v.height).is_none());
+    }
+
+    #[test]
+    fn a_selection_no_longer_in_the_layout_is_dropped() {
+        let mut v = new_view("[a](a.md) [b](b.md)\n");
+        v.resize(40, 5);
+        v.selected = Some(Stop::Link(1));
+        v.reload(parse("[a](a.md)\n"));
+        assert_eq!(v.selected, None);
+        v.selected = Some(Stop::Link(0));
+        v.relayout(None);
+        assert_eq!(v.selected, Some(Stop::Link(0)));
+        v.selected = Some(Stop::Link(1));
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+        v.selected = Some(Stop::Fold(0));
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+        v.reload(parse("> [!note]- Shut\n> body\n"));
+        v.selected = Some(Stop::Fold(0));
+        v.relayout(None);
+        assert_eq!(v.selected, Some(Stop::Fold(0)));
+        // A checkbox stays selected only while it can be ticked.
+        v.reload(parse("- [ ] buy\n"));
+        v.tasks = true;
+        v.selected = Some(Stop::Task(0));
+        v.relayout(None);
+        assert_eq!(v.selected, Some(Stop::Task(0)));
+        v.selected = Some(Stop::Task(1));
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+        v.selected = Some(Stop::Task(0));
+        v.tasks = false;
+        v.relayout(None);
+        assert_eq!(v.selected, None);
+    }
+
+    #[test]
+    fn a_click_finds_a_link_below_the_top_of_a_scrolled_view() {
+        let md = format!("{}[A](a.md)\n\n{}", paragraphs(1), paragraphs(5));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        // The link is on line 2, the second row of a view scrolled one down.
+        v.scroll = 1;
+        assert_eq!(v.stop_at(0, 1), Some(Stop::Link(0)));
+        assert_eq!(v.stop_at(0, 2), None);
     }
 
     #[test]
@@ -3084,6 +3306,55 @@ mod tests {
     }
 
     #[test]
+    fn back_in_the_same_note_reads_it_again_once_its_text_has_changed() {
+        let home = format!("[down](#later)\n\n{}## Later\n", paragraphs(8));
+        let (mut b, dir) = browser("back-same", &[("HOME.md", &home)]);
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.history.len(), 1);
+        // Reloaded, the note on screen is not the one left; then the file
+        // changes again before the watcher sees it.
+        std::fs::write(&b.path, "second\n").unwrap();
+        press_all(&mut b, "r");
+        std::fs::write(&b.path, "third\n").unwrap();
+        b.back();
+        assert_eq!(top(&b.view), "third");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_with_no_obsidian_folder_stays_the_vault_for_notes_inside_it() {
+        let files = [
+            ("HOME.md", "[two](sub/two.md) [far](../far.md)\n"),
+            ("sub/two.md", "two\n"),
+        ];
+        let (mut b, dir) = browser("vault-kept", &files);
+        std::fs::remove_dir_all(dir.join(".obsidian")).unwrap();
+        b.vault = Vault::for_file(&b.path);
+        enter(&mut b, KeyCode::Tab);
+        enter(&mut b, KeyCode::Enter);
+        assert_eq!(b.path, dir.join("sub/two.md"));
+        assert_eq!(b.vault.root, dir);
+        // A note outside it has a vault of its own. Its text is given, so
+        // no file need be there.
+        let far = dir.with_file_name(format!("smd-far-{}.md", std::process::id()));
+        b.show(far.clone(), "far\n", false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(b.vault.root, far.parent().unwrap());
+    }
+
+    #[test]
+    fn the_help_opens_from_a_note_read_from_stdin() {
+        let (b, dir) = browser("help-piped", &[("stdin", "piped\n")]);
+        let mut b = b.piped();
+        press_all(&mut b, "?");
+        assert!(b.toolbar().to_string().trim_end().ends_with(" help"));
+        b.back();
+        assert_eq!(top(&b.view), "piped");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_click_ticks_a_checkbox() {
         let (mut b, dir) = browser("tick-click", &[("HOME.md", "- [ ] one\n")]);
         let click = |column| MouseEvent {
@@ -3132,6 +3403,10 @@ mod tests {
         b.view.selected = None;
         enter(&mut b, KeyCode::Tab);
         assert_eq!(b.view.selected, Some(Stop::Task(0)));
+        // A checkbox that can no longer be ticked is no longer selected.
+        b.config.tasks = Tasks::ReadOnly;
+        b.check_tasks();
+        assert_eq!(b.view.selected, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3336,6 +3611,110 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_keeps_the_view_as_far_through_the_note() {
+        let md: String = (0..20).map(|n| format!("line {n} goes on\n\n")).collect();
+        let mut v = new_view(&md);
+        v.resize(10, 5);
+        // Each paragraph is two lines at 10 columns and one at 40, with a
+        // blank line between them.
+        assert_eq!(v.layout.lines.len(), 59);
+        v.scroll = 30;
+        v.resize(40, 5);
+        assert_eq!(v.layout.lines.len(), 39);
+        assert_eq!(v.scroll, 30 * 39 / 59);
+    }
+
+    #[test]
+    fn nothing_is_laid_out_before_the_view_has_a_width() {
+        let mut v = new_view("one\n");
+        v.show(parse("two\n"), PathBuf::new());
+        assert!(v.layout.lines.is_empty());
+        v.resize(20, 5);
+        assert_eq!(top(&v), "two");
+    }
+
+    #[test]
+    fn a_byte_keeps_its_place_before_an_edit_moves_after_it_and_is_lost_in_it() {
+        assert_eq!(moved(1, "abcd", "abXcd"), Some(1));
+        assert_eq!(moved(2, "abcd", "abXcd"), Some(3));
+        assert_eq!(moved(3, "abXcd", "abcd"), Some(2));
+        assert_eq!(moved(2, "abXcd", "abcd"), None);
+        // With the same bytes on both sides of the edit, the end of the
+        // shorter text is not counted twice: the last "a" went.
+        assert_eq!(moved(2, "aaa", "aa"), None);
+        assert_eq!(moved(3, "aaa", "aa"), Some(2));
+    }
+
+    #[test]
+    fn a_count_before_tab_goes_round_as_that_many_tabs_do() {
+        let md = "[a](a.md) [b](b.md) [c](c.md)\n";
+        for action in [Action::NextLink, Action::PrevLink] {
+            for times in 1..=8 {
+                let mut one_by_one = new_view(md);
+                one_by_one.resize(40, 5);
+                for _ in 0..times {
+                    one_by_one.act(action);
+                }
+                let mut counted = new_view(md);
+                counted.resize(40, 5);
+                counted.act_counted(action, Some(times));
+                assert_eq!(counted.selected, one_by_one.selected, "{action:?} {times}");
+            }
+        }
+    }
+
+    #[test]
+    fn images_are_read_from_the_notes_folder_or_the_current_one() {
+        assert_eq!(folder(Path::new("notes/a.md")), PathBuf::from("notes"));
+        assert_eq!(folder(Path::new("/a.md")), PathBuf::from("/"));
+        assert_eq!(folder(Path::new("a.md")), PathBuf::from("."));
+        assert_eq!(folder(Path::new("/")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn folding_a_block_selects_it_only_if_it_was_selected() {
+        let md = "> [!note]- One\n> body\n\n> [!note]- Two\n> body\n";
+        let mut v = new_view(md);
+        v.resize(20, 2);
+        let at = v.layout.folds[0].at;
+        v.fold(at);
+        assert_eq!(v.selected, None);
+        // Its title stays on the top row, though the title below it moves.
+        assert_eq!(v.scroll, 0);
+        v.selected = Some(Stop::Fold(1));
+        v.fold(at);
+        assert_eq!(v.selected, Some(Stop::Fold(1)));
+        v.selected = Some(Stop::Fold(0));
+        v.fold(at);
+        assert_eq!(v.selected, Some(Stop::Fold(0)));
+    }
+
+    #[test]
+    fn a_jump_outside_a_shut_fold_leaves_it_shut() {
+        let md = format!("> [!note]- Shut\n> body\n\n{}## Later\n", paragraphs(4));
+        let mut v = new_view(&md);
+        v.resize(20, 5);
+        assert!(v.jump_to_heading("later"));
+        assert!(!v.layout.folds[0].open);
+        assert!(v.flipped.is_empty());
+    }
+
+    #[test]
+    fn a_heading_is_found_in_a_quote_or_a_list_and_across_a_break() {
+        for (md, wanted, at) in [
+            ("> # Quoted\n", "quoted", "# Quoted"),
+            ("- one\n- # Listed\n", "listed", "# Listed"),
+            ("> - # Deeper\n", "deeper", "# Deeper"),
+            ("Two\\\nLines\n===\n\n# Two\n", "two lines", "Two"),
+        ] {
+            let doc = parse(md);
+            let found = heading_start(&doc.source, &doc.blocks, wanted);
+            assert_eq!(found, md.find(at), "{md:?}");
+            assert_eq!(heading_start(&doc.source, &doc.blocks, "missing"), None);
+        }
+    }
+
+    #[test]
     fn a_fold_stays_open_when_the_note_is_edited_above_it() {
         let note = "> [!note]- Shut\n> body\n";
         let mut v = new_view(note);
@@ -3439,6 +3818,40 @@ mod tests {
         assert!(b.view.search.matches.is_empty());
         assert!(b.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backspace_edits_the_term_and_enter_with_none_gives_the_search_up() {
+        let mut v = new_view("ab\n\nab cd\n");
+        v.resize(20, 5);
+        let typed = |v: &mut View, code| v.search_key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(
+            v.act(Action::NextMatch),
+            Some(Go::Say("no search: press / to search".into()))
+        );
+        v.act(Action::Search);
+        for c in "abx".chars() {
+            assert_eq!(typed(&mut v, KeyCode::Char(c)), None);
+        }
+        assert_eq!(v.prompt.as_deref(), Some("/abx  no matches"));
+        typed(&mut v, KeyCode::Backspace);
+        assert_eq!(v.prompt.as_deref(), Some("/ab  2 matches"));
+        // A key that is not for the prompt leaves it as it is, Alt+C too.
+        assert_eq!(typed(&mut v, KeyCode::Tab), None);
+        let alt_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
+        assert_eq!(v.search_key(alt_c), None);
+        assert_eq!(v.prompt.as_deref(), Some("/ab  2 matches"));
+        // With the term taken off, Enter goes nowhere and ends the search.
+        typed(&mut v, KeyCode::Backspace);
+        typed(&mut v, KeyCode::Backspace);
+        assert_eq!(typed(&mut v, KeyCode::Enter), None);
+        assert_eq!((v.prompt.clone(), v.search.active()), (None, false));
+        assert_eq!(v.search.current, None);
+        // Esc while typing gives the search up too.
+        v.act(Action::Search);
+        typed(&mut v, KeyCode::Char('a'));
+        assert_eq!(typed(&mut v, KeyCode::Esc), None);
+        assert_eq!((v.prompt.clone(), v.search.active()), (None, false));
     }
 
     #[test]
@@ -3604,6 +4017,11 @@ mod tests {
         press_all(&mut b, "2");
         assert_eq!(b.view.scroll, 1);
         assert_eq!(b.view.count, None);
+        // Nor is a digit with Ctrl or Alt held.
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            b.key(KeyEvent::new(KeyCode::Char('5'), modifiers));
+            assert_eq!(b.view.count, None);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3655,6 +4073,26 @@ mod tests {
         let row = rows(terminal.backend().buffer()).pop().unwrap();
         assert!(row.starts_with("no note found"), "{row:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_page_is_shown_beside_a_message_only_with_a_space_between() {
+        // " page 1/1 " takes 10 of the 20 columns.
+        let status = |notice: &str| {
+            let mut v = new_view("one\n");
+            v.set_notice(Some(notice.into()));
+            let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+            terminal.draw(|f| v.draw(f)).unwrap();
+            rows(terminal.backend().buffer()).pop().unwrap()
+        };
+        assert_eq!(status("123456789"), "123456789  page 1/1 ");
+        // In the bar's style, not as plain text.
+        let mut v = new_view("one\n");
+        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        terminal.draw(|f| v.draw(f)).unwrap();
+        let cell = &terminal.backend().buffer()[(0, 1)];
+        assert!(cell.modifier.contains(Modifier::REVERSED) || cell.bg != Color::Reset);
+        assert_eq!(status("1234567890"), "1234567890          ");
     }
 
     #[test]
@@ -4410,11 +4848,44 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_ends_at_its_terminator_or_a_key_it_cannot_hold() {
+        let (mut b, dir) = browser("reply-ends", &[("a.md", "a\n")]);
+        let key = |code, modifiers| KeyEvent::new(KeyCode::Char(code), modifiers);
+        let (none, alt, ctrl) = (KeyModifiers::NONE, KeyModifiers::ALT, KeyModifiers::CONTROL);
+        // A backslash without Alt is part of it, and so is what follows.
+        assert!(b.reply(key(']', alt)));
+        assert!(b.reply(key('\\', none)));
+        assert!(b.reply(key('j', none)));
+        // ST ends it and is part of it; the key after is the reader's.
+        assert!(b.reply(key('\\', alt)));
+        assert!(!b.reply(key('j', none)));
+        // So does BEL.
+        assert!(b.reply(key(']', alt)));
+        assert!(b.reply(key('g', ctrl)));
+        assert!(!b.reply(key('j', none)));
+        // Another key with Ctrl cannot be in it, so it ends it and is the
+        // reader's.
+        assert!(b.reply(key(']', alt)));
+        assert!(!b.reply(key('x', ctrl)));
+        assert!(!b.reply(key('j', none)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn keys_after_the_readers_own_alt_bracket_still_work() {
         let (mut b, dir) = browser("alt-bracket", &[("a.md", &paragraphs(20))]);
         b.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
         // Later than any part of a reply would come.
         std::thread::sleep(REPLY_GAP);
+        enter(&mut b, KeyCode::Char('j'));
+        assert_eq!(b.view.scroll, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bracket_without_alt_does_not_start_a_reply() {
+        let (mut b, dir) = browser("bracket", &[("a.md", &paragraphs(20))]);
+        enter(&mut b, KeyCode::Char(']'));
         enter(&mut b, KeyCode::Char('j'));
         assert_eq!(b.view.scroll, 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4521,6 +4992,76 @@ mod tests {
         assert!(ignored(libc::SIGUSR2));
         unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
         assert!(!ignored(libc::SIGUSR2));
+    }
+
+    /// A new pseudo-terminal: its master and its slave. Both are opened
+    /// close-on-exec, so a child another test starts meanwhile cannot hold
+    /// the master open, which would keep the pty up.
+    #[cfg(unix)]
+    fn pty() -> (std::fs::File, std::fs::File) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        /// ptsname writes the name to a buffer every caller shares.
+        static PTSNAME: Mutex<()> = Mutex::new(());
+        let open = |path: &std::ffi::OsStr| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(path)
+                .unwrap()
+        };
+        let master = open("/dev/ptmx".as_ref());
+        let fd = master.as_raw_fd();
+        let _shared = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: fd is a pty master; ptsname's name is copied before the
+        // lock is let go.
+        let name = unsafe {
+            assert_eq!(libc::grantpt(fd), 0, "{}", io::Error::last_os_error());
+            assert_eq!(libc::unlockpt(fd), 0, "{}", io::Error::last_os_error());
+            let name = libc::ptsname(fd);
+            assert!(!name.is_null(), "{}", io::Error::last_os_error());
+            std::ffi::CStr::from_ptr(name).to_owned()
+        };
+        let slave = open(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        (master, slave)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_is_gone_only_once_its_other_end_closes() {
+        let (mut master, slave) = pty();
+        assert!(!gone(slave.as_raw_fd()), "nothing waiting");
+        master.write_all(b"j\n").unwrap();
+        assert!(kitty::readable(slave.as_raw_fd(), Duration::from_secs(1)).unwrap());
+        assert!(!gone(slave.as_raw_fd()), "a key waiting");
+        drop(master);
+        assert!(gone(slave.as_raw_fd()));
+        assert!(
+            !gone(libc::FD_SETSIZE as libc::c_int),
+            "too high for select"
+        );
+    }
+
+    // poll cannot watch a terminal on macOS, so `hung_up` does not wait there.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_hang_up_is_waited_for_but_keys_do_not_end_the_wait() {
+        let (mut master, slave) = pty();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(hung_up(slave.as_raw_fd())));
+        master.write_all(b"j\n").unwrap();
+        let waited = rx.recv_timeout(Duration::from_millis(200));
+        assert!(waited.is_err(), "ended on a key: {waited:?}");
+        drop(master);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_descriptor_poll_cannot_watch_is_not_taken_for_a_hang_up() {
+        // Far above any open descriptor, so poll says it is not valid.
+        assert!(!hung_up(libc::c_int::MAX));
     }
 
     #[cfg(unix)]

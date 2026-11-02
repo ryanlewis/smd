@@ -2947,4 +2947,33 @@ graph TD
             assert!(rows < 100, "{unit:?}: {rows}");
         }
     }
+
+    #[test]
+    fn a_long_word_with_wide_and_joined_characters_breaks_between_them() {
+        let word = "abcdefghij日本語klmnop❤\u{fe0f}qrst👨\u{200d}👩\u{200d}👧uvwe\u{301}xyz";
+        assert_eq!(
+            plain(&format!("{word}\n"), 7),
+            [
+                "abcdefg",
+                "hij日本",
+                "語klmno",
+                "p❤\u{fe0f}qrst",
+                "👨\u{200d}👩\u{200d}👧uvwe\u{301}x",
+                "yz"
+            ]
+        );
+        assert_eq!(
+            plain(&format!("```\n{word}\n```\n"), 7),
+            [
+                "  abcde",
+                "  fghij",
+                "  日本",
+                "  語klm",
+                "  nop❤\u{fe0f}",
+                "  qrst",
+                "  👨\u{200d}👩\u{200d}👧uvw",
+                "  e\u{301}xyz"
+            ]
+        );
+    }
 }

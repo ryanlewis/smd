@@ -153,34 +153,8 @@ impl Vault {
     }
 
     fn index(&self) -> &HashMap<String, Vec<PathBuf>> {
-        self.index.get_or_init(|| {
-            let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
-            let mut dirs = vec![self.root.clone()];
-            let mut seen = 0;
-            while let Some(dir) = dirs.pop() {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let Ok(kind) = entry.file_type() else {
-                        continue;
-                    };
-                    if kind.is_dir() {
-                        if !SKIP.contains(&name.as_str()) {
-                            dirs.push(entry.path());
-                        }
-                    } else if seen < MAX_FILES {
-                        seen += 1;
-                        index
-                            .entry(name.to_lowercase())
-                            .or_default()
-                            .push(entry.path());
-                    }
-                }
-            }
-            index
-        })
+        self.index
+            .get_or_init(|| index_files(&self.root, MAX_FILES).0)
     }
 
     /// Point every wiki-embedded image at its file in the vault, so it loads
@@ -211,6 +185,40 @@ impl Vault {
             }
         }
     }
+}
+
+/// Every file under `root`, outside the folders in [`SKIP`], by its name in
+/// lower case: at most `max` of them. Gives the index and how many folders
+/// it read.
+fn index_files(root: &Path, max: usize) -> (HashMap<String, Vec<PathBuf>>, usize) {
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut dirs = vec![root.to_path_buf()];
+    let mut seen = 0;
+    let mut read = 0;
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        read += 1;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if !SKIP.contains(&name.as_str()) {
+                    dirs.push(entry.path());
+                }
+            } else if seen < max {
+                seen += 1;
+                index
+                    .entry(name.to_lowercase())
+                    .or_default()
+                    .push(entry.path());
+            }
+        }
+    }
+    (index, read)
 }
 
 /// The folder `file` is in.
@@ -797,13 +805,12 @@ mod tests {
 
     #[test]
     fn the_index_stops_at_max_files() {
-        let v = TempVault::empty("vault-max-files", &[]);
-        for i in 0..=MAX_FILES {
-            std::fs::File::create(v.path(&format!("n{i}.md"))).unwrap();
-        }
-        let vault = Vault::for_file(&v.path("n0.md"));
-        let indexed: usize = vault.index().values().map(Vec::len).sum();
-        assert_eq!(indexed, MAX_FILES);
+        let v = TempVault::empty("vault-max-files", &["a.md", "b.md", "c.md", "d.md"]);
+        let (index, read) = index_files(&v.0, 3);
+        let indexed: usize = index.values().map(Vec::len).sum();
+        assert_eq!(indexed, 3);
+        // Only the vault's own folder: `.obsidian` is passed over.
+        assert_eq!(read, 1);
     }
 
     #[test]

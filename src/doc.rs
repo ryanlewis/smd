@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use pulldown_cmark::{
-    CodeBlockKind, Event, LinkType, MetadataBlockKind, Options, Parser, Tag, TagEnd,
+    CodeBlockKind, CowStr, Event, LinkType, MetadataBlockKind, Options, Parser, Tag, TagEnd,
 };
 
 use crate::html::{self, Piece};
@@ -419,7 +419,7 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
     let body = &source[start..];
     let comments: Vec<Range<usize>> = comments(body, options);
     let patched = unspaced_definitions(body, options, &comments);
-    builder.colon = patched.as_ref().map(|(_, colon)| *colon);
+    let colon = patched.as_ref().map(|(_, colon)| *colon);
     builder.comments = comments
         .into_iter()
         .map(|c| c.start + start..c.end + start)
@@ -428,7 +428,13 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
     let events = || {
         Parser::new_ext(text, options)
             .into_offset_iter()
-            .map(move |(event, range)| (event, range.start + start..range.end + start))
+            .map(move |(event, range)| {
+                let event = match colon {
+                    Some(colon) => with_colons(event, colon),
+                    None => event,
+                };
+                (event, range.start + start..range.end + start)
+            })
     };
     if source.contains("[^") {
         let comments = &builder.comments;
@@ -741,21 +747,76 @@ fn fold(label: &str) -> String {
     out
 }
 
-/// The first control character not in `source`, to stand in for the `:` of a
-/// definition with no space or tab after it, such as `:tada:` on the line
-/// after a paragraph, or of one in a comment, so the line is read as more of
-/// the paragraph. It is one byte, as the colon is, so every range still
-/// points at the source, and the builder turns it back into a colon. It is
-/// not in the source, so none of the source's own characters become colons.
-/// Whitespace, which the parser reads as a space, is never used, nor is U+000B,
-/// which CommonMark counts as whitespace. `None` if the source has them all.
+/// `event` with each `colon`, a stand-in from [`colon_marker`], turned back
+/// into `:`, wherever it is: text, code, maths, HTML, and link targets.
+fn with_colons<'a>(event: Event<'a>, colon: char) -> Event<'a> {
+    let fix = |s: CowStr<'a>| -> CowStr<'a> {
+        if s.contains(colon) {
+            s.replace(colon, ":").into()
+        } else {
+            s
+        }
+    };
+    match event {
+        Event::Text(s) => Event::Text(fix(s)),
+        Event::Code(s) => Event::Code(fix(s)),
+        Event::InlineMath(s) => Event::InlineMath(fix(s)),
+        Event::DisplayMath(s) => Event::DisplayMath(fix(s)),
+        Event::Html(s) => Event::Html(fix(s)),
+        Event::InlineHtml(s) => Event::InlineHtml(fix(s)),
+        Event::FootnoteReference(s) => Event::FootnoteReference(fix(s)),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: fix(dest_url),
+            title: fix(title),
+            id: fix(id),
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: fix(dest_url),
+            title: fix(title),
+            id: fix(id),
+        }),
+        event => event,
+    }
+}
+
+/// A character not in `source`, to stand in for the `:` of a definition with
+/// no space or tab after it, such as `:tada:` on the line after a paragraph,
+/// or of one in a comment, so the line is read as more of the paragraph. It
+/// is one byte, as the colon is, so every range still points at the source,
+/// and [`with_colons`] turns it back into a colon. It is not in the source,
+/// so none of the source's own characters become colons.
+///
+/// First choice is punctuation with no meaning in markdown, which the parser
+/// reads as it reads a colon, so `_` or a quote after it works as after `:`.
+/// It is used only in a source with no `&`, as punctuation can be written as
+/// a character reference, such as `&#64;`. Then a control character: whitespace, which the parser reads as a space,
+/// is never used, nor is U+000B, which CommonMark counts as whitespace.
+/// `None` if the source has them all.
 fn colon_marker(source: &str) -> Option<char> {
-    let mut seen = [false; 32];
-    for byte in source.bytes().filter(|&b| b < 32) {
+    let mut seen = [false; 128];
+    for byte in source.bytes().filter(u8::is_ascii) {
         seen[usize::from(byte)] = true;
     }
-    ('\u{1}'..='\u{1f}')
-        .filter(|c| !c.is_ascii_whitespace() && *c != '\u{b}')
+    // Punctuation may also be written as a character reference.
+    let punctuation: &[char] = if seen[usize::from(b'&')] {
+        &[]
+    } else {
+        &['@', ';', '/', '?', ',', '%']
+    };
+    (punctuation.iter().copied())
+        .chain(('\u{1}'..='\u{1f}').filter(|c| !c.is_ascii_whitespace() && *c != '\u{b}'))
         .find(|&c| !seen[c as usize])
 }
 
@@ -828,9 +889,6 @@ struct Builder<'a> {
     hide: Option<&'static str>,
     /// How deep in an image being left out.
     hidden: u32,
-    /// The stand-in for a colon, if the parser reads a source with one in
-    /// it, from [`colon_marker`].
-    colon: Option<char>,
     /// For each image started and not yet ended, whether it was a wiki embed
     /// of a note, read as a link instead.
     embeds: Vec<bool>,
@@ -1044,7 +1102,6 @@ impl<'a> Builder<'a> {
             gap: false,
             hide: None,
             hidden: 0,
-            colon: None,
             embeds: Vec::new(),
             comments: Vec::new(),
             numbered: Vec::new(),
@@ -1252,14 +1309,8 @@ impl<'a> Builder<'a> {
         match &mut self.top().kind {
             FrameKind::Code { code, .. } => code.push_str(text),
             _ => {
-                let text = match typed_dashes(self.source, range.clone()) {
-                    Some(typed) => Cow::Borrowed(typed),
-                    None => match self.colon {
-                        Some(colon) => Cow::Owned(text.replace(colon, ":")),
-                        None => Cow::Borrowed(text),
-                    },
-                };
-                self.prose(&text, range);
+                let text = typed_dashes(self.source, range.clone()).unwrap_or(text);
+                self.prose(text, range);
             }
         }
     }
@@ -4024,22 +4075,73 @@ quote @45..55
     }
 
     #[test]
-    fn the_colon_marker_is_a_control_character_not_in_the_source() {
-        assert_eq!(colon_marker("a"), Some('\u{1}'));
+    fn the_colon_marker_is_a_character_not_in_the_source() {
+        // Punctuation first, then control characters.
+        assert_eq!(colon_marker("a"), Some('@'));
+        assert_eq!(colon_marker("a@b;c"), Some('/'));
+        // Not punctuation when the source has character references.
+        assert_eq!(colon_marker("a &amp; b"), Some('\u{1}'));
+        assert_eq!(colon_marker("@;/?,% \u{1}\u{2}"), Some('\u{3}'));
+        // Whitespace is never used.
         assert_eq!(
-            colon_marker("\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}"),
+            colon_marker("@;/?,%\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}"),
             Some('\u{e}')
         );
-        let all: String = ('\u{1}'..='\u{1f}')
-            .filter(|c| !c.is_ascii_whitespace())
+        let all: String = "@;/?,%"
+            .chars()
+            .chain(('\u{1}'..='\u{1f}').filter(|c| !c.is_ascii_whitespace()))
             .collect();
         assert_eq!(colon_marker(&all), None);
         // With no marker free, a definition colon with no space stays one.
         let out = outline(&format!("{all}\n:tada:\n"));
-        assert!(out.starts_with("definition @0..35\n"), "{out}");
+        assert!(out.starts_with("definition @0..41\n"), "{out}");
         assert!(
-            out.ends_with("paragraph @29..34\n      \"tada:\"\n"),
+            out.ends_with("paragraph @35..40\n      \"tada:\"\n"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn a_swapped_colon_is_punctuation_to_what_follows_it() {
+        assert_outline(
+            "para\n:_tada_ x\n",
+            "paragraph @0..15\n  \"para :\"\n  \"tada\" em\n  \" x\"\n",
+        );
+        assert_outline("para\n:\"x\" y\n", "paragraph @0..12\n  \"para :“x” y\"\n");
+        assert_outline("para\n:'x' y\n", "paragraph @0..12\n  \"para :‘x’ y\"\n");
+        assert_outline("p\n:^a^\n", "paragraph @0..7\n  \"p :\"\n  \"a\" sup\n");
+        // Code, maths and link targets get their colon back too.
+        assert_outline(
+            "para `a\n:b`\n",
+            "paragraph @0..12\n  \"para \"\n  \"a :b\" code\n",
+        );
+        assert_outline(
+            "para $a\n:b$\n",
+            "paragraph @0..12\n  \"para \"\n  \"$a\\n:b$\" math\n",
+        );
+        assert_outline(
+            "p [[a\n:x]]\n",
+            "paragraph @0..11\n  \"p \"\n  \"a\\n:x\" link=\"a\\n:x\" wiki=true\n",
+        );
+        assert_outline(
+            "p [x](\n:b)\n",
+            "paragraph @0..11\n  \"p \"\n  \"x\" link=\":b\" wiki=false\n",
+        );
+        // With all of that punctuation in the document, a control character
+        // stands in, and the document's own control characters stay.
+        assert_outline(
+            "@;/?,% \u{1}\n\npara\n:tada: `a\n:b`\n",
+            "paragraph @0..9\n  \"@;/?,% \\u{1}\"\nparagraph @10..29\n  \"para 🎉 \"\n  \"a :b\" code\n",
+        );
+        // So does punctuation written as a character reference.
+        assert_outline(
+            "a&#64;b &commat; [x](a&#47;b)\n\npara\n:tada:\n",
+            "paragraph @0..30\n  \"a@b @ \"\n  \"x\" link=\"a/b\" wiki=false\nparagraph @31..43\n  \"para 🎉\"\n",
+        );
+        // The document's own punctuation stays as it is.
+        assert_outline(
+            "a @ b; c\n\npara\n:tada:\n",
+            "paragraph @0..9\n  \"a @ b; c\"\nparagraph @10..22\n  \"para 🎉\"\n",
         );
     }
 

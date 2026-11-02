@@ -27,6 +27,12 @@ impl Match {
         let last = self.cells.last().map_or(self.row, |(row, _)| *row);
         self.row..last + 1
     }
+
+    /// Whether any of it is on the lines of `view`.
+    pub fn seen(&self, view: &Range<usize>) -> bool {
+        let rows = self.rows();
+        rows.start < view.end && view.start < rows.end
+    }
 }
 
 /// A search: the term, where it is drawn, and which match the reader is on.
@@ -47,19 +53,30 @@ impl Search {
     }
 
     /// Find the term again, as in a new layout. The matches may have moved
-    /// or changed in number, so none is current until the caller says which.
-    pub fn refresh(&mut self, layout: &Layout, doc: &Document) {
+    /// or changed in number, so the current one is the one `kept` names:
+    /// the nth of the matches on the given rows, those of the block it was
+    /// in, when it is still there.
+    pub fn refresh(
+        &mut self,
+        layout: &Layout,
+        doc: &Document,
+        kept: Option<(Range<usize>, usize)>,
+    ) {
         self.matches = find(&self.term, layout, doc);
-        self.current = None;
+        self.current = kept.and_then(|(rows, nth)| {
+            let i = self.matches.partition_point(|m| m.row < rows.start) + nth;
+            self.matches
+                .get(i)
+                .filter(|m| rows.contains(&m.row))
+                .map(|_| i)
+        });
     }
 
     /// The first match on or below row `top`, going round to the first of
     /// all when there is none. Gives its index and whether it went round.
     pub fn first_from(&self, top: usize) -> Option<(usize, bool)> {
-        match self.matches.iter().position(|m| m.row >= top) {
-            Some(i) => Some((i, false)),
-            None => (!self.matches.is_empty()).then_some((0, true)),
-        }
+        let row = |i: usize| self.matches[i].row;
+        step_round(self.matches.len(), None, true, top..top, row)
     }
 
     /// The next or previous match, going round at the ends. From a match
@@ -67,24 +84,25 @@ impl Search {
     /// the view or the last one above its bottom. Gives its index and whether
     /// it went round.
     pub fn step(&self, forward: bool, view: Range<usize>) -> Option<(usize, bool)> {
-        let len = self.matches.len();
-        if len == 0 {
-            return None;
-        }
+        let current = self.current.filter(|&i| self.matches[i].seen(&view));
         let row = |i: usize| self.matches[i].row;
-        let seen = |i: usize| {
-            let rows = self.matches[i].rows();
-            rows.start < view.end && view.start < rows.end
-        };
-        let current = self.current.filter(|&i| seen(i));
-        Some(match (current, forward) {
-            (Some(i), true) => ((i + 1) % len, i + 1 == len),
-            (Some(i), false) => ((i + len - 1) % len, i == 0),
-            (None, true) => return self.first_from(view.start),
-            (None, false) => match (0..len).rev().find(|&i| row(i) < view.end) {
-                Some(i) => (i, false),
-                None => (len - 1, true),
-            },
+        step_round(self.matches.len(), current, forward, view, row)
+    }
+
+    /// `step` taken `times` times: the first step is from the view, the rest
+    /// from that match. Gives its index and whether it went round.
+    pub fn step_by(
+        &self,
+        forward: bool,
+        view: Range<usize>,
+        times: usize,
+    ) -> Option<(usize, bool)> {
+        let (i, round) = self.step(forward, view)?;
+        let (len, more) = (self.matches.len(), times.saturating_sub(1));
+        Some(if forward {
+            ((i + more % len) % len, round || more >= len - i)
+        } else {
+            ((i + len - more % len) % len, round || more > i)
         })
     }
 
@@ -112,6 +130,35 @@ impl Search {
             n => format!("/{}  {n} matches", self.term),
         }
     }
+}
+
+/// The next or previous of `len` things in reading order, where `row` gives
+/// the line each starts on, going round at the ends. From `current`, which
+/// must be in `view`, it is the one after or before it. Without it, it is the
+/// first on or below the top of the view or the last above its bottom. Gives
+/// its index and whether it went round.
+pub fn step_round(
+    len: usize,
+    current: Option<usize>,
+    forward: bool,
+    view: Range<usize>,
+    row: impl Fn(usize) -> usize,
+) -> Option<(usize, bool)> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (current, forward) {
+        (Some(i), true) => ((i + 1) % len, i + 1 == len),
+        (Some(i), false) => ((i + len - 1) % len, i == 0),
+        (None, true) => match (0..len).find(|&i| row(i) >= view.start) {
+            Some(i) => (i, false),
+            None => (0, true),
+        },
+        (None, false) => match (0..len).rev().find(|&i| row(i) < view.end) {
+            Some(i) => (i, false),
+            None => (len - 1, true),
+        },
+    })
 }
 
 /// Whether to ignore case for `term`: smartcase, so a capital in the term
@@ -215,7 +262,8 @@ pub fn find(term: &str, layout: &Layout, doc: &Document) -> Vec<Match> {
 /// A character as drawn, compared as `fold` gives it.
 struct Drawn {
     c: char,
-    row: usize,
+    /// The line it is on, in 32 bits to keep it small.
+    row: u32,
     /// The columns it covers.
     cols: Range<u16>,
 }
@@ -228,7 +276,7 @@ fn in_sized(line: &SizedLine, ignore: bool) -> Vec<Drawn> {
         let end = cell.col + u16::from(line.scale) * u16::from(cell.width);
         out.extend(cell.text.chars().map(|c| Drawn {
             c: fold(c, ignore),
-            row: line.row,
+            row: line.row as u32,
             cols: cell.col..end,
         }));
     }
@@ -244,7 +292,7 @@ fn in_line(line: &Line, ignore: bool, row: usize) -> Vec<Drawn> {
             let end = col.saturating_add(c.width().unwrap_or(0) as u16);
             out.push(Drawn {
                 c: fold(c, ignore),
-                row,
+                row: row as u32,
                 cols: col..end,
             });
             col = end;
@@ -265,9 +313,10 @@ fn in_run(run: &[Drawn], wanted: &[char], out: &mut Vec<Match>) {
         }
         let mut cells: Vec<(usize, Range<u16>)> = Vec::new();
         for d in found {
+            let at = d.row as usize;
             match cells.last_mut() {
-                Some((row, cols)) if *row == d.row => cols.end = cols.end.max(d.cols.end),
-                _ => cells.push((d.row, d.cols.clone())),
+                Some((row, cols)) if *row == at => cols.end = cols.end.max(d.cols.end),
+                _ => cells.push((at, d.cols.clone())),
             }
         }
         // Such as the space put in at a break, which is not drawn.
@@ -353,6 +402,71 @@ mod tests {
         assert_eq!(find("go", &layout, &doc), vec![at(0, 2..6)]);
         assert_eq!(find("o 日", &layout, &doc), vec![at(0, 4..12)]);
         assert_eq!(find("g o", &layout, &doc), vec![]);
+    }
+
+    /// The matches of `term` when the block that starts at the first `from`
+    /// in `md` is drawn as an image, on the lines of its text and `more`.
+    fn found_in_image(md: &str, from: &str, more: usize, term: &str) -> Vec<Match> {
+        use crate::images::Placement;
+        let doc = doc::parse(md);
+        let mut layout = render(&doc, 40, &Images::new((8, 16)));
+        let at = md.find(from).unwrap();
+        let block = layout.blocks.iter_mut().rfind(|b| b.span.start == at);
+        let block = block.expect("a block starts there");
+        block.rows.end += more;
+        let rows = block.rows.len() as u16;
+        block.image = Some(Placement {
+            id: 1,
+            cols: 20,
+            rows,
+        });
+        find(term, &layout, &doc)
+    }
+
+    #[test]
+    fn a_heading_drawn_as_an_image_matches_by_its_text() {
+        let on = |row| {
+            vec![Match {
+                row,
+                cells: Vec::new(),
+            }]
+        };
+        for (md, row) in [
+            ("# Big Title\n\nafter\n", 0),
+            ("> # Big Title\n", 0),
+            ("> [!NOTE]\n> # Big Title\n", 1),
+            (
+                "<details open>\n<summary>more</summary>\n\n# Big Title\n\n</details>\n",
+                1,
+            ),
+            ("- # Big Title\n", 0),
+            ("Term\n: # Big Title\n", 1),
+        ] {
+            assert_eq!(found_in_image(md, "#", 0, "big title"), on(row), "{md:?}");
+            assert_eq!(found_in_image(md, "#", 0, "Big Title"), on(row), "{md:?}");
+            assert_eq!(found_in_image(md, "#", 0, "Big title"), [], "{md:?}");
+            assert_eq!(found_in_image(md, "#", 0, "big titles"), [], "{md:?}");
+        }
+        // Only its first line matches: the lines under it are the image.
+        let md = "# Big Title\n\nbig title\n";
+        assert_eq!(found_in_image(md, "#", 2, "big title"), on(0));
+        // The text is that of the heading drawn, not of another one.
+        let md = "# Other\n\n# Big Title\n";
+        assert_eq!(found_in_image(md, "# Big", 0, "big title"), on(2));
+        assert_eq!(found_in_image(md, "# Big", 0, "other"), [at(0, 0..5)]);
+        // A hard break in the heading reads as a space.
+        assert_eq!(
+            found_in_image("Big\\\nTitle\n===\n", "Big", 0, "big title"),
+            on(0)
+        );
+    }
+
+    #[test]
+    fn the_lines_of_a_picture_drawn_as_an_image_are_passed_over() {
+        let md = "![big title](big.png)\n\nbig title\n";
+        let text = found(md, "big title");
+        assert_eq!(text.len(), 2, "{text:?}");
+        assert_eq!(found_in_image(md, "!", 0, "big title"), text[1..]);
     }
 
     #[test]
@@ -455,6 +569,88 @@ mod tests {
             ..Search::default()
         };
         assert_eq!(search.first_from(1), Some((1, false)));
+    }
+
+    #[test]
+    fn a_counted_step_goes_on_from_the_first_and_round() {
+        let on = |row| Match {
+            row,
+            cells: vec![(row, 0..1)],
+        };
+        let mut search = Search {
+            term: "x".into(),
+            matches: vec![on(0), on(5), on(10)],
+            ..Search::default()
+        };
+        // The first step is from the view, the rest from that match.
+        let (top, bottom) = (0..3, 9..12);
+        assert_eq!(search.step_by(true, top.clone(), 1), Some((0, false)));
+        assert_eq!(search.step_by(true, top.clone(), 3), Some((2, false)));
+        assert_eq!(search.step_by(true, top.clone(), 4), Some((0, true)));
+        assert_eq!(search.step_by(true, top.clone(), 7), Some((0, true)));
+        assert_eq!(search.step_by(false, bottom.clone(), 1), Some((2, false)));
+        assert_eq!(search.step_by(false, bottom.clone(), 3), Some((0, false)));
+        assert_eq!(search.step_by(false, bottom, 4), Some((2, true)));
+        // From the current match while it is in view.
+        search.current = Some(1);
+        assert_eq!(search.step_by(true, 4..7, 2), Some((0, true)));
+        assert_eq!(search.step_by(false, 4..7, 2), Some((2, true)));
+        assert_eq!(Search::default().step_by(true, top, 2), None);
+    }
+
+    #[test]
+    fn a_match_is_seen_when_any_of_its_lines_is_in_view() {
+        let m = Match {
+            row: 2,
+            cells: vec![(2, 5..6), (3, 0..1)],
+        };
+        for (view, seen) in [(0..2, false), (1..3, true), (3..4, true), (4..6, false)] {
+            assert_eq!(m.seen(&view), seen, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn a_step_with_no_match_ahead_goes_round() {
+        let on = |row| Match {
+            row,
+            cells: vec![(row, 0..1)],
+        };
+        let search = Search {
+            term: "x".into(),
+            matches: vec![on(5), on(10)],
+            ..Search::default()
+        };
+        // Below the last match, forward goes round to the first.
+        assert_eq!(search.step(true, 11..14), Some((0, true)));
+        assert_eq!(search.first_from(11), Some((0, true)));
+        // Above the first match, back goes round to the last.
+        assert_eq!(search.step(false, 0..3), Some((1, true)));
+        // A match on the line under the view is not above its bottom.
+        assert_eq!(search.step(false, 2..5), Some((1, true)));
+    }
+
+    #[test]
+    fn the_prompt_counts_the_matches_so_far() {
+        let one = Match {
+            row: 0,
+            cells: vec![(0, 0..1)],
+        };
+        let mut search = Search::default();
+        assert!(!search.active());
+        assert_eq!(search.prompt(), "/");
+        search.term = "x".into();
+        assert!(search.active());
+        assert_eq!(search.prompt(), "/x  no matches");
+        search.matches = vec![one.clone()];
+        assert_eq!(search.prompt(), "/x  1 match");
+        search.matches = vec![one.clone(), one];
+        assert_eq!(search.prompt(), "/x  2 matches");
+    }
+
+    #[test]
+    fn a_drawn_character_is_small() {
+        // One is held for each character of a run of wrapped lines.
+        assert_eq!(std::mem::size_of::<Drawn>(), 12);
     }
 
     #[test]

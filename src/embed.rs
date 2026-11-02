@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::doc::{self, Block, BlockKind, Document, Inline, Link};
+use crate::doc::{self, Block, BlockKind, Callout, Document, Inline, Link};
 use crate::images;
 use crate::theme::Theme;
 use crate::vault::{self, Target, Vault};
@@ -111,9 +111,19 @@ impl Embedder<'_> {
                         *wiki = false;
                     }
                 }
-                BlockKind::Quote(inner)
-                | BlockKind::Callout { blocks: inner, .. }
-                | BlockKind::Details { blocks: inner, .. } => self.rebase(inner, from),
+                BlockKind::Quote(inner) => self.rebase(inner, from),
+                BlockKind::Callout {
+                    callout: Callout { title: head, .. },
+                    blocks: inner,
+                }
+                | BlockKind::Details {
+                    summary: head,
+                    blocks: inner,
+                    ..
+                } => {
+                    self.rebase_links(head, from);
+                    self.rebase(inner, from);
+                }
                 BlockKind::List { items, .. } => {
                     for item in items {
                         self.rebase(&mut item.blocks, from);
@@ -589,6 +599,60 @@ mod tests {
         };
         let c = format!("{}/c.md", absolute(v.0.join("sub")).display());
         assert_eq!(style.link.as_ref().unwrap().dest, c);
+    }
+
+    #[test]
+    fn links_in_an_embedded_callout_title_or_summary_are_rebased() {
+        let v = TempVault::new(
+            "titles",
+            &[
+                ("a.md", "![[sub/b]]"),
+                (
+                    "sub/b.md",
+                    "> [!note] See [[c]]\n> body\n\n<details><summary><a href=\"c.md\">c</a></summary>\n\nx\n\n</details>\n",
+                ),
+                ("sub/c.md", ""),
+            ],
+        );
+        let doc = v.open("a.md");
+        let BlockKind::Embed { doc: inner, .. } = &doc.blocks[0].kind else {
+            panic!("not embedded: {:?}", doc.blocks);
+        };
+        let dest = |content: &[Inline]| {
+            content.iter().find_map(|i| match i {
+                Inline::Text { style, .. } => style.link.as_ref().map(|l| l.dest.clone()),
+                Inline::Break => None,
+            })
+        };
+        let c = format!("{}/c.md", absolute(v.0.join("sub")).display());
+        let BlockKind::Callout { callout, .. } = &inner.blocks[0].kind else {
+            panic!("no callout: {:?}", inner.blocks);
+        };
+        assert_eq!(dest(&callout.title), Some(c.clone()));
+        let BlockKind::Details { summary, .. } = &inner.blocks[1].kind else {
+            panic!("no details: {:?}", inner.blocks);
+        };
+        assert_eq!(dest(summary), Some(c));
+    }
+
+    #[test]
+    fn a_shut_callout_or_details_in_an_embed_is_shown_open() {
+        let v = TempVault::new(
+            "shut",
+            &[
+                ("a.md", "![[b]]"),
+                (
+                    "b.md",
+                    "> [!faq]- Shut\n> inside\n\n<details><summary>Sum</summary>\n\nwithin\n\n</details>\n",
+                ),
+            ],
+        );
+        // Folding it would take a stop in the note shown, which has no
+        // source for it, so its body is shown.
+        let lines = v.lines("a.md");
+        assert!(lines.iter().any(|l| l.contains("inside")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("within")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains('▸')), "{lines:?}");
     }
 
     #[test]

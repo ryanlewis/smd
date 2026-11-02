@@ -276,7 +276,7 @@ mod tests {
     use crate::testdir::TempVault;
 
     impl TempVault {
-        /// The first note, `files[0]`, parsed with its embeds swapped in.
+        /// The note `file`, parsed with its embeds swapped in.
         fn open(&self, file: &str) -> Document {
             let path = self.0.join(file);
             let source = std::fs::read_to_string(&path).unwrap();

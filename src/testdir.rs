@@ -114,16 +114,17 @@ mod tests {
     #[test]
     fn a_leftover_that_cannot_be_emptied_is_not_used() {
         use std::os::unix::fs::PermissionsExt;
-        // Root can remove it anyway.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let first = TempDir::new("testdir-stuck");
         let stuck = first.join("stuck");
         std::fs::create_dir(&stuck).unwrap();
         std::fs::write(stuck.join("a.md"), "").unwrap();
         let mode = |mode| std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(mode));
         mode(0o555).unwrap();
+        // Root, or a file system that ignores the mode, can change it anyway.
+        if std::fs::write(stuck.join("b.md"), "").is_ok() {
+            mode(0o755).unwrap();
+            return;
+        }
         let path = first.to_path_buf();
         std::mem::forget(first);
         let err = std::panic::catch_unwind(|| TempDir::new("testdir-stuck")).unwrap_err();

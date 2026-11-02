@@ -1636,6 +1636,11 @@ pub fn run(terminal: &mut DefaultTerminal, mut browser: Browser) -> io::Result<(
             .spawn(move || end_on_hangup(&keys));
     }
     let result = run_browser(terminal, &mut browser, &mut live);
+    // On macOS reading or writing the gone terminal may fail first. The
+    // error is then not reported, as after SIGHUP.
+    if result.is_err() {
+        live.hung_up();
+    }
     let deleted = browser.view.images.delete_all(terminal.backend_mut());
     // After SIGHUP the terminal is gone, so failing to write to it is
     // expected and not worth reporting.
@@ -2089,18 +2094,11 @@ impl Input for Live {
         if self.hung_up() {
             return Ok(false);
         }
-        // On macOS crossterm may instead fail to read the gone terminal.
-        // The loop then ends by the error, which is not reported after a
-        // stop signal.
-        event::poll(timeout).inspect_err(|_| {
-            self.hung_up();
-        })
+        event::poll(timeout)
     }
 
     fn read(&mut self) -> io::Result<Event> {
-        event::read().inspect_err(|_| {
-            self.hung_up();
-        })
+        event::read()
     }
 
     fn stopped(&self) -> bool {

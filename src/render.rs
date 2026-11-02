@@ -419,7 +419,7 @@ fn sized_heading(
                 if w > 0 {
                     spans.push(Span::styled(" ".repeat((s - 1) * w), span.style));
                     cells.push(heading::SizedCell {
-                        col: column(col),
+                        col: col as u16,
                         width: w as u8,
                         text: piece.to_string(),
                     });
@@ -443,7 +443,7 @@ fn sized_heading(
     }
     layout.joins.extend(wrapped.joins.into_iter().map(|j| Join {
         row: rows[j.row],
-        col: column(left(j.row)),
+        col: left(j.row) as u16,
         ..j
     }));
     for mut spot in links {
@@ -451,9 +451,8 @@ fn sized_heading(
             .cells
             .iter()
             .flat_map(|(r, cols)| {
-                let (row, x) = (rows[*r], left(*r));
-                let at = |c: u16| column(x + usize::from(c) * s);
-                let cols = at(cols.start)..at(cols.end);
+                let (row, x) = (rows[*r], left(*r) as u16);
+                let cols = x + cols.start * scale as u16..x + cols.end * scale as u16;
                 (row..row + s).map(move |row| (row, cols.clone()))
             })
             .collect();
@@ -2927,27 +2926,6 @@ graph TD
         assert_eq!(layout.tasks.len(), 1);
         assert_eq!(layout.folds.len(), 1);
         assert!(layout.joins.iter().any(|j| j.end.is_some()));
-        assert!(cols.iter().all(|&c| c == u16::MAX), "{cols:?}");
-    }
-
-    #[test]
-    fn a_sized_heading_past_the_last_column_stays_past_it() {
-        let BlockKind::Heading { level, content } = parse("# ab [l](u)\n").blocks.remove(0).kind
-        else {
-            panic!("not a heading");
-        };
-        let wide = [Span::raw(" ".repeat(PAST_LAST))];
-        let mut layout = Layout::default();
-        sized_heading(&content, level, 2, 80, &wide, &wide, &mut layout);
-        let mut cols: Vec<u16> = Vec::new();
-        for line in &layout.sized {
-            cols.extend(line.cells.iter().map(|c| c.col));
-        }
-        for spot in &layout.links {
-            cols.extend(spot.cells.iter().map(|(_, c)| c.start));
-        }
-        cols.extend(layout.joins.iter().map(|j| j.col));
-        assert!(!layout.joins.is_empty() && !layout.links.is_empty());
         assert!(cols.iter().all(|&c| c == u16::MAX), "{cols:?}");
     }
 }

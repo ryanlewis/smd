@@ -19,7 +19,9 @@ cargo test --locked --all-targets
 
 The `screenshots` workflow opens each note in `tests/screenshots` with smd in [kitty](https://sw.kovidgoyal.net/kitty/), on a headless X server, and compares a screenshot of the window with the matching PNG in `tests/screenshots/reference`. This catches changes to how headings, diagrams, maths, images, code and tables are drawn that the unit tests cannot see. kitty and the DejaVu fonts are pinned in `tests/screenshots/install.sh`, and the window size, font and colours in `tests/screenshots/kitty.conf`.
 
-A screenshot fails when more than 100 pixels differ from its reference. The run then uploads a `screenshots` artifact holding, for each failed note, `<note>.png` (this run), `<note>.reference.png` and `<note>.diff.png`, which shows the changed pixels in red.
+A note can have two files next to it. `<note>.conf` holds kitty settings for that note only, such as `initial_window_width 50c` for a narrow window. Each line of `<note>.keys` is passed to `xdotool` once smd has settled, such as `key slash` or `type rain`, and the screenshot is taken once it settles again.
+
+A screenshot fails when more than 100 pixels differ from its reference, and the run fails when a reference has no screenshot, as when its note was removed. The run then uploads a `screenshots` artifact holding, for each failed note, `<note>.png` (this run), `<note>.reference.png` and `<note>.diff.png`, which shows the changed pixels in red.
 
 When a change is meant to alter the screenshots, make new references in CI, not on your own machine, whose fonts and graphics differ:
 

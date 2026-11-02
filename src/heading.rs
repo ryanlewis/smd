@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use serde::Deserialize;
 
 use crate::doc::Inline;
@@ -178,7 +179,7 @@ pub fn draw_sized(buf: &mut Buffer, area: Rect, scroll: usize, lines: &[SizedLin
         }
         let y = area.y + top as u16;
         if top + usize::from(s) > usize::from(area.height) {
-            text_size(buf, area.x, y, line);
+            text_size(buf, area, y, line);
             continue;
         }
         for cell in &line.cells {
@@ -347,25 +348,34 @@ fn fonts() -> Option<(&'static FontVec, &'static FontVec)> {
     Some((sans, mono))
 }
 
-/// Draw `line`'s characters on row `y` side by side at the size of text,
-/// where the layout spaced them out, in the styles they were given.
-fn text_size(buf: &mut Buffer, x: u16, y: u16, line: &SizedLine) {
+/// Draw `line`'s characters on row `y` of `area` side by side at the size
+/// of text, where the layout spaced them out, in the styles they were given.
+/// A character laid out past the right edge of `area` takes the style of the
+/// one before it.
+fn text_size(buf: &mut Buffer, area: Rect, y: u16, line: &SizedLine) {
     let (Some(first), Some(last)) = (line.cells.first(), line.cells.last()) else {
         return;
     };
+    let (x, right) = (area.x, area.right());
     let s = u16::from(line.scale);
-    let end = (last.col + s * u16::from(last.width)).min(buf.area.right() - x);
+    let end = (last.col + s * u16::from(last.width)).min(right - x);
+    let mut style = Style::default();
     let chars: Vec<_> = line
         .cells
         .iter()
-        .map(|c| (c, buf[(x + c.col, y)].style()))
+        .map(|c| {
+            if x + c.col < right {
+                style = buf[(x + c.col, y)].style();
+            }
+            (c, style)
+        })
         .collect();
     for col in first.col..end {
         buf[(x + col, y)].reset();
     }
     let mut col = x + first.col;
     for (cell, style) in chars {
-        if col + u16::from(cell.width) > buf.area.right() {
+        if col + u16::from(cell.width) > right {
             break;
         }
         buf[(col, y)].set_symbol(&cell.text).set_style(style);
@@ -1190,6 +1200,11 @@ mod tests {
         assert_eq!(cut(&[(3, 1, "A")]), row(&[(2, "XXXA"), (8, "XXXX")]));
         // A wide character that just fits on the last two columns.
         assert_eq!(cut(&[(8, 2, "日")]), row(&[(2, "XXXXXXXX"), (10, "日")]));
+        // A character laid out from the edge itself, after one that fits.
+        assert_eq!(
+            cut(&[(8, 2, "日"), (10, 1, "B")]),
+            row(&[(2, "XXXXXXXX"), (10, "日")])
+        );
         // One that would hang over the edge is left out.
         assert_eq!(cut(&[(9, 2, "日")]), row(&[(2, "XXXXXXXXX")]));
     }

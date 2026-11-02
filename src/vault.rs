@@ -306,25 +306,7 @@ pub fn heading_matches(text: &str, wanted: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// A vault in a temporary folder, with `files` written empty.
-    struct TempVault(crate::testdir::TempDir);
-
-    impl TempVault {
-        fn new(name: &str, files: &[&str]) -> TempVault {
-            let root = crate::testdir::TempDir::new(&format!("vault-{name}"));
-            std::fs::create_dir_all(root.join(".obsidian")).unwrap();
-            for file in files {
-                let path = root.join(file);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, "").unwrap();
-            }
-            TempVault(root)
-        }
-
-        fn path(&self, file: &str) -> PathBuf {
-            self.0.join(file)
-        }
-    }
+    use crate::testdir::TempVault;
 
     fn wiki(dest: &str) -> Link {
         Link {
@@ -342,7 +324,7 @@ mod tests {
 
     #[test]
     fn the_vault_is_the_folder_with_obsidian_in_it() {
-        let v = TempVault::new("root", &["HOME.md", "a/b/deep.md"]);
+        let v = TempVault::empty("vault-root", &["HOME.md", "a/b/deep.md"]);
         let vault = Vault::for_file(&v.path("a/b/deep.md"));
         assert_eq!(vault.root, v.0.path());
         assert!(vault.holds(&v.path("HOME.md")));
@@ -351,8 +333,8 @@ mod tests {
 
     #[test]
     fn wiki_links_find_notes_by_name_or_path() {
-        let v = TempVault::new(
-            "names",
+        let v = TempVault::empty(
+            "vault-names",
             &[
                 "HOME.md",
                 "work/AFC/README.md",
@@ -389,7 +371,7 @@ mod tests {
 
     #[test]
     fn headings_and_block_references() {
-        let v = TempVault::new("headings", &["HOME.md", "Plan.md"]);
+        let v = TempVault::empty("vault-headings", &["HOME.md", "Plan.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
         assert_eq!(
@@ -421,7 +403,10 @@ mod tests {
 
     #[test]
     fn markdown_links_are_relative_and_web_links_go_out() {
-        let v = TempVault::new("relative", &["a/HOME.md", "a/My Note.md", "a/doc.pdf"]);
+        let v = TempVault::empty(
+            "vault-relative",
+            &["a/HOME.md", "a/My Note.md", "a/doc.pdf"],
+        );
         let vault = Vault::for_file(&v.path("a/HOME.md"));
         let home = v.path("a/HOME.md");
         assert_eq!(
@@ -444,7 +429,7 @@ mod tests {
 
     #[test]
     fn embedded_images_are_found_in_the_vault() {
-        let v = TempVault::new("embeds", &["HOME.md", "attachments/pic.png"]);
+        let v = TempVault::empty("vault-embeds", &["HOME.md", "attachments/pic.png"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let mut doc = crate::doc::parse("![[pic.png|300]]\n\n- ![[gone.png]]\n");
         vault.resolve_embeds(&mut doc.blocks, &v.path("HOME.md"));
@@ -468,7 +453,7 @@ mod tests {
 
     #[test]
     fn a_wiki_link_with_a_heading_and_a_block_reference() {
-        let v = TempVault::new("wikihb", &["HOME.md", "Plan.md"]);
+        let v = TempVault::empty("vault-wikihb", &["HOME.md", "Plan.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
         // A block reference after a heading goes to the heading.
@@ -509,7 +494,7 @@ mod tests {
 
     #[test]
     fn block_references_and_spaces_are_found_after_decoding() {
-        let v = TempVault::new("decodeorder", &["HOME.md", "Plan.md"]);
+        let v = TempVault::empty("vault-decodeorder", &["HOME.md", "Plan.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
         let plan = v.path("Plan.md");
@@ -540,7 +525,7 @@ mod tests {
 
     #[test]
     fn a_markdown_link_to_a_heading_in_the_open_note() {
-        let v = TempVault::new("mdheading", &["HOME.md"]);
+        let v = TempVault::empty("vault-mdheading", &["HOME.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
         assert_eq!(
@@ -553,7 +538,7 @@ mod tests {
 
     #[test]
     fn web_and_mail_links_are_not_looked_up() {
-        let v = TempVault::new("web", &["HOME.md"]);
+        let v = TempVault::empty("vault-web", &["HOME.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
         for dest in [
@@ -589,8 +574,8 @@ mod tests {
 
     #[test]
     fn links_to_files_that_are_not_notes() {
-        let v = TempVault::new(
-            "other",
+        let v = TempVault::empty(
+            "vault-other",
             &[
                 "HOME.md",
                 "docs/spec.pdf",
@@ -634,7 +619,7 @@ mod tests {
 
     #[test]
     fn missing_notes_report_what_was_looked_for() {
-        let v = TempVault::new("missing", &["HOME.md", "docs/a.md"]);
+        let v = TempVault::empty("vault-missing", &["HOME.md", "docs/a.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let home = v.path("HOME.md");
         assert_eq!(
@@ -674,8 +659,8 @@ mod tests {
 
     #[test]
     fn markdown_links_go_up_folders_and_decode_escapes() {
-        let v = TempVault::new(
-            "up",
+        let v = TempVault::empty(
+            "vault-up",
             &["a/b/HOME.md", "a/Top.md", "a/b/caf\u{e9}.md", "a/b/100%.md"],
         );
         let vault = Vault::for_file(&v.path("a/b/HOME.md"));
@@ -708,8 +693,8 @@ mod tests {
 
     #[test]
     fn a_name_shared_by_notes_goes_to_the_nearest_folder() {
-        let v = TempVault::new(
-            "clash",
+        let v = TempVault::empty(
+            "vault-clash",
             &[
                 "Idea.md",
                 "work/Idea.md",
@@ -751,8 +736,8 @@ mod tests {
 
     #[test]
     fn a_path_is_tried_from_the_vault_top_then_the_linking_folder() {
-        let v = TempVault::new(
-            "paths",
+        let v = TempVault::empty(
+            "vault-paths",
             &["HOME.md", "sub/HOME2.md", "sub/x/Page.md", "x/Page.md"],
         );
         let vault = Vault::for_file(&v.path("HOME.md"));
@@ -775,7 +760,7 @@ mod tests {
 
     #[test]
     fn a_path_relative_to_the_linking_folder_is_found_when_not_at_the_top() {
-        let v = TempVault::new("rel", &["HOME.md", "sub/x/Page.md"]);
+        let v = TempVault::empty("vault-rel", &["HOME.md", "sub/x/Page.md"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         assert_eq!(
             vault.follow(&wiki("x/Page"), &v.path("sub/y.md")),
@@ -785,8 +770,8 @@ mod tests {
 
     #[test]
     fn skipped_folders_are_not_indexed() {
-        let v = TempVault::new(
-            "skip",
+        let v = TempVault::empty(
+            "vault-skip",
             &[
                 "HOME.md",
                 ".trash/Gone.md",
@@ -875,7 +860,7 @@ mod tests {
 
     #[test]
     fn embeds_inside_quotes_and_lists_are_resolved() {
-        let v = TempVault::new("nested", &["HOME.md", "pics/a.png", "pics/b.png"]);
+        let v = TempVault::empty("vault-nested", &["HOME.md", "pics/a.png", "pics/b.png"]);
         let vault = Vault::for_file(&v.path("HOME.md"));
         let mut doc = crate::doc::parse("> ![[a.png]]\n\n- ![[b.png]]\n\n![](web.png)\n");
         vault.resolve_embeds(&mut doc.blocks, &v.path("HOME.md"));

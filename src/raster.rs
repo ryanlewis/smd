@@ -756,7 +756,6 @@ pub(crate) mod tests {
         assert_eq!(map(full.to_str().unwrap()), Some(&b"font bytes"[..]));
         assert_eq!(map(empty.to_str().unwrap()), None);
         assert_eq!(map(dir.join("missing").to_str().unwrap()), None);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The characters the test emoji font maps, to glyphs 1 and 2. Any

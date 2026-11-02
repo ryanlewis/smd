@@ -273,22 +273,9 @@ mod tests {
     use crate::images::Images;
     use crate::render::render;
 
-    /// A vault in a temporary folder holding `files`, each a name and its
-    /// text.
-    struct TempVault(crate::testdir::TempDir);
+    use crate::testdir::TempVault;
 
     impl TempVault {
-        fn new(name: &str, files: &[(&str, &str)]) -> TempVault {
-            let root = crate::testdir::TempDir::new(&format!("embed-{name}"));
-            std::fs::create_dir_all(root.join(".obsidian")).unwrap();
-            for (file, text) in files {
-                let path = root.join(file);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, text).unwrap();
-            }
-            TempVault(root)
-        }
-
         /// The first note, `files[0]`, parsed with its embeds swapped in.
         fn open(&self, file: &str) -> Document {
             let path = self.0.join(file);
@@ -313,7 +300,7 @@ mod tests {
     #[test]
     fn a_lone_embed_shows_the_note_in_a_frame_without_its_frontmatter() {
         let v = TempVault::new(
-            "lone",
+            "embed-lone",
             &[
                 ("a.md", "Before\n\n![[b]]\n\nAfter"),
                 ("b.md", "---\ntags: [x]\n---\n# B\n\nBody"),
@@ -330,7 +317,7 @@ mod tests {
     #[test]
     fn a_heading_embed_shows_only_its_section() {
         let v = TempVault::new(
-            "section",
+            "embed-section",
             &[
                 ("a.md", "![[b#Two]]"),
                 (
@@ -355,7 +342,7 @@ mod tests {
     #[test]
     fn what_cannot_be_embedded_stays_a_link() {
         let v = TempVault::new(
-            "links",
+            "embed-links",
             &[
                 (
                     "a.md",
@@ -373,7 +360,10 @@ mod tests {
 
     #[test]
     fn a_block_embed_shows_the_whole_note() {
-        let v = TempVault::new("block", &[("a.md", "![[b#^id]]"), ("b.md", "x\n\ny ^id")]);
+        let v = TempVault::new(
+            "embed-block",
+            &[("a.md", "![[b#^id]]"), ("b.md", "x\n\ny ^id")],
+        );
         let doc = v.open("a.md");
         let BlockKind::Embed { doc, .. } = &doc.blocks[0].kind else {
             panic!("not embedded");
@@ -391,7 +381,7 @@ mod tests {
 
     #[test]
     fn a_loop_of_embeds_stops_at_the_note_it_started_from() {
-        let v = TempVault::new("loop", &[("a.md", "![[b]]"), ("b.md", "![[a]]")]);
+        let v = TempVault::new("embed-loop", &[("a.md", "![[b]]"), ("b.md", "![[a]]")]);
         assert_eq!(depth(&v.open("a.md").blocks), 1);
     }
 
@@ -401,14 +391,14 @@ mod tests {
             .map(|i| (format!("n{i}.md"), format!("![[n{}]]", i + 1)))
             .collect();
         let files: Vec<(&str, &str)> = files.iter().map(|(a, b)| (&a[..], &b[..])).collect();
-        let v = TempVault::new("deep", &files);
+        let v = TempVault::new("embed-deep", &files);
         assert_eq!(depth(&v.open("n0.md").blocks), MAX_DEPTH);
     }
 
     #[test]
     fn links_in_an_embed_lead_where_they_do_from_its_note() {
         let v = TempVault::new(
-            "rebase",
+            "embed-rebase",
             &[
                 ("a.md", "![[sub/b]]"),
                 (
@@ -453,7 +443,7 @@ mod tests {
     #[test]
     fn a_task_in_an_embed_cannot_be_ticked() {
         let v = TempVault::new(
-            "task",
+            "embed-task",
             &[("a.md", "- [ ] mine\n\n![[b]]"), ("b.md", "- [ ] theirs")],
         );
         let doc = v.open("a.md");
@@ -464,7 +454,10 @@ mod tests {
 
     #[test]
     fn the_title_links_to_the_note_and_blocks_inside_take_the_embeds_span() {
-        let v = TempVault::new("title", &[("a.md", "x\n\n![[b]]"), ("b.md", "one\n\ntwo")]);
+        let v = TempVault::new(
+            "embed-title",
+            &[("a.md", "x\n\n![[b]]"), ("b.md", "one\n\ntwo")],
+        );
         let doc = v.open("a.md");
         let layout = render(&doc, 40, &Images::new((8, 16)));
         assert_eq!(layout.links[0].link.dest, "b");
@@ -476,7 +469,7 @@ mod tests {
     #[test]
     fn an_embed_in_a_list_or_quote_is_framed_there_under_its_alias() {
         let v = TempVault::new(
-            "nested",
+            "embed-nested",
             &[("a.md", "- ![[b|Bee]]\n\n> ![[b]]"), ("b.md", "hi")],
         );
         assert_eq!(
@@ -488,7 +481,7 @@ mod tests {
     #[test]
     fn an_embed_in_a_callout_is_framed_there_and_its_links_rebased() {
         let v = TempVault::new(
-            "callout",
+            "embed-callout",
             &[
                 ("a.md", "> [!note] Seen\n> ![[sub/b]]"),
                 ("sub/b.md", "[[c]]\n\n> [!tip]- Folded\n> [[c]]"),
@@ -523,7 +516,7 @@ mod tests {
     #[test]
     fn an_embed_in_a_definition_is_framed_there_and_its_links_rebased() {
         let v = TempVault::new(
-            "definition",
+            "embed-definition",
             &[
                 (
                     "a.md",
@@ -563,7 +556,7 @@ mod tests {
     #[test]
     fn an_embed_in_details_is_framed_there_and_its_links_rebased() {
         let v = TempVault::new(
-            "details",
+            "embed-details",
             &[
                 (
                     "a.md",
@@ -596,7 +589,7 @@ mod tests {
     #[test]
     fn links_in_an_embedded_callout_title_or_summary_are_rebased() {
         let v = TempVault::new(
-            "titles",
+            "embed-titles",
             &[
                 ("a.md", "![[sub/b]]"),
                 (
@@ -630,7 +623,7 @@ mod tests {
     #[test]
     fn a_shut_callout_or_details_in_an_embed_is_shown_open() {
         let v = TempVault::new(
-            "shut",
+            "embed-shut",
             &[
                 ("a.md", "![[b]]"),
                 (
@@ -650,7 +643,7 @@ mod tests {
     #[test]
     fn an_embed_in_a_comment_stays_hidden() {
         let v = TempVault::new(
-            "comment",
+            "embed-comment",
             &[
                 ("a.md", "x\n\n%%![[b]]%%\n\n%%\n![[b]]\n%%"),
                 ("b.md", "secret"),
@@ -688,7 +681,7 @@ mod tests {
     #[test]
     fn a_wiki_image_in_an_embed_is_found_from_a_vault_named_relatively() {
         let v = TempVault::new(
-            "relimage",
+            "embed-relimage",
             &[
                 ("a.md", "![[sub/b]]"),
                 ("sub/b.md", "![[p.png]]"),
@@ -714,7 +707,7 @@ mod tests {
     #[test]
     fn a_link_from_an_embed_back_to_the_note_shown_stays_in_it() {
         let v = TempVault::new(
-            "back",
+            "embed-back",
             &[
                 ("a.md", "![[sub/b]]\n\n# Top"),
                 ("sub/b.md", "[[a#Top]] [[a]]"),
@@ -740,7 +733,7 @@ mod tests {
     #[test]
     fn a_link_missing_from_an_embed_does_not_find_a_file_beside_the_note_shown() {
         let v = TempVault::new(
-            "missing",
+            "embed-missing",
             &[
                 ("a.md", "![[sub/b]]"),
                 ("sub/b.md", "[t](todo.md)"),

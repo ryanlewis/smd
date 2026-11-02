@@ -401,9 +401,23 @@ fn sized_heading(
     let s = usize::from(scale);
     let prefix = spans_width(first).max(spans_width(rest));
     let avail = (width.saturating_sub(prefix) / s).max(1);
-    let mut wrapped = Layout::default();
     let style = heading_style(level);
-    let links = wrap(content, style, avail, &[], &[], &mut wrapped);
+    // unicode-width can count a sequence as narrower than the pieces it is
+    // drawn in, as with a skin tone joined to flag letters, so wrap a column
+    // narrower at a time until the pieces of every line fit. A piece wider
+    // than a line cannot fit however it is wrapped, so its width is allowed.
+    let mut at = avail;
+    let mut fit = None;
+    let (wrapped, links) = loop {
+        let mut wrapped = Layout::default();
+        let links = wrap(content, style, at, &[], &[], &mut wrapped);
+        let fit = *fit.get_or_insert_with(|| avail.max(widest_piece(&wrapped.lines)));
+        let widest = wrapped.lines.iter().map(sized_width).max().unwrap_or(0);
+        if widest <= fit || at == 1 {
+            break (wrapped, links);
+        }
+        at -= 1;
+    };
     let left = |i: usize| spans_width(if i == 0 { first } else { rest });
     let mut rows = Vec::new();
     for (i, line) in wrapped.lines.into_iter().enumerate() {
@@ -458,6 +472,20 @@ fn sized_heading(
             .collect();
         layout.links.push(spot);
     }
+}
+
+/// How many columns `line` takes at the size of text when its characters
+/// are laid out one by one, as [`sized_heading`] does.
+fn sized_width(line: &Line) -> usize {
+    let pieces = line.spans.iter().flat_map(|s| sized_pieces(&s.content));
+    pieces.map(|p| p.width()).sum()
+}
+
+/// The most columns any one piece of `lines` takes at the size of text.
+fn widest_piece(lines: &[Line]) -> usize {
+    let spans = lines.iter().flat_map(|l| &l.spans);
+    let pieces = spans.flat_map(|s| sized_pieces(&s.content));
+    pieces.map(|p| p.width()).max().unwrap_or(0)
 }
 
 /// `s` in the pieces each drawn as one larger character: [`clusters`], with
@@ -1423,6 +1451,7 @@ fn column(x: usize) -> u16 {
 mod tests {
     use super::*;
     use crate::doc::parse;
+    use ratatui::{buffer::Buffer, layout::Rect};
 
     fn no_images() -> Images {
         Images::new((8, 16))
@@ -1453,37 +1482,153 @@ mod tests {
     }
 
     /// A level 1 heading at twice the size in 42 columns, two of them a
-    /// quote bar. unicode-width counts a skin tone joined to flag letters as
-    /// two columns, but its pieces take four, so its last cell is laid out
-    /// past the edge.
-    fn too_wide() -> Layout {
-        let layout = sized("# aaaaaaaaaaaaaaaaaa🏻\u{200D}🇫🇧\n", 2, 42);
-        assert!(usize::from(layout.sized[0].cells.last().unwrap().col) >= 42);
-        layout
+    /// quote bar, so 20 columns of text. unicode-width counts a skin tone
+    /// joined to flag letters as two columns, but its pieces take four.
+    fn odd_sequence() -> Layout {
+        sized("# aaaaaaaaaaaaaaaaaa🏻\u{200D}🇫🇧\n", 2, 42)
     }
 
     #[test]
-    fn a_sized_heading_laid_out_past_the_edge_is_cut_at_the_bottom_without_a_panic() {
-        use ratatui::{buffer::Buffer, layout::Rect};
-        // Cut at the bottom of the view, it is drawn at the size of text.
-        let area = Rect::new(0, 0, 42, 1);
-        let mut buf = Buffer::empty(area);
-        heading::draw_sized(&mut buf, area, 0, &too_wide().sized);
-        assert_eq!(buf[(19, 0)].symbol(), "a🏻\u{200D}🇫");
-        assert_eq!(buf[(23, 0)].symbol(), "🇧");
+    fn a_sized_heading_measured_wider_than_unicode_width_says_still_fits() {
+        let layout = odd_sequence();
+        for line in &layout.sized {
+            for c in &line.cells {
+                let end = usize::from(c.col) + 2 * usize::from(c.width);
+                assert!(end <= 42, "{:?} ends at {end}", c.text);
+            }
+        }
+        for line in &layout.lines {
+            let wide: usize = line.spans.iter().map(|s| s.content.width()).sum();
+            assert!(wide <= 42, "{wide}");
+        }
+        // Measured as 22 columns, it wraps at 18: the letters, then the
+        // sequence on a line of its own.
+        let mut want: Vec<(u16, u8, String)> =
+            (0..18).map(|i| (2 + 2 * i, 1, "a".into())).collect();
+        want.extend([(2, 3, "🏻\u{200D}🇫".into()), (8, 1, "🇧".into())]);
+        assert_eq!(sized_texts(&layout), want);
+        let rows: Vec<usize> = layout.sized.iter().map(|l| l.row).collect();
+        assert_eq!(rows, [0, 2]);
+        // Ten of the sequence, measured as 20 columns but taking 40, wrap
+        // as late as they fit, at 19 columns.
+        let layout = sized(&format!("# {}\n", "🏻\u{200D}🇫🇧".repeat(10)), 2, 42);
+        let widths: Vec<usize> = layout
+            .sized
+            .iter()
+            .map(|l| l.cells.iter().map(|c| usize::from(c.width)).sum())
+            .collect();
+        assert_eq!(widths, [19, 17, 4]);
+    }
+
+    /// `layout` drawn by `draw_sized` in `area` of a buffer `screen` wide,
+    /// from layout row `scroll`, its cells first all "M".
+    fn draw_sized_in(layout: &Layout, screen: u16, area: Rect, scroll: usize) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, screen, area.height));
+        for y in 0..area.height {
+            buf.set_string(0, y, "M".repeat(usize::from(screen)), Style::default());
+        }
+        heading::draw_sized(&mut buf, area, scroll, &layout.sized);
+        buf
+    }
+
+    #[test]
+    fn a_sized_heading_shows_the_same_characters_whole_and_cut() {
+        let layout = odd_sequence();
+        let line = &layout.sized[0];
+        // Whole, in two rows, each character is drawn larger where it was
+        // laid out.
+        let whole = draw_sized_in(&layout, 42, Rect::new(0, 0, 42, 2), 0);
+        for c in &line.cells {
+            let sized = format!(";{}\x1b\\", c.text);
+            assert!(whole[(c.col, 0)].symbol().ends_with(&sized), "{:?}", c.text);
+        }
+        // Cut at the bottom of a view of one row, each is drawn at the size
+        // of text, one after another.
+        let cut = draw_sized_in(&layout, 42, Rect::new(0, 0, 42, 1), 0);
+        let mut col = line.cells[0].col;
+        for c in &line.cells {
+            assert_eq!(cut[(col, 0)].symbol(), c.text);
+            col += u16::from(c.width);
+        }
+    }
+
+    /// 22 letters joined by U+200D: one piece, too wide for any line of 20.
+    fn joined() -> String {
+        vec!["a"; 22].join("\u{200D}")
+    }
+
+    /// A heading at twice the size in 42 columns with [`joined`] in it.
+    fn oversize() -> Layout {
+        sized(&format!("# hello {}\n", joined()), 2, 42)
+    }
+
+    #[test]
+    fn a_piece_wider_than_a_line_does_not_spread_out_the_rest() {
+        let layout = oversize();
+        let texts: Vec<String> = layout
+            .sized
+            .iter()
+            .map(|l| l.cells.iter().map(|c| c.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, ["hello".to_string(), joined()]);
+    }
+
+    #[test]
+    fn a_piece_too_wide_for_the_view_is_drawn_at_the_size_of_text_when_cut() {
+        // Scrolled so its line is cut at the bottom of a view of one row.
+        let buf = draw_sized_in(&oversize(), 42, Rect::new(0, 0, 42, 1), 2);
+        assert_eq!(buf[(2, 0)].symbol(), joined());
     }
 
     #[test]
     fn a_sized_heading_cut_at_the_bottom_leaves_the_margins_alone() {
-        use ratatui::{buffer::Buffer, layout::Rect, style::Style};
         // A view narrower than the screen, as max_width makes it.
-        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 1));
-        buf.set_string(0, 0, "M".repeat(60), Style::default());
-        let area = Rect::new(9, 0, 42, 1);
-        heading::draw_sized(&mut buf, area, 0, &too_wide().sized);
+        let buf = draw_sized_in(&oversize(), 60, Rect::new(9, 0, 42, 1), 2);
         for x in (0..9).chain(51..60) {
             assert_eq!(buf[(x, 0)].symbol(), "M", "column {x}");
         }
+    }
+
+    #[test]
+    fn sized_headings_of_wide_characters_and_emoji_wrap_as_measured() {
+        // A line filling all 20 columns stays one line.
+        let layout = sized("# aaaaaaaaaa aaaaaaaaa\n", 2, 42);
+        assert_eq!(layout.sized.len(), 1);
+        let layout = sized(
+            "# 日本語の見出し 👋🏽 hello world 👩🏽\u{200D}💻 done 🇬🇧🇫🇷 end\n",
+            2,
+            42,
+        );
+        assert_eq!(
+            texts(&layout),
+            [
+                "> 日  本  語  の  見  出  し    👋🏽  ",
+                ">",
+                "> h e l l o   w o r l d   👩🏽\u{200d}💻    d o n e ",
+                ">",
+                "> 🇬🇧  🇫🇷    e n d ",
+                ">",
+            ]
+        );
+        let layout = sized(
+            "## Café ❤\u{FE0F} straße 한국어 1\u{FE0F}\u{20E3} wrapping words here\n",
+            3,
+            64,
+        );
+        assert_eq!(
+            texts(&layout),
+            [
+                "> C  a  f  é     ❤\u{fe0f}       s  t  r  a  ß  e  ",
+                ">",
+                ">",
+                "> 한    국    어       1\u{fe0f}\u{20e3}       w  r  a  p  p  i  n  g  ",
+                ">",
+                ">",
+                "> w  o  r  d  s     h  e  r  e  ",
+                ">",
+                ">",
+            ]
+        );
     }
 
     #[test]

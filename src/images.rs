@@ -632,6 +632,7 @@ fn looks_like_svg(data: &[u8]) -> bool {
 }
 
 /// The images an SVG may draw.
+#[derive(Clone, Copy)]
 enum Hrefs<'a> {
     /// Files beside it, in this directory, and `data:` URLs.
     Beside(Option<&'a Path>),

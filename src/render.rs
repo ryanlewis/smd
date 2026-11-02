@@ -613,7 +613,10 @@ fn fold_title(
 
 /// The colour and mark a callout of `kind` is drawn with.
 fn callout_look(kind: CalloutKind) -> (Color, &'static str) {
-    use CalloutKind::*;
+    use CalloutKind::{
+        Abstract, Bug, Caution, Danger, Example, Failure, Important, Info, Note, Question, Quote,
+        Success, Tip, Todo, Warning,
+    };
     match kind {
         Note => (Color::Blue, "✎"),
         Abstract => (Color::Cyan, "≡"),

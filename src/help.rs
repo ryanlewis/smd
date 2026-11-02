@@ -32,6 +32,7 @@ fn config_line(path: &Path) -> String {
 
 /// The table of actions and the keys bound to them.
 fn table(config: &Config) -> String {
+    use std::fmt::Write as _;
     let mut out = String::from("| Keys | Action | What it does |\n| --- | --- | --- |\n");
     for action in Action::ALL {
         let names = config.key_names(action);
@@ -40,11 +41,12 @@ fn table(config: &Config) -> String {
         } else {
             names.iter().map(|n| cell(n)).collect::<Vec<_>>().join(", ")
         };
-        out.push_str(&format!(
-            "| {keys} | {} | {} |\n",
+        let _ = writeln!(
+            out,
+            "| {keys} | {} | {} |",
             cell(action.name()),
             what(action)
-        ));
+        );
     }
     out
 }

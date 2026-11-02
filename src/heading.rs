@@ -148,12 +148,13 @@ fn osc66(scale: u8, width: u8, text: &str) -> String {
 /// larger character that starts on one of those rows to the right of it, as
 /// when a heading moves down a row. Erasing a lower row removes all of it.
 fn erase(rows: u16, cols: u16) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     if rows > 1 {
-        out.push_str(&format!("\x1b[{}B", rows - 1));
+        let _ = write!(out, "\x1b[{}B", rows - 1);
     }
     for row in (0..rows).rev() {
-        out.push_str(&format!("\x1b[{cols}X"));
+        let _ = write!(out, "\x1b[{cols}X");
         if row > 0 {
             out.push_str("\x1b[A");
         }

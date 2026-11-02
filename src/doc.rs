@@ -1577,13 +1577,14 @@ impl<'a> Builder<'a> {
         true
     }
 
-    /// An HTML block. Comments are hidden. A block of nothing but `<p>`,
+    /// An HTML block. Comments are hidden, except inside `<pre>`, `<script>`,
+    /// `<style>` or `<textarea>`. A block of nothing but `<p>`,
     /// images, links, line breaks and formatting is read as a paragraph, so
     /// an image in it is drawn as a markdown one is. `<details>` opens a
     /// block that folds, holding the blocks up to its `</details>`, with its
     /// `<summary>` as the title. Any other block is kept as its source.
     fn html_block(&mut self, html: &str, span: Range<usize>) {
-        let pieces = html::pieces(html);
+        let pieces = html::without_comments(html::pieces(html));
         let tag_is = |p: &Piece, names: &[&str]| matches!(p, Piece::Tag(t) if names.contains(&t.name.as_str()));
         let details = pieces.iter().any(|p| tag_is(p, &["details", "summary"]));
         let inline = pieces.iter().all(|p| match p {
@@ -1593,21 +1594,12 @@ impl<'a> Builder<'a> {
             }
             _ => true,
         });
-        // Inside these a comment is text.
-        let keep_comments = pieces
-            .iter()
-            .any(|p| tag_is(p, &["pre", "script", "style", "textarea"]));
         if !inline && !details {
-            if keep_comments {
-                self.push_block(BlockKind::Html(html.to_string()), span);
-                return;
-            }
             let kept: String = pieces
                 .iter()
-                .filter_map(|p| match p {
-                    Piece::Text(t) => Some(*t),
-                    Piece::Tag(t) => Some(t.raw),
-                    Piece::Comment(_) => None,
+                .map(|p| match p {
+                    Piece::Text(t) | Piece::Comment(t) => *t,
+                    Piece::Tag(t) => t.raw,
                 })
                 .collect();
             if !kept.trim().is_empty() {
@@ -1631,10 +1623,8 @@ impl<'a> Builder<'a> {
             let fold_tag = tag_is(&piece, &["details", "summary"]);
             if !inline && part != Some(true) && !fold_tag {
                 match piece {
-                    Piece::Text(t) => raw.push_str(t),
+                    Piece::Text(t) | Piece::Comment(t) => raw.push_str(t),
                     Piece::Tag(t) => raw.push_str(t.raw),
-                    Piece::Comment(c) if keep_comments => raw.push_str(c),
-                    Piece::Comment(_) => {}
                 }
                 continue;
             }
@@ -4187,6 +4177,34 @@ paragraph @51..57
     "S"
   html "<pre>\na <!-- c -->\n</pre>\n" @0..68
 "#,
+        );
+    }
+
+    #[test]
+    fn comments_go_from_html_beside_preformatted_html() {
+        assert_outline(
+            "<div>a<!-- secret --></div>\n<pre>x <!-- kept --></pre>\n",
+            "html \"<div>a</div>\\n<pre>x <!-- kept --></pre>\\n\" @0..55\n",
+        );
+        assert_outline(
+            "<details>\n<summary>S</summary>\n<div>a<!-- secret --></div>\n<pre>x</pre>\n</details>\n",
+            r#"details open=false @0..83
+  summary
+    "S"
+  html "<div>a</div>\n<pre>x</pre>\n" @0..83
+"#,
+        );
+    }
+
+    #[test]
+    fn a_tag_inside_raw_text_does_not_keep_later_comments() {
+        assert_outline(
+            "<div><script>document.write(\"<pre>\")</script><!-- secret --></div>\n",
+            "html \"<div><script>document.write(\\\"<pre>\\\")</script></div>\\n\" @0..67\n",
+        );
+        assert_outline(
+            "<div><textarea><pre></textarea><!-- secret --></div>\n",
+            "html \"<div><textarea><pre></textarea></div>\\n\" @0..53\n",
         );
     }
 

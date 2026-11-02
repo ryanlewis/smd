@@ -813,6 +813,9 @@ struct Builder<'a> {
     /// wiki embed.
     image: Option<(String, String, bool)>,
     image_depth: u32,
+    /// Whether an image left out of the alt text being read has left a gap
+    /// whose space is not yet taken out.
+    alt_gap: bool,
     /// Images ending with this are left out.
     hide: Option<&'static str>,
     /// How deep in an image being left out.
@@ -1023,6 +1026,7 @@ impl<'a> Builder<'a> {
             in_table: false,
             image: None,
             image_depth: 0,
+            alt_gap: false,
             hide: None,
             hidden: 0,
             colon: None,
@@ -1189,7 +1193,10 @@ impl<'a> Builder<'a> {
         if self.hidden > 0 {
             match event {
                 Event::Start(Tag::Image { .. }) => self.hidden += 1,
-                Event::End(TagEnd::Image) => self.hidden -= 1,
+                Event::End(TagEnd::Image) => {
+                    self.hidden -= 1;
+                    self.alt_gap = self.hidden == 0 && self.image.is_some();
+                }
                 _ => {}
             }
             return;
@@ -1381,6 +1388,16 @@ impl<'a> Builder<'a> {
         if self.embeds.pop() == Some(true) {
             self.links.pop();
             return;
+        }
+        // An image left out at the end of an image's alt text leaves no space.
+        if std::mem::take(&mut self.alt_gap)
+            && let Some((_, alt, _)) = &mut self.image
+            && alt.ends_with(char::is_whitespace)
+        {
+            alt.truncate(alt.trim_end().len());
+            if let Some(Inline::Text { text, .. }) = self.top().inlines.last_mut() {
+                text.truncate(text.trim_end().len());
+            }
         }
         self.image_depth = self.image_depth.saturating_sub(1);
         if self.image_depth == 0
@@ -1576,6 +1593,7 @@ impl<'a> Builder<'a> {
             if self.hidden > 0 {
                 // Left out for the theme: there are no events to skip.
                 self.hidden = 0;
+                self.alt_gap = self.image.is_some();
             } else {
                 self.text(tag.attr("alt").unwrap_or(""), self.style(), range);
                 self.end_image();
@@ -1912,7 +1930,16 @@ impl<'a> Builder<'a> {
     fn text(&mut self, text: &str, style: InlineStyle, range: Range<usize>) {
         // An image's alt text does not make its paragraph prose.
         if let Some((_, alt, _)) = &mut self.image {
+            // An image left out of it leaves one space at most.
+            let mut text = text;
+            if self.alt_gap && (alt.is_empty() || alt.ends_with(char::is_whitespace)) {
+                text = text.trim_start();
+            }
+            if !text.is_empty() {
+                self.alt_gap = false;
+            }
             alt.push_str(text);
+            return self.push_text(text, style, range);
         } else if !text.trim().is_empty() {
             self.top().other_inline = true;
         }
@@ -2976,6 +3003,48 @@ paragraph @23..37
         );
         // With no theme known, both logos stay.
         assert_eq!(parse_for(md, None).blocks, parse(md).blocks);
+    }
+
+    #[test]
+    fn a_logo_left_out_of_alt_text_leaves_one_space() {
+        let md = "![a ![b](b.png#gh-light-mode-only) c](l.png) after\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..51\n  \"[image: a c] after\"\n"
+        );
+        let md = "![a ![b](b.png#gh-light-mode-only) c](l.png)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "image \"l.png\" alt=\"a c\" wiki=false @0..45\n"
+        );
+        // At the start or end of the alt text, it leaves none.
+        let md = "![![b](b.png#gh-light-mode-only) c](l.png)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "image \"l.png\" alt=\"c\" wiki=false @0..43\n"
+        );
+        let md = "![a ![b](b.png#gh-light-mode-only)](l.png) after\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..49\n  \"[image: a] after\"\n"
+        );
+        // Inside an image in the alt text, or as an HTML image.
+        let md = "![a ![x ![b](b.png#gh-light-mode-only)](x.png) c](l.png) after\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..63\n  \"[image: a [image: x] c] after\"\n"
+        );
+        let md = "![a <img src=\"b.png#gh-light-mode-only\"> c](l.png) after\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..57\n  \"[image: a c] after\"\n"
+        );
+        // Its space taken out even when it follows styled text.
+        let md = "![*a* ![b](b.png#gh-light-mode-only)](l.png) after\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..51\n  \"[image: \"\n  \"a\" em\n  \"] after\"\n"
+        );
     }
 
     #[test]

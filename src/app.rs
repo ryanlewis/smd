@@ -2061,6 +2061,23 @@ struct Live {
     keys: Option<std::fs::File>,
 }
 
+impl Live {
+    /// Stop as if SIGHUP came when the terminal keys come from has gone,
+    /// and say whether it has.
+    fn hung_up(&self) -> bool {
+        #[cfg(unix)]
+        if self
+            .keys
+            .as_ref()
+            .is_some_and(|keys| gone(keys.as_raw_fd()))
+        {
+            hang_up();
+            return true;
+        }
+        false
+    }
+}
+
 impl Input for Live {
     fn now(&self) -> Instant {
         Instant::now()
@@ -2069,20 +2086,21 @@ impl Input for Live {
     fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
         // crossterm waits again at once when the terminal has gone, until
         // the timeout on macOS, so it is not asked then.
-        #[cfg(unix)]
-        if self
-            .keys
-            .as_ref()
-            .is_some_and(|keys| gone(keys.as_raw_fd()))
-        {
-            hang_up();
+        if self.hung_up() {
             return Ok(false);
         }
-        event::poll(timeout)
+        // On macOS crossterm may instead fail to read the gone terminal.
+        // The loop then ends by the error, which is not reported after a
+        // stop signal.
+        event::poll(timeout).inspect_err(|_| {
+            self.hung_up();
+        })
     }
 
     fn read(&mut self) -> io::Result<Event> {
-        event::read()
+        event::read().inspect_err(|_| {
+            self.hung_up();
+        })
     }
 
     fn stopped(&self) -> bool {

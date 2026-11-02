@@ -222,4 +222,51 @@ mod tests {
         assert_eq!(panel((0x1e, 0x1e, 0x2e)), Color::Rgb(48, 48, 63));
         assert_eq!(panel((255, 255, 255)), Color::Rgb(235, 235, 235));
     }
+
+    #[test]
+    fn luma_weighs_green_most_and_blue_least() {
+        assert_eq!(luma(1.0, 0.0, 0.0), 0.2126);
+        assert_eq!(luma(0.0, 1.0, 0.0), 0.7152);
+        assert_eq!(luma(0.0, 0.0, 1.0), 0.0722);
+        assert_eq!(luma(0.5, 0.5, 0.5), 0.5);
+        assert_eq!(fraction_of(0), 0.0);
+        assert_eq!(fraction_of(51), 0.2);
+        assert_eq!(fraction_of(255), 1.0);
+    }
+
+    #[test]
+    fn background_is_light_just_past_half_brightness() {
+        let reply = |rgb: &str| parse_background_reply(format!("\x1b]11;rgb:{rgb}\x07").as_bytes());
+        assert_eq!(reply("80/80/80"), Some(Theme::Light));
+        assert_eq!(reply("7f/7f/7f"), Some(Theme::Dark));
+        // Pure green is light and pure red is dark, as the eye sees them.
+        assert_eq!(reply("00/ff/00"), Some(Theme::Light));
+        assert_eq!(reply("ff/00/00"), Some(Theme::Dark));
+        assert_eq!(reply("ff/00/ff"), Some(Theme::Dark));
+    }
+
+    #[test]
+    fn background_reply_skips_broken_replies_for_a_good_one() {
+        let buf = b"\x1b]11;rgb:zz/zz/zz\x07\x1b]11;hsl:1/2/3\x07\x1b]11;rgb:ff/ff/ff\x1b\\";
+        assert_eq!(parse_background_reply(buf), Some(Theme::Light));
+        assert_eq!(parse_background_colour(buf), Some((255, 255, 255)));
+    }
+
+    #[test]
+    fn colour_parts_are_one_to_four_hex_digits() {
+        assert_eq!(fraction(""), None);
+        assert_eq!(fraction("12345"), None);
+        assert_eq!(fraction("g"), None);
+        assert_eq!(fraction("f"), Some(1.0));
+        assert_eq!(fraction("0"), Some(0.0));
+        assert_eq!(fraction("80"), Some(128.0 / 255.0));
+        assert_eq!(fraction("8000"), Some(32768.0 / 65535.0));
+        assert_eq!(fraction("fff"), Some(1.0));
+    }
+
+    #[test]
+    fn theme_names_are_lower_case_words() {
+        assert_eq!(Theme::Dark.name(), "dark");
+        assert_eq!(Theme::Light.name(), "light");
+    }
 }

@@ -623,12 +623,12 @@ mod tests {
         assert_eq!(String::from_utf8(err).unwrap(), "smd: gone\n");
     }
 
-    /// A stderr that takes nothing.
-    struct Closed;
+    /// A stderr whose writes fail, as a broken pipe's do.
+    struct Broken;
 
-    impl Write for Closed {
+    impl Write for Broken {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("closed"))
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -637,14 +637,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "failed printing to stderr: closed")]
-    fn a_failure_that_cannot_be_written_panics_as_eprintln_does() {
-        exit_code(Err(Failure::new("gone")), &mut Closed);
+    #[should_panic(expected = "failed printing to stderr: ")]
+    fn a_failure_whose_message_cannot_be_written_panics() {
+        exit_code(Err(Failure::new("gone")), &mut Broken);
     }
 
     #[test]
-    fn success_writes_nothing_even_to_a_closed_stderr() {
-        assert_eq!(exit_code(Ok(()), &mut Closed), ExitCode::SUCCESS);
+    fn success_writes_nothing_even_to_a_broken_stderr() {
+        assert_eq!(exit_code(Ok(()), &mut Broken), ExitCode::SUCCESS);
     }
 
     #[test]

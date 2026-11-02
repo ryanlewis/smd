@@ -24,6 +24,9 @@ const MAX_HARD: usize = 2;
 /// The style of a header.
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
+/// The style of box rules and card rules.
+const BORDER: Style = Style::new().fg(Color::DarkGray);
+
 /// Characters a word too long for its column may break after. A break
 /// there does not count against `MAX_HARD`.
 const BREAK_AFTER: &str = "/-_.,:=";
@@ -179,11 +182,10 @@ impl Table {
     /// The table inside box rules, each cell wrapped to its column's width,
     /// and how many words were broken mid-word.
     fn grid(&self, widths: &[usize], styled: impl Fn(Style, &InlineStyle) -> Style) -> Grid {
-        let border = Style::new().fg(Color::DarkGray);
         let rule = |left: &str, fill: &str, mid: &str, right: &str| {
             let parts: Vec<String> = widths.iter().map(|w| fill.repeat(w + 2)).collect();
             vec![(
-                Span::styled(format!("{left}{}{right}", parts.join(mid)), border),
+                Span::styled(format!("{left}{}{right}", parts.join(mid)), BORDER),
                 None,
             )]
         };
@@ -205,11 +207,7 @@ impl Table {
         let mut lines = vec![rule("┌", "─", "┬", "┐")];
         let mut rules = 2;
         for (r, cells) in rows.iter().enumerate() {
-            let base = if r == 0 {
-                Style::new().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let base = if r == 0 { BOLD } else { Style::default() };
             hard += cells.iter().map(|w| w.hard).sum::<usize>();
             let pieces: Vec<Lines> = cells
                 .iter()
@@ -217,14 +215,16 @@ impl Table {
                 .map(|(c, cell)| pieces(cell, &self.run_links[r][c], base, &styled))
                 .collect();
             for k in 0..height(cells) {
-                lines.push(self.grid_line(widths, cells, &pieces, k, border));
+                lines.push(self.grid_line(widths, cells, &pieces, k));
             }
             // The header's rule under it, and dashed rules between other
             // rows when they are set apart.
-            let fill = match r {
-                _ if r + 1 == rows.len() => None,
-                0 => Some("─"),
-                _ => separate.then_some("╌"),
+            let fill = if r + 1 == rows.len() {
+                None
+            } else if r == 0 {
+                Some("─")
+            } else {
+                separate.then_some("╌")
             };
             if let Some(fill) = fill {
                 lines.push(rule("├", fill, "┼", "┤"));
@@ -243,12 +243,11 @@ impl Table {
         cells: &[Wrapped],
         pieces: &[Lines],
         k: usize,
-        border: Style,
     ) -> Vec<Piece> {
         let mut line = Vec::new();
         for (c, cell) in cells.iter().enumerate() {
             let edge = if c == 0 { "│ " } else { " │ " };
-            line.push((Span::styled(edge, border), None));
+            line.push((Span::styled(edge, BORDER), None));
             let part = cell.lines.get(k).map_or(&[][..], Vec::as_slice);
             let extra = widths[c].saturating_sub(text_width(part));
             let (before, after) = padding(self.aligns[c], extra);
@@ -256,7 +255,7 @@ impl Table {
             line.extend(pieces[c].get(k).cloned().unwrap_or_default());
             line.push((Span::raw(" ".repeat(after)), None));
         }
-        line.push((Span::styled(" │", border), None));
+        line.push((Span::styled(" │", BORDER), None));
         line
     }
 
@@ -264,10 +263,7 @@ impl Table {
     /// each cell that has text, the value wrapped under itself. A table with
     /// no body shows its header as one card.
     fn cards(&self, width: usize, styled: impl Fn(Style, &InlineStyle) -> Style + Copy) -> Lines {
-        let rule = vec![(
-            Span::styled("─".repeat(width), Style::new().fg(Color::DarkGray)),
-            None,
-        )];
+        let rule = vec![(Span::styled("─".repeat(width), BORDER), None)];
         let heads = &self.rows[0];
         if self.rows.len() == 1 {
             let mut lines = vec![rule.clone()];
@@ -432,7 +428,7 @@ fn wrap(cell: &Cell, width: usize) -> Wrapped {
     let lines = lines
         .into_iter()
         .map(|line| {
-            let (runs, from) = runs(cell, line);
+            let (runs, from) = line_runs(cell, line);
             sources.push(from);
             runs
         })
@@ -503,7 +499,7 @@ fn fill(words: Vec<(Chars, Chars)>, width: usize) -> (Vec<Chars>, usize) {
 
 /// A line of `cell`'s characters as runs in their styles, and the run in
 /// the cell each came from.
-fn runs(cell: &Cell, line: Chars) -> (Cell, Vec<usize>) {
+fn line_runs(cell: &Cell, line: Chars) -> (Cell, Vec<usize>) {
     let mut runs: Cell = Vec::new();
     let mut from = Vec::new();
     for (c, i) in line {

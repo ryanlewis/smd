@@ -2963,6 +2963,12 @@ paragraph @23..37
     }
 
     #[test]
+    fn a_logo_left_out_takes_an_image_in_its_alt_text_with_it() {
+        let md = "![a ![b](b.png) c](l.png#gh-light-mode-only) after\n";
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..51\n  \" after\"\n");
+    }
+
+    #[test]
     fn pin_headings_atx_setext_and_inline_code() {
         assert_outline(
             "## Heading `code`\nSetext\n===\n",
@@ -3819,6 +3825,13 @@ quote @45..55
     }
 
     #[test]
+    fn a_control_character_in_the_source_is_kept() {
+        // With no definition colon swapped for `COLON`, nothing is turned
+        // back into a colon.
+        assert_outline("a \u{1} b\n", "paragraph @0..6\n  \"a \\u{1} b\"\n");
+    }
+
+    #[test]
     fn html_comments_are_hidden() {
         assert_outline(
             "a <!-- one\nline --> b\n\n<!--\nmany\n\nlines\n-->\n\n<div>x</div> <!-- y -->\n\n<!-- open\n",
@@ -4154,6 +4167,57 @@ paragraph @51..57
     "S"
   html "<pre>\na\n  b\n</pre>\n" @0..61
 "#,
+        );
+    }
+
+    #[test]
+    fn comments_in_html_in_details_go_unless_preformatted() {
+        assert_outline(
+            "<details>\n<summary>S</summary>\n<div>a<!-- c --></div>\n</details>\n",
+            r#"details open=false @0..65
+  summary
+    "S"
+  html "<div>a</div>\n" @0..65
+"#,
+        );
+        assert_outline(
+            "<details>\n<summary>S</summary>\n<pre>\na <!-- c -->\n</pre>\n</details>\n",
+            r#"details open=false @0..68
+  summary
+    "S"
+  html "<pre>\na <!-- c -->\n</pre>\n" @0..68
+"#,
+        );
+    }
+
+    #[test]
+    fn summary_tags_count_only_where_a_summary_can_open_or_close() {
+        // A `<p>` inside a summary does not end it.
+        assert_outline(
+            "<details>\n<summary>a<p>b</p>c</summary>\nx\n</details>\n",
+            r#"details open=false @0..53
+  summary
+    "abc"
+  paragraph @0..53
+    "x"
+"#,
+        );
+        // Outside details, or inside a summary, `<summary>` is text, as is
+        // `</summary>` in a paragraph.
+        assert_outline(
+            "<summary>S</summary>\n",
+            "paragraph @0..21\n  \"<summary>S</summary>\"\n",
+        );
+        assert_outline(
+            "<details>\n<summary>S<summary>T</summary>\n</details>\n",
+            r#"details open=false @0..51
+  summary
+    "S<summary>T"
+"#,
+        );
+        assert_outline(
+            "<p>a</summary> b</p>\n",
+            "paragraph @0..21\n  \"a</summary> b\"\n",
         );
     }
 }

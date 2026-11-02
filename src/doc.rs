@@ -419,12 +419,12 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
     let body = &source[start..];
     let comments: Vec<Range<usize>> = comments(body, options);
     let patched = unspaced_definitions(body, options, &comments);
-    builder.colons = patched.is_some();
+    builder.colon = patched.as_ref().map(|(_, colon)| *colon);
     builder.comments = comments
         .into_iter()
         .map(|c| c.start + start..c.end + start)
         .collect();
-    let text = patched.as_deref().unwrap_or(body);
+    let text = patched.as_ref().map_or(body, |(text, _)| text.as_str());
     let events = || {
         Parser::new_ext(text, options)
             .into_offset_iter()
@@ -741,20 +741,32 @@ fn fold(label: &str) -> String {
     out
 }
 
-/// Stands in for the `:` of a definition with no space or tab after it, such
-/// as `:tada:` on the line after a paragraph, or of one in a comment, so the line is read as more of
+/// The first control character not in `source`, to stand in for the `:` of a
+/// definition with no space or tab after it, such as `:tada:` on the line
+/// after a paragraph, or of one in a comment, so the line is read as more of
 /// the paragraph. It is one byte, as the colon is, so every range still
-/// points at the source, and the builder turns it back into a colon.
-const COLON: char = '\u{1}';
+/// points at the source, and the builder turns it back into a colon. It is
+/// not in the source, so none of the source's own characters become colons.
+/// Whitespace, which the parser reads as a space, is never used, nor is U+000B,
+/// which CommonMark counts as whitespace. `None` if the source has them all.
+fn colon_marker(source: &str) -> Option<char> {
+    let mut seen = [false; 32];
+    for byte in source.bytes().filter(|&b| b < 32) {
+        seen[usize::from(byte)] = true;
+    }
+    ('\u{1}'..='\u{1f}')
+        .filter(|c| !c.is_ascii_whitespace() && *c != '\u{b}')
+        .find(|&c| !seen[c as usize])
+}
 
 /// `source` with the colon of each definition that has no space or tab after
-/// it, or that is inside one of the `comments`, swapped for [`COLON`], or
-/// `None` when there is none.
+/// it, or that is inside one of the `comments`, swapped for a
+/// [`colon_marker`], and that marker; or `None` when there is none.
 fn unspaced_definitions(
     source: &str,
     options: Options,
     comments: &[Range<usize>],
-) -> Option<String> {
+) -> Option<(String, char)> {
     let maybe = source.lines().any(|line| {
         let line = line.trim_start_matches([' ', '\t', '>']);
         line.starts_with(':') && (!comments.is_empty() || !line[1..].starts_with([' ', '\t']))
@@ -762,6 +774,7 @@ fn unspaced_definitions(
     if !maybe {
         return None;
     }
+    let colon = colon_marker(source)?;
     let mut patched: Option<String> = None;
     // Each round swaps at least one colon, so it ends.
     loop {
@@ -778,11 +791,11 @@ fn unspaced_definitions(
             })
             .collect();
         if unspaced.is_empty() {
-            return patched;
+            return patched.map(|text| (text, colon));
         }
         let mut swapped = text.to_string().into_bytes();
         for at in unspaced {
-            swapped[at] = COLON as u8;
+            swapped[at] = colon as u8;
         }
         patched = Some(String::from_utf8(swapped).expect("one ASCII byte for another"));
     }
@@ -804,8 +817,9 @@ struct Builder<'a> {
     hide: Option<&'static str>,
     /// How deep in an image being left out.
     hidden: u32,
-    /// Whether the parser reads a source with [`COLON`] in it.
-    colons: bool,
+    /// The stand-in for a colon, if the parser reads a source with one in
+    /// it, from [`colon_marker`].
+    colon: Option<char>,
     /// For each image started and not yet ended, whether it was a wiki embed
     /// of a note, read as a link instead.
     embeds: Vec<bool>,
@@ -1011,7 +1025,7 @@ impl<'a> Builder<'a> {
             image_depth: 0,
             hide: None,
             hidden: 0,
-            colons: false,
+            colon: None,
             embeds: Vec::new(),
             comments: Vec::new(),
             numbered: Vec::new(),
@@ -1188,8 +1202,10 @@ impl<'a> Builder<'a> {
                 _ => {
                     let text = match typed_dashes(self.source, range.clone()) {
                         Some(typed) => Cow::Borrowed(typed),
-                        None if self.colons => Cow::Owned(text.replace(COLON, ":")),
-                        None => Cow::Borrowed(&*text),
+                        None => match self.colon {
+                            Some(colon) => Cow::Owned(text.replace(colon, ":")),
+                            None => Cow::Borrowed(&*text),
+                        },
                     };
                     self.prose(&text, range);
                 }
@@ -3816,9 +3832,41 @@ quote @45..55
 
     #[test]
     fn a_control_character_in_the_source_is_kept() {
-        // With no definition colon swapped for `COLON`, nothing is turned
-        // back into a colon.
+        // With no definition colon swapped, nothing is turned back into a colon.
         assert_outline("a \u{1} b\n", "paragraph @0..6\n  \"a \\u{1} b\"\n");
+    }
+
+    #[test]
+    fn the_colon_marker_is_a_control_character_not_in_the_source() {
+        assert_eq!(colon_marker("a"), Some('\u{1}'));
+        assert_eq!(
+            colon_marker("\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}"),
+            Some('\u{e}')
+        );
+        let all: String = ('\u{1}'..='\u{1f}')
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        assert_eq!(colon_marker(&all), None);
+        // With no marker free, a definition colon with no space stays one.
+        let out = outline(&format!("{all}\n:tada:\n"));
+        assert!(out.starts_with("definition @0..35\n"), "{out}");
+        assert!(
+            out.ends_with("paragraph @29..34\n      \"tada:\"\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_control_character_stays_when_a_definition_colon_is_swapped() {
+        assert_outline(
+            "a \u{1} b\n\npara\n:tada:\n",
+            "paragraph @0..6\n  \"a \\u{1} b\"\nparagraph @7..19\n  \"para 🎉\"\n",
+        );
+        // And when the swapped colon is in a comment.
+        assert_outline(
+            "a \u{1}\u{2} b %%\n: c\n%%\n",
+            "paragraph @0..17\n  \"a \\u{1}\\u{2} b \"\n",
+        );
     }
 
     #[test]

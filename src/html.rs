@@ -97,6 +97,41 @@ pub fn pieces(html: &str) -> Vec<Piece<'_>> {
     out
 }
 
+/// `pieces` with the comments taken out, except those inside `<pre>`,
+/// `<script>`, `<style>` or `<textarea>`, where a comment is text. Inside
+/// one, only its own end tag ends it: other tags there may be text.
+pub fn without_comments(mut pieces: Vec<Piece<'_>>) -> Vec<Piece<'_>> {
+    // The element the pieces are in, and how many of it are open.
+    let mut inside: Option<(String, usize)> = None;
+    pieces.retain(|piece| match piece {
+        Piece::Tag(t) => {
+            match &mut inside {
+                Some((name, open)) if *name == t.name => {
+                    if t.close {
+                        *open -= 1;
+                        if *open == 0 {
+                            inside = None;
+                        }
+                    } else {
+                        *open += 1;
+                    }
+                }
+                Some(_) => {}
+                None if !t.close
+                    && matches!(t.name.as_str(), "pre" | "script" | "style" | "textarea") =>
+                {
+                    inside = Some((t.name.clone(), 1));
+                }
+                None => {}
+            }
+            true
+        }
+        Piece::Comment(_) => inside.is_some(),
+        Piece::Text(_) => true,
+    });
+    pieces
+}
+
 /// The tag at the start of `s`, if one is there.
 fn tag(s: &str) -> Option<Tag<'_>> {
     let body = s.strip_prefix('<')?;

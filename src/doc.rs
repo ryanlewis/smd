@@ -419,12 +419,12 @@ pub fn parse_for(source: &str, theme: Option<Theme>) -> Document {
     let body = &source[start..];
     let comments: Vec<Range<usize>> = comments(body, options);
     let patched = unspaced_definitions(body, options, &comments);
-    builder.colons = patched.is_some();
+    builder.colon = patched.as_ref().map(|(_, colon)| *colon);
     builder.comments = comments
         .into_iter()
         .map(|c| c.start + start..c.end + start)
         .collect();
-    let text = patched.as_deref().unwrap_or(body);
+    let text = patched.as_ref().map_or(body, |(text, _)| text.as_str());
     let events = || {
         Parser::new_ext(text, options)
             .into_offset_iter()
@@ -741,20 +741,32 @@ fn fold(label: &str) -> String {
     out
 }
 
-/// Stands in for the `:` of a definition with no space or tab after it, such
-/// as `:tada:` on the line after a paragraph, or of one in a comment, so the line is read as more of
+/// The first control character not in `source`, to stand in for the `:` of a
+/// definition with no space or tab after it, such as `:tada:` on the line
+/// after a paragraph, or of one in a comment, so the line is read as more of
 /// the paragraph. It is one byte, as the colon is, so every range still
-/// points at the source, and the builder turns it back into a colon.
-const COLON: char = '\u{1}';
+/// points at the source, and the builder turns it back into a colon. It is
+/// not in the source, so none of the source's own characters become colons.
+/// Whitespace, which the parser reads as a space, is never used, nor is U+000B,
+/// which CommonMark counts as whitespace. `None` if the source has them all.
+fn colon_marker(source: &str) -> Option<char> {
+    let mut seen = [false; 32];
+    for byte in source.bytes().filter(|&b| b < 32) {
+        seen[usize::from(byte)] = true;
+    }
+    ('\u{1}'..='\u{1f}')
+        .filter(|c| !c.is_ascii_whitespace() && *c != '\u{b}')
+        .find(|&c| !seen[c as usize])
+}
 
 /// `source` with the colon of each definition that has no space or tab after
-/// it, or that is inside one of the `comments`, swapped for [`COLON`], or
-/// `None` when there is none.
+/// it, or that is inside one of the `comments`, swapped for a
+/// [`colon_marker`], and that marker; or `None` when there is none.
 fn unspaced_definitions(
     source: &str,
     options: Options,
     comments: &[Range<usize>],
-) -> Option<String> {
+) -> Option<(String, char)> {
     let maybe = source.lines().any(|line| {
         let line = line.trim_start_matches([' ', '\t', '>']);
         line.starts_with(':') && (!comments.is_empty() || !line[1..].starts_with([' ', '\t']))
@@ -762,6 +774,7 @@ fn unspaced_definitions(
     if !maybe {
         return None;
     }
+    let colon = colon_marker(source)?;
     let mut patched: Option<String> = None;
     // Each round swaps at least one colon, so it ends.
     loop {
@@ -778,11 +791,11 @@ fn unspaced_definitions(
             })
             .collect();
         if unspaced.is_empty() {
-            return patched;
+            return patched.map(|text| (text, colon));
         }
         let mut swapped = text.to_string().into_bytes();
         for at in unspaced {
-            swapped[at] = COLON as u8;
+            swapped[at] = colon as u8;
         }
         patched = Some(String::from_utf8(swapped).expect("one ASCII byte for another"));
     }
@@ -804,8 +817,9 @@ struct Builder<'a> {
     hide: Option<&'static str>,
     /// How deep in an image being left out.
     hidden: u32,
-    /// Whether the parser reads a source with [`COLON`] in it.
-    colons: bool,
+    /// The stand-in for a colon, if the parser reads a source with one in
+    /// it, from [`colon_marker`].
+    colon: Option<char>,
     /// For each image started and not yet ended, whether it was a wiki embed
     /// of a note, read as a link instead.
     embeds: Vec<bool>,
@@ -1011,7 +1025,7 @@ impl<'a> Builder<'a> {
             image_depth: 0,
             hide: None,
             hidden: 0,
-            colons: false,
+            colon: None,
             embeds: Vec::new(),
             comments: Vec::new(),
             numbered: Vec::new(),
@@ -1188,8 +1202,10 @@ impl<'a> Builder<'a> {
                 _ => {
                     let text = match typed_dashes(self.source, range.clone()) {
                         Some(typed) => Cow::Borrowed(typed),
-                        None if self.colons => Cow::Owned(text.replace(COLON, ":")),
-                        None => Cow::Borrowed(&*text),
+                        None => match self.colon {
+                            Some(colon) => Cow::Owned(text.replace(colon, ":")),
+                            None => Cow::Borrowed(&*text),
+                        },
                     };
                     self.prose(&text, range);
                 }
@@ -1577,13 +1593,14 @@ impl<'a> Builder<'a> {
         true
     }
 
-    /// An HTML block. Comments are hidden. A block of nothing but `<p>`,
+    /// An HTML block. Comments are hidden, except inside `<pre>`, `<script>`,
+    /// `<style>` or `<textarea>`. A block of nothing but `<p>`,
     /// images, links, line breaks and formatting is read as a paragraph, so
     /// an image in it is drawn as a markdown one is. `<details>` opens a
     /// block that folds, holding the blocks up to its `</details>`, with its
     /// `<summary>` as the title. Any other block is kept as its source.
     fn html_block(&mut self, html: &str, span: Range<usize>) {
-        let pieces = html::pieces(html);
+        let pieces = html::without_comments(html::pieces(html));
         let tag_is = |p: &Piece, names: &[&str]| matches!(p, Piece::Tag(t) if names.contains(&t.name.as_str()));
         let details = pieces.iter().any(|p| tag_is(p, &["details", "summary"]));
         let inline = pieces.iter().all(|p| match p {
@@ -1593,21 +1610,12 @@ impl<'a> Builder<'a> {
             }
             _ => true,
         });
-        // Inside these a comment is text.
-        let keep_comments = pieces
-            .iter()
-            .any(|p| tag_is(p, &["pre", "script", "style", "textarea"]));
         if !inline && !details {
-            if keep_comments {
-                self.push_block(BlockKind::Html(html.to_string()), span);
-                return;
-            }
             let kept: String = pieces
                 .iter()
-                .filter_map(|p| match p {
-                    Piece::Text(t) => Some(*t),
-                    Piece::Tag(t) => Some(t.raw),
-                    Piece::Comment(_) => None,
+                .map(|p| match p {
+                    Piece::Text(t) | Piece::Comment(t) => *t,
+                    Piece::Tag(t) => t.raw,
                 })
                 .collect();
             if !kept.trim().is_empty() {
@@ -1631,10 +1639,8 @@ impl<'a> Builder<'a> {
             let fold_tag = tag_is(&piece, &["details", "summary"]);
             if !inline && part != Some(true) && !fold_tag {
                 match piece {
-                    Piece::Text(t) => raw.push_str(t),
+                    Piece::Text(t) | Piece::Comment(t) => raw.push_str(t),
                     Piece::Tag(t) => raw.push_str(t.raw),
-                    Piece::Comment(c) if keep_comments => raw.push_str(c),
-                    Piece::Comment(_) => {}
                 }
                 continue;
             }
@@ -2963,6 +2969,12 @@ paragraph @23..37
     }
 
     #[test]
+    fn a_logo_left_out_takes_an_image_in_its_alt_text_with_it() {
+        let md = "![a ![b](b.png) c](l.png#gh-light-mode-only) after\n";
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..51\n  \" after\"\n");
+    }
+
+    #[test]
     fn pin_headings_atx_setext_and_inline_code() {
         assert_outline(
             "## Heading `code`\nSetext\n===\n",
@@ -3819,6 +3831,45 @@ quote @45..55
     }
 
     #[test]
+    fn a_control_character_in_the_source_is_kept() {
+        // With no definition colon swapped, nothing is turned back into a colon.
+        assert_outline("a \u{1} b\n", "paragraph @0..6\n  \"a \\u{1} b\"\n");
+    }
+
+    #[test]
+    fn the_colon_marker_is_a_control_character_not_in_the_source() {
+        assert_eq!(colon_marker("a"), Some('\u{1}'));
+        assert_eq!(
+            colon_marker("\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}"),
+            Some('\u{e}')
+        );
+        let all: String = ('\u{1}'..='\u{1f}')
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        assert_eq!(colon_marker(&all), None);
+        // With no marker free, a definition colon with no space stays one.
+        let out = outline(&format!("{all}\n:tada:\n"));
+        assert!(out.starts_with("definition @0..35\n"), "{out}");
+        assert!(
+            out.ends_with("paragraph @29..34\n      \"tada:\"\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_control_character_stays_when_a_definition_colon_is_swapped() {
+        assert_outline(
+            "a \u{1} b\n\npara\n:tada:\n",
+            "paragraph @0..6\n  \"a \\u{1} b\"\nparagraph @7..19\n  \"para 🎉\"\n",
+        );
+        // And when the swapped colon is in a comment.
+        assert_outline(
+            "a \u{1}\u{2} b %%\n: c\n%%\n",
+            "paragraph @0..17\n  \"a \\u{1}\\u{2} b \"\n",
+        );
+    }
+
+    #[test]
     fn html_comments_are_hidden() {
         assert_outline(
             "a <!-- one\nline --> b\n\n<!--\nmany\n\nlines\n-->\n\n<div>x</div> <!-- y -->\n\n<!-- open\n",
@@ -4154,6 +4205,85 @@ paragraph @51..57
     "S"
   html "<pre>\na\n  b\n</pre>\n" @0..61
 "#,
+        );
+    }
+
+    #[test]
+    fn comments_in_html_in_details_go_unless_preformatted() {
+        assert_outline(
+            "<details>\n<summary>S</summary>\n<div>a<!-- c --></div>\n</details>\n",
+            r#"details open=false @0..65
+  summary
+    "S"
+  html "<div>a</div>\n" @0..65
+"#,
+        );
+        assert_outline(
+            "<details>\n<summary>S</summary>\n<pre>\na <!-- c -->\n</pre>\n</details>\n",
+            r#"details open=false @0..68
+  summary
+    "S"
+  html "<pre>\na <!-- c -->\n</pre>\n" @0..68
+"#,
+        );
+    }
+
+    #[test]
+    fn comments_go_from_html_beside_preformatted_html() {
+        assert_outline(
+            "<div>a<!-- secret --></div>\n<pre>x <!-- kept --></pre>\n",
+            "html \"<div>a</div>\\n<pre>x <!-- kept --></pre>\\n\" @0..55\n",
+        );
+        assert_outline(
+            "<details>\n<summary>S</summary>\n<div>a<!-- secret --></div>\n<pre>x</pre>\n</details>\n",
+            r#"details open=false @0..83
+  summary
+    "S"
+  html "<div>a</div>\n<pre>x</pre>\n" @0..83
+"#,
+        );
+    }
+
+    #[test]
+    fn a_tag_inside_raw_text_does_not_keep_later_comments() {
+        assert_outline(
+            "<div><script>document.write(\"<pre>\")</script><!-- secret --></div>\n",
+            "html \"<div><script>document.write(\\\"<pre>\\\")</script></div>\\n\" @0..67\n",
+        );
+        assert_outline(
+            "<div><textarea><pre></textarea><!-- secret --></div>\n",
+            "html \"<div><textarea><pre></textarea></div>\\n\" @0..53\n",
+        );
+    }
+
+    #[test]
+    fn summary_tags_count_only_where_a_summary_can_open_or_close() {
+        // A `<p>` inside a summary does not end it.
+        assert_outline(
+            "<details>\n<summary>a<p>b</p>c</summary>\nx\n</details>\n",
+            r#"details open=false @0..53
+  summary
+    "abc"
+  paragraph @0..53
+    "x"
+"#,
+        );
+        // Outside details, or inside a summary, `<summary>` is text, as is
+        // `</summary>` in a paragraph.
+        assert_outline(
+            "<summary>S</summary>\n",
+            "paragraph @0..21\n  \"<summary>S</summary>\"\n",
+        );
+        assert_outline(
+            "<details>\n<summary>S<summary>T</summary>\n</details>\n",
+            r#"details open=false @0..51
+  summary
+    "S<summary>T"
+"#,
+        );
+        assert_outline(
+            "<p>a</summary> b</p>\n",
+            "paragraph @0..21\n  \"a</summary> b\"\n",
         );
     }
 }

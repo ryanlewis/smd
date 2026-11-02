@@ -763,13 +763,15 @@ impl View {
         if let Some((i, _)) = found {
             self.search.current = Some(i);
             let rows = self.search.matches[i].rows();
-            let row = rows.start;
-            let view = self.in_view();
-            if !view.contains(&row) || !view.contains(&(rows.end - 1)) {
-                self.scroll = row
-                    .saturating_sub(self.height as usize / 3)
-                    .min(self.max_scroll());
-            }
+            // A heading drawn larger takes the rows under its lines too.
+            let last = self
+                .layout
+                .sized
+                .iter()
+                .filter(|l| rows.contains(&l.row))
+                .map(|l| l.row + usize::from(l.scale) - 1)
+                .fold(rows.end - 1, usize::max);
+            self.scroll_into_view(rows.start, last);
         }
         Go::Say(self.search.status(wrapped))
     }
@@ -857,10 +859,15 @@ impl View {
             return;
         };
         self.selected = Some(links[next]);
-        // Bring it into view, a little way down the page when that moves it,
-        // and all of it when it fits, as a heading drawn larger takes rows.
         let row = rows[next];
         let last = self.cells(links[next]).last().map_or(row, |c| c.0);
+        self.scroll_into_view(row, last);
+    }
+
+    /// Bring rows `row` to `last` into view, a little way down the page when
+    /// that moves them, and all of them when they fit, as a heading drawn
+    /// larger takes rows.
+    fn scroll_into_view(&mut self, row: usize, last: usize) {
         let view = self.in_view();
         if !view.contains(&row) || !view.contains(&last) {
             let down = (last + 1).saturating_sub(self.height as usize);
@@ -2563,6 +2570,42 @@ mod tests {
         on_match(&mut v, "eight nine", 0);
         assert_eq!(v.search.matches[0].rows(), 4..6);
         assert!(v.in_view().contains(&5), "scroll {}", v.scroll);
+    }
+
+    #[test]
+    fn going_to_a_match_in_a_sized_heading_brings_all_its_rows_into_view() {
+        use crate::heading::{SizedCell, SizedLine};
+        let md = format!("{}needle\n\n{}", paragraphs(4), paragraphs(10));
+        // Where the view is after going to "needle" on row 8, the last row
+        // in view, laid out as a heading three times the size or not.
+        let go = |height: u16, sized: bool| {
+            let mut v = new_view(&md);
+            v.resize(20, height);
+            if sized {
+                let cells = "needle".chars().enumerate().map(|(i, c)| SizedCell {
+                    col: 3 * i as u16,
+                    width: 1,
+                    text: c.into(),
+                });
+                let cells = cells.collect();
+                v.layout.sized.push(SizedLine {
+                    row: 8,
+                    scale: 3,
+                    cells,
+                });
+            }
+            v.scroll = 9 - usize::from(height);
+            on_match(&mut v, "needle", 0);
+            assert_eq!(v.search.matches[0].rows(), 8..9);
+            v.in_view()
+        };
+        // As text it is in view, so the view stays.
+        assert_eq!(go(5, false), 4..9);
+        // Larger it takes rows 8 to 10, and moves the view to put it a third
+        // of the way down, or lower when it would not all fit there.
+        assert_eq!(go(5, true), 7..12);
+        assert_eq!(go(4, true), 7..11);
+        assert_eq!(go(3, true), 8..11);
     }
 
     fn paragraphs(n: usize) -> String {

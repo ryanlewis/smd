@@ -744,4 +744,171 @@ mod tests {
         let bitmap = Bitmap::decode(&out).unwrap();
         assert_eq!(pixels_of(&bitmap), [[50, 50, 50, 0], [60, 60, 60, 255]]);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn map_reads_a_whole_file_and_refuses_an_empty_or_missing_one() {
+        let dir = std::env::temp_dir().join(format!("smd-raster-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let full = dir.join("full");
+        std::fs::write(&full, b"font bytes").unwrap();
+        let empty = dir.join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(map(full.to_str().unwrap()), Some(&b"font bytes"[..]));
+        assert_eq!(map(empty.to_str().unwrap()), None);
+        assert_eq!(map(dir.join("missing").to_str().unwrap()), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The characters the test emoji font maps, to glyphs 1 and 2. Any
+    /// other character is glyph 0.
+    const STAR: char = '\u{2605}';
+    const OPEN_STAR: char = '\u{2606}';
+
+    /// A colour emoji font of three glyphs with an `sbix` table: one strike
+    /// per entry of `strikes`, each its pixels per em and the PNG data for
+    /// each glyph, or `None` for a glyph with no image.
+    fn emoji_font(strikes: &[(u16, [Option<&[u8]>; 3])]) -> Emoji {
+        fn u16s(out: &mut Vec<u8>, values: &[u16]) {
+            for v in values {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        fn u32s(out: &mut Vec<u8>, values: &[u32]) {
+            for v in values {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+        }
+        let mut head = Vec::new();
+        u32s(&mut head, &[0x0001_0000, 0, 0, 0x5F0F_3CF5]);
+        u16s(&mut head, &[0, 1000]); // flags, units per em
+        head.resize(54, 0); // dates, bounds, style; short `loca` offsets
+        let mut hhea = Vec::new();
+        u32s(&mut hhea, &[0x0001_0000]);
+        u16s(&mut hhea, &[800, (-200i16) as u16]);
+        hhea.resize(34, 0);
+        u16s(&mut hhea, &[1]); // metrics count
+        let mut maxp = Vec::new();
+        u32s(&mut maxp, &[0x0000_5000]);
+        u16s(&mut maxp, &[3]);
+        // One Unicode subtable of format 6: two codes from STAR on.
+        let mut cmap = Vec::new();
+        u16s(&mut cmap, &[0, 1, 0, 3]);
+        u32s(&mut cmap, &[12]);
+        u16s(&mut cmap, &[6, 14, 0, STAR as u16, 2, 1, 2]);
+        let mut strike_data = Vec::new();
+        let mut strike_offsets = Vec::new();
+        let header = 8 + 4 * strikes.len() as u32;
+        for (ppem, images) in strikes {
+            strike_offsets.push(header + strike_data.len() as u32);
+            let mut strike = Vec::new();
+            u16s(&mut strike, &[*ppem, 72]);
+            let mut glyphs = Vec::new();
+            let mut offsets = Vec::new();
+            for image in images {
+                offsets.push(20 + glyphs.len() as u32);
+                if let Some(png) = image {
+                    u16s(&mut glyphs, &[0, 0]);
+                    glyphs.extend_from_slice(b"png ");
+                    glyphs.extend_from_slice(png);
+                }
+            }
+            offsets.push(20 + glyphs.len() as u32);
+            u32s(&mut strike, &offsets);
+            strike.extend(glyphs);
+            strike_data.extend(strike);
+        }
+        let mut sbix = Vec::new();
+        u16s(&mut sbix, &[1, 1]);
+        u32s(&mut sbix, &[strikes.len() as u32]);
+        u32s(&mut sbix, &strike_offsets);
+        sbix.extend(strike_data);
+        // Tables sorted by tag, each on a four-byte boundary.
+        let tables: [(&[u8; 4], Vec<u8>); 5] = [
+            (b"cmap", cmap),
+            (b"head", head),
+            (b"hhea", hhea),
+            (b"maxp", maxp),
+            (b"sbix", sbix),
+        ];
+        let mut font = Vec::new();
+        u32s(&mut font, &[0x0001_0000]);
+        u16s(&mut font, &[tables.len() as u16, 0, 0, 0]);
+        let mut offset = 12 + 16 * tables.len() as u32;
+        let mut body = Vec::new();
+        for (tag, data) in &tables {
+            font.extend_from_slice(*tag);
+            u32s(
+                &mut font,
+                &[0, offset + body.len() as u32, data.len() as u32],
+            );
+            body.extend_from_slice(data);
+            body.resize(body.len().next_multiple_of(4), 0);
+        }
+        offset += body.len() as u32;
+        font.extend(body);
+        assert_eq!(font.len() as u32, offset);
+        let data: &'static [u8] = font.leak();
+        Emoji(FontRef::try_from_slice(data).unwrap())
+    }
+
+    /// An opaque PNG of `width` by `height` in `colour`.
+    fn solid_png(width: u32, height: u32, colour: Rgba) -> Vec<u8> {
+        let mut canvas = Canvas::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                canvas.blend(i64::from(x), i64::from(y), colour, 1.0);
+            }
+        }
+        canvas.encode().unwrap()
+    }
+
+    #[test]
+    fn emoji_bitmap_comes_from_the_nearest_strike_at_or_above_the_size() {
+        let small = solid_png(2, 1, [255, 0, 0, 255]);
+        let large = solid_png(4, 2, [0, 0, 255, 255]);
+        let font = emoji_font(&[
+            (20, [None, Some(&small), None]),
+            (40, [None, Some(&large), None]),
+        ]);
+        let (bitmap, ppem) = font.bitmap(STAR, 20.0).unwrap();
+        assert_eq!((bitmap.width, bitmap.height, ppem), (2, 1, 20.0));
+        assert_eq!(pixels_of(&bitmap), [[255, 0, 0, 255]; 2]);
+        // A part pixel rounds up to the next strike.
+        let (bitmap, ppem) = font.bitmap(STAR, 20.5).unwrap();
+        assert_eq!((bitmap.width, bitmap.height, ppem), (4, 2, 40.0));
+        assert_eq!(pixels_of(&bitmap), [[0, 0, 255, 255]; 8]);
+        // Bigger than every strike takes the largest; nothing takes the
+        // smallest.
+        assert_eq!(font.bitmap(STAR, 500.0).unwrap().1, 40.0);
+        assert_eq!(font.bitmap(STAR, 0.0).unwrap().1, 20.0);
+        assert_eq!(font.bitmap(STAR, -3.0).unwrap().1, 20.0);
+    }
+
+    #[test]
+    fn emoji_bitmap_is_none_without_a_usable_image() {
+        let png = solid_png(1, 1, [0, 255, 0, 255]);
+        let font = emoji_font(&[(32, [None, Some(&png), None])]);
+        assert!(font.bitmap(STAR, 32.0).is_some());
+        // A glyph with no image, and a character the font does not map.
+        assert!(font.bitmap(OPEN_STAR, 32.0).is_none());
+        assert!(font.bitmap('a', 32.0).is_none());
+        // A strike that claims zero pixels per em.
+        let font = emoji_font(&[(0, [None, Some(&png), None])]);
+        assert!(font.bitmap(STAR, 32.0).is_none());
+        // Data marked as PNG that does not decode: the header is there,
+        // the image is not.
+        let font = emoji_font(&[(32, [None, Some(&png[..33]), None])]);
+        assert!(font.bitmap(STAR, 32.0).is_none());
+    }
+
+    #[test]
+    fn emoji_has_only_characters_the_font_maps_to_an_image() {
+        let png = solid_png(1, 1, [0, 255, 0, 255]);
+        // Glyph 0, for characters the font lacks, has an image too.
+        let font = emoji_font(&[(64, [Some(&png), Some(&png), None])]);
+        assert!(font.has(STAR));
+        assert!(!font.has(OPEN_STAR));
+        assert!(!font.has('a'));
+    }
 }

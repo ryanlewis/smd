@@ -2812,10 +2812,10 @@ mod tests {
         b.mouse(on_link(left, KeyModifiers::NONE));
         assert_eq!(b.path, dir.join("HOME.md"));
         enter(&mut b, KeyCode::Esc);
-        // Past the Forward button, the toolbar does nothing.
         b.mouse(on_link(left, KeyModifiers::NONE));
         assert_eq!(b.path, dir.join("Plan.md"));
         b.back();
+        // Past the Forward button, the toolbar does nothing.
         let past = (BACK_BUTTON.width() + FORWARD_BUTTON.width()) as u16;
         let toolbar = |column| MouseEvent {
             kind: left,
@@ -3221,16 +3221,12 @@ mod tests {
         enter(&mut b, KeyCode::Enter);
         assert_eq!(b.path, dir.join("sub/two.md"));
         assert_eq!(b.vault.root, dir);
-        // A note outside it has a vault of its own.
-        let far = dir
-            .parent()
-            .unwrap()
-            .join(format!("{}-far.md", dir.display()));
-        std::fs::write(&far, "far\n").unwrap();
+        // A note outside it has a vault of its own. Its text is given, so
+        // no file need be there.
+        let far = dir.with_file_name(format!("smd-far-{}.md", std::process::id()));
         b.show(far.clone(), "far\n", false);
+        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(b.vault.root, far.parent().unwrap());
-        let _ = std::fs::remove_file(far);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3538,16 +3534,18 @@ mod tests {
     #[test]
     fn a_count_before_tab_goes_round_as_that_many_tabs_do() {
         let md = "[a](a.md) [b](b.md) [c](c.md)\n";
-        for times in 1..=8 {
-            let mut one_by_one = new_view(md);
-            one_by_one.resize(40, 5);
-            for _ in 0..times {
-                one_by_one.act(Action::PrevLink);
+        for action in [Action::NextLink, Action::PrevLink] {
+            for times in 1..=8 {
+                let mut one_by_one = new_view(md);
+                one_by_one.resize(40, 5);
+                for _ in 0..times {
+                    one_by_one.act(action);
+                }
+                let mut counted = new_view(md);
+                counted.resize(40, 5);
+                counted.act_counted(action, Some(times));
+                assert_eq!(counted.selected, one_by_one.selected, "{action:?} {times}");
             }
-            let mut counted = new_view(md);
-            counted.resize(40, 5);
-            counted.act_counted(Action::PrevLink, Some(times));
-            assert_eq!(counted.selected, one_by_one.selected, "{times}");
         }
     }
 

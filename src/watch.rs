@@ -179,6 +179,21 @@ mod tests {
     }
 
     #[test]
+    fn a_path_that_cannot_be_looked_at_is_unreadable_not_deleted() {
+        let dir = scratch("not-a-dir");
+        let path = dir.join("parent/a.md");
+        let mut w = Watcher::new(path.clone());
+        // Its folder is now a file, so the path is not missing but cannot
+        // be looked at.
+        fs::write(dir.join("parent"), "x").unwrap();
+        let Some(Change::Unreadable(err)) = settle(&mut w) else {
+            panic!("not reported as unreadable");
+        };
+        assert!(!err.is_empty());
+        assert_eq!(w.check(), None);
+    }
+
+    #[test]
     fn half_written_save_is_not_reported() {
         let dir = scratch("truncate");
         let path = dir.join("a.md");

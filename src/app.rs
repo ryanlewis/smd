@@ -939,12 +939,13 @@ fn hyperlink(cell: &mut Cell, id: usize, url: &str) {
 /// A `file://` address for `path`, with the bytes a URL cannot hold as is
 /// escaped.
 fn file_url(path: &Path) -> String {
+    use std::fmt::Write as _;
     let mut url = String::from("file://");
     for &b in path.as_os_str().as_encoded_bytes() {
         if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
             url.push(b as char);
         } else {
-            url.push_str(&format!("%{b:02X}"));
+            let _ = write!(url, "%{b:02X}");
         }
     }
     url

@@ -166,6 +166,7 @@ fn fetch(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>, String> 
 /// and a double quote in it. Others, such as letters outside ASCII, are sent
 /// as they are.
 fn escaped(url: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(url.len());
     let mut query = false;
     for c in url.chars() {
@@ -174,7 +175,7 @@ fn escaped(url: &str) -> String {
             || matches!(c, ' ' | '<' | '>')
             || c == if query { '"' } else { '`' };
         if refused {
-            out.push_str(&format!("%{:02X}", u32::from(c)));
+            let _ = write!(out, "%{:02X}", u32::from(c));
         } else {
             out.push(c);
         }

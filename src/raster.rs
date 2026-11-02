@@ -486,7 +486,7 @@ pub fn ink(font: &FontVec, size: f32, x: f32, text: &str) -> Option<[f32; 4]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -762,13 +762,13 @@ mod tests {
 
     /// The characters the test emoji font maps, to glyphs 1 and 2. Any
     /// other character is glyph 0.
-    const STAR: char = '\u{2605}';
-    const OPEN_STAR: char = '\u{2606}';
+    pub(crate) const STAR: char = '\u{2605}';
+    pub(crate) const OPEN_STAR: char = '\u{2606}';
 
     /// A colour emoji font of three glyphs with an `sbix` table: one strike
     /// per entry of `strikes`, each its pixels per em and the PNG data for
     /// each glyph, or `None` for a glyph with no image.
-    fn emoji_font(strikes: &[(u16, [Option<&[u8]>; 3])]) -> Emoji {
+    pub(crate) fn emoji_font(strikes: &[(u16, [Option<&[u8]>; 3])]) -> Emoji {
         let mut strike_data = Vec::new();
         let mut strike_offsets = Vec::new();
         let header = 8 + 4 * strikes.len() as u32;
@@ -876,10 +876,17 @@ mod tests {
     /// A font whose glyphs are squares on whole pixels at size 10, where a
     /// unit is a hundredth of a pixel. 'a' is ink from 1 to 5 pixels across
     /// and 0 to 4 up, with an advance of 6. 'b' is ink from 0 to 3 across
-    /// and 0 to 7 up, with an advance of 4. 'b' after 'a' moves 2 pixels
+    /// and 0 to 7 up, with an advance of 4. 'c' is ink from 0 to 2 across,
+    /// 3 up to 4 down, with an advance of 3. 'b' after 'a' moves 2 pixels
     /// left. Any other character has no ink and no advance.
-    fn square_font() -> FontVec {
-        let squares: [[i16; 4]; 2] = [[100, 0, 500, 400], [0, 0, 300, 700]];
+    pub(crate) fn square_font() -> FontVec {
+        square_font_from('a')
+    }
+
+    /// The glyphs of [`square_font`] for `first` and the two characters
+    /// after it.
+    pub(crate) fn square_font_from(first: char) -> FontVec {
+        let squares: [[i16; 4]; 3] = [[100, 0, 500, 400], [0, 0, 300, 700], [0, -400, 200, 300]];
         let mut glyf = Vec::new();
         let mut loca = vec![0u16, 0];
         for [x0, y0, x1, y1] in squares {
@@ -894,12 +901,12 @@ mod tests {
         let mut loca_bytes = Vec::new();
         u16s(&mut loca_bytes, &loca);
         let mut hmtx = Vec::new();
-        i16s(&mut hmtx, &[0, 0, 600, 100, 400, 0]);
+        i16s(&mut hmtx, &[0, 0, 600, 100, 400, 0, 300, 0]);
         // One horizontal subtable of format 0 with one pair.
         let mut kern = Vec::new();
         u16s(&mut kern, &[0, 1, 0, 20, 1, 1, 6, 0, 0, 1, 2]);
         i16s(&mut kern, &[-200]);
-        let mut tables = base_tables(3, 3, 'a', &[1, 2]);
+        let mut tables = base_tables(4, 4, first, &[1, 2, 3]);
         tables.extend([
             (*b"glyf", glyf),
             (*b"hmtx", hmtx),
@@ -910,7 +917,7 @@ mod tests {
     }
 
     /// An opaque PNG of `width` by `height` in `colour`.
-    fn solid_png(width: u32, height: u32, colour: Rgba) -> Vec<u8> {
+    pub(crate) fn solid_png(width: u32, height: u32, colour: Rgba) -> Vec<u8> {
         let mut canvas = Canvas::new(width, height);
         for y in 0..height {
             for x in 0..width {

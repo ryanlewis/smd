@@ -801,6 +801,14 @@ fn unspaced_definitions(
     }
 }
 
+/// Where `tag`, from an HTML block `html` at `span`, is in the source: exact
+/// at the top level, and in order inside a quote or list, whose markers the
+/// HTML has lost.
+fn tag_offset(tag: &html::Tag, html: &str, span: &Range<usize>) -> usize {
+    let offset = tag.raw.as_ptr() as usize - html.as_ptr() as usize;
+    (span.start + offset).min(span.end)
+}
+
 struct Builder<'a> {
     source: &'a str,
     stack: Vec<Frame>,
@@ -813,9 +821,9 @@ struct Builder<'a> {
     /// wiki embed.
     image: Option<(String, String, bool)>,
     image_depth: u32,
-    /// Whether an image left out of the alt text being read has left a gap
-    /// whose space is not yet taken out.
-    alt_gap: bool,
+    /// Whether an image left out has left a gap whose space is not yet
+    /// taken out.
+    gap: bool,
     /// Images ending with this are left out.
     hide: Option<&'static str>,
     /// How deep in an image being left out.
@@ -870,6 +878,13 @@ impl Open {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
 }
+
+/// The most frames deep a block that holds others nests; deeper ones give
+/// their blocks to the one around them. A list takes two frames, a list
+/// and an item, so lists nest about half as deep. Far deeper than real
+/// documents nest, and shallow enough that drawing and dropping the
+/// blocks, which recurse, cannot run out of stack.
+const MAX_DEPTH: usize = 100;
 
 struct Frame {
     kind: FrameKind,
@@ -1026,7 +1041,7 @@ impl<'a> Builder<'a> {
             in_table: false,
             image: None,
             image_depth: 0,
-            alt_gap: false,
+            gap: false,
             hide: None,
             hidden: 0,
             colon: None,
@@ -1173,50 +1188,13 @@ impl<'a> Builder<'a> {
     }
 
     fn event(&mut self, event: Event, range: Range<usize>) {
-        // Whatever is all inside a comment is hidden.
-        if in_comment(&self.comments, &range) {
-            self.top().left_out = true;
-            // A callout's title still ends at its line.
-            if matches!(event, Event::SoftBreak | Event::HardBreak) {
-                self.ends_title(range.end);
-            }
-            return;
-        }
-        // A table is kept whole as source text, so skip its contents.
-        if self.in_table {
-            if matches!(event, Event::End(TagEnd::Table)) {
-                self.in_table = false;
-            }
-            return;
-        }
-        // An image left out takes its alt text with it.
-        if self.hidden > 0 {
-            match event {
-                Event::Start(Tag::Image { .. }) => self.hidden += 1,
-                Event::End(TagEnd::Image) => {
-                    self.hidden -= 1;
-                    self.alt_gap = self.hidden == 0 && self.image.is_some();
-                }
-                _ => {}
-            }
+        if self.skipped(&event, &range) {
             return;
         }
         match event {
             Event::Start(tag) => self.start(tag, range),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) => match &mut self.top().kind {
-                FrameKind::Code { code, .. } => code.push_str(&text),
-                _ => {
-                    let text = match typed_dashes(self.source, range.clone()) {
-                        Some(typed) => Cow::Borrowed(typed),
-                        None => match self.colon {
-                            Some(colon) => Cow::Owned(text.replace(colon, ":")),
-                            None => Cow::Borrowed(&*text),
-                        },
-                    };
-                    self.prose(&text, range);
-                }
-            },
+            Event::Text(text) => self.text_event(&text, range),
             Event::Html(html) => match &mut self.top().kind {
                 FrameKind::Html(buf) => buf.push_str(&html),
                 _ => self.text(&html, self.style(), range),
@@ -1233,6 +1211,56 @@ impl<'a> Builder<'a> {
             Event::HardBreak => self.inline(Inline::Break, range),
             Event::Rule => self.push_block(BlockKind::Rule, range),
             Event::TaskListMarker(done) => self.mark_task(done, range),
+        }
+    }
+
+    /// Whether `event` is skipped: it is all inside a comment, inside a
+    /// table, or inside an image left out.
+    fn skipped(&mut self, event: &Event, range: &Range<usize>) -> bool {
+        // Whatever is all inside a comment is hidden.
+        if in_comment(&self.comments, range) {
+            self.top().left_out = true;
+            // A callout's title still ends at its line.
+            if matches!(event, Event::SoftBreak | Event::HardBreak) {
+                self.ends_title(range.end);
+            }
+            return true;
+        }
+        // A table is kept whole as source text, so skip its contents.
+        if self.in_table {
+            if matches!(event, Event::End(TagEnd::Table)) {
+                self.in_table = false;
+            }
+            return true;
+        }
+        // An image left out takes its alt text with it.
+        if self.hidden > 0 {
+            match event {
+                Event::Start(Tag::Image { .. }) => self.hidden += 1,
+                Event::End(TagEnd::Image) => {
+                    self.hidden -= 1;
+                    self.gap = self.hidden == 0;
+                }
+                _ => {}
+            }
+            return true;
+        }
+        false
+    }
+
+    fn text_event(&mut self, text: &str, range: Range<usize>) {
+        match &mut self.top().kind {
+            FrameKind::Code { code, .. } => code.push_str(text),
+            _ => {
+                let text = match typed_dashes(self.source, range.clone()) {
+                    Some(typed) => Cow::Borrowed(typed),
+                    None => match self.colon {
+                        Some(colon) => Cow::Owned(text.replace(colon, ":")),
+                        None => Cow::Borrowed(text),
+                    },
+                };
+                self.prose(&text, range);
+            }
         }
     }
 
@@ -1344,6 +1372,7 @@ impl<'a> Builder<'a> {
             self.top().other_inline = true;
         }
         self.push_text("[image: ", self.style(), range);
+        self.gap = false;
         self.image_depth += 1;
         if self.image_depth == 1 {
             self.image = Some((image_src(dest, wiki), String::new(), wiki));
@@ -1390,7 +1419,7 @@ impl<'a> Builder<'a> {
             return;
         }
         // An image left out at the end of an image's alt text leaves no space.
-        if std::mem::take(&mut self.alt_gap)
+        if std::mem::take(&mut self.gap)
             && let Some((_, alt, _)) = &mut self.image
             && alt.ends_with(char::is_whitespace)
         {
@@ -1498,7 +1527,11 @@ impl<'a> Builder<'a> {
             },
             FrameKind::Definition => {
                 frame.flush_inlines();
-                self.add_definition(frame.blocks, span);
+                if self.too_deep() {
+                    self.top().blocks.extend(frame.blocks);
+                } else {
+                    self.add_definition(frame.blocks, span);
+                }
                 return;
             }
             FrameKind::Code { lang, code } => code_block(lang, code),
@@ -1518,7 +1551,7 @@ impl<'a> Builder<'a> {
                     open,
                     blocks: frame.blocks,
                 };
-                self.push_block(kind, span.start..span.end.max(end));
+                self.push_nested(kind, span.start..span.end.max(end));
                 return;
             }
             FrameKind::Html(html) => {
@@ -1536,7 +1569,49 @@ impl<'a> Builder<'a> {
                 items,
             },
         };
-        self.push_block(kind, span);
+        self.push_nested(kind, span);
+    }
+
+    /// Whether a block closing now is nested deeper than `MAX_DEPTH`.
+    fn too_deep(&self) -> bool {
+        self.stack.len() >= MAX_DEPTH
+    }
+
+    /// Add a block that may hold others to the block around it. Nested too
+    /// deep to draw, what it holds goes there instead, after its title.
+    fn push_nested(&mut self, kind: BlockKind, span: Range<usize>) {
+        if !self.too_deep() {
+            return self.push_block(kind, span);
+        }
+        let paragraph = |inlines: Vec<Inline>| Block {
+            kind: BlockKind::Paragraph(inlines),
+            span: span.clone(),
+        };
+        let blocks = match kind {
+            BlockKind::Quote(blocks) => blocks,
+            BlockKind::Callout { callout, blocks } => {
+                let mut all = vec![paragraph(callout.title)];
+                all.extend(blocks);
+                all
+            }
+            BlockKind::Details {
+                summary, blocks, ..
+            } => {
+                let mut all = vec![paragraph(summary)];
+                all.extend(blocks);
+                all
+            }
+            BlockKind::Definition { term, definitions } => {
+                let mut all = vec![paragraph(term)];
+                all.extend(definitions.into_iter().flatten());
+                all
+            }
+            BlockKind::List { items, .. } => items.into_iter().flat_map(|i| i.blocks).collect(),
+            kind => vec![Block { kind, span }],
+        };
+        let top = self.top();
+        top.flush_inlines();
+        top.blocks.extend(blocks);
     }
 
     /// The `<details>` just under the lists and items on top of the stack,
@@ -1593,7 +1668,7 @@ impl<'a> Builder<'a> {
             if self.hidden > 0 {
                 // Left out for the theme: there are no events to skip.
                 self.hidden = 0;
-                self.alt_gap = self.image.is_some();
+                self.gap = true;
             } else {
                 self.text(tag.attr("alt").unwrap_or(""), self.style(), range);
                 self.end_image();
@@ -1619,8 +1694,8 @@ impl<'a> Builder<'a> {
     /// `<summary>` as the title. Any other block is kept as its source.
     fn html_block(&mut self, html: &str, span: Range<usize>) {
         let pieces = html::without_comments(html::pieces(html));
-        let tag_is = |p: &Piece, names: &[&str]| matches!(p, Piece::Tag(t) if names.contains(&t.name.as_str()));
-        let details = pieces.iter().any(|p| tag_is(p, &["details", "summary"]));
+        let fold_tag = |p: &Piece| matches!(p, Piece::Tag(t) if matches!(t.name.as_str(), "details" | "summary"));
+        let details = pieces.iter().any(fold_tag);
         let inline = pieces.iter().all(|p| match p {
             Piece::Tag(t) => {
                 matches!(t.name.as_str(), "p" | "br" | "img" | "details" | "summary")
@@ -1629,24 +1704,12 @@ impl<'a> Builder<'a> {
             _ => true,
         });
         if !inline && !details {
-            let kept: String = pieces
-                .iter()
-                .map(|p| match p {
-                    Piece::Text(t) | Piece::Comment(t) => *t,
-                    Piece::Tag(t) => t.raw,
-                })
-                .collect();
+            let kept: String = pieces.iter().map(Piece::source).collect();
             if !kept.trim().is_empty() {
                 self.push_block(BlockKind::Html(kept), span);
             }
             return;
         }
-        // Where a tag is in the source: exact at the top level, and in order
-        // inside a quote or list, whose markers the HTML has lost.
-        let at = |tag: &html::Tag| {
-            let offset = tag.raw.as_ptr() as usize - html.as_ptr() as usize;
-            (span.start + offset).min(span.end)
-        };
         self.top().flush_inlines();
         // Whether a paragraph is open on top of the stack, and whether it is
         // a summary.
@@ -1654,70 +1717,81 @@ impl<'a> Builder<'a> {
         // Other HTML around a `<details>`, kept as its source.
         let mut raw = String::new();
         for piece in pieces {
-            let fold_tag = tag_is(&piece, &["details", "summary"]);
-            if !inline && part != Some(true) && !fold_tag {
-                match piece {
-                    Piece::Text(t) | Piece::Comment(t) => raw.push_str(t),
-                    Piece::Tag(t) => raw.push_str(t.raw),
-                }
+            if !inline && part != Some(true) && !fold_tag(&piece) {
+                raw.push_str(piece.source());
                 continue;
             }
             self.push_raw_html(&mut raw, span.clone());
-            let tag = match piece {
-                Piece::Comment(_) => continue,
+            match piece {
+                Piece::Comment(_) => {}
+                Piece::Text(text) if part.is_none() && text.trim().is_empty() => {}
                 Piece::Text(text) => {
-                    if part.is_none() && text.trim().is_empty() {
-                        continue;
-                    }
                     self.open_html_part(&mut part, false, span.clone());
                     self.html_text(text, span.clone());
-                    continue;
                 }
-                Piece::Tag(tag) => tag,
-            };
-            let in_details = matches!(self.top().kind, FrameKind::Details { .. });
-            match (tag.name.as_str(), tag.close) {
-                ("p", _) if part == Some(false) => self.end_html_part(&mut part),
-                ("p", _) => {}
-                ("details", false) => {
-                    self.end_html_part(&mut part);
-                    let kind = FrameKind::Details {
-                        summary: Vec::new(),
-                        open: tag.attr("open").is_some(),
-                        ended: false,
-                    };
-                    let from = at(&tag);
-                    self.stack.push(Frame::new(kind, from..span.end));
-                }
-                ("details", true) => {
-                    self.end_html_part(&mut part);
-                    let end = at(&tag) + tag.raw.len();
-                    if matches!(self.top().kind, FrameKind::Details { .. }) {
-                        self.top().span.end = end;
-                        self.close();
-                    } else if let Some(frame) = self.details_around_list() {
-                        // An indented `</details>` after a list is read as
-                        // part of its last item.
-                        frame.span.end = end;
-                        if let FrameKind::Details { ended, .. } = &mut frame.kind {
-                            *ended = true;
-                        }
-                    }
-                }
-                ("summary", false) if part.is_none() && in_details => {
-                    self.open_html_part(&mut part, true, span.clone());
-                }
-                ("summary", true) if part == Some(true) => self.end_html_part(&mut part),
-                _ => {
-                    self.open_html_part(&mut part, false, span.clone());
-                    if !self.html_tag(&tag, span.clone()) {
-                        self.text(tag.raw, self.style(), span.clone());
-                    }
-                }
+                Piece::Tag(tag) => self.html_block_tag(&tag, &mut part, html, &span),
             }
         }
         self.end_html_part(&mut part);
         self.push_raw_html(&mut raw, span);
+    }
+
+    /// A tag in an HTML block read as markdown, `html`, from `span`. `part`
+    /// is whether a paragraph is open on top of the stack, and whether it is
+    /// a summary.
+    fn html_block_tag(
+        &mut self,
+        tag: &html::Tag,
+        part: &mut Option<bool>,
+        html: &str,
+        span: &Range<usize>,
+    ) {
+        match (tag.name.as_str(), tag.close) {
+            ("p", _) if *part == Some(false) => self.end_html_part(part),
+            ("p", _) => {}
+            ("details", false) => {
+                self.end_html_part(part);
+                let kind = FrameKind::Details {
+                    summary: Vec::new(),
+                    open: tag.attr("open").is_some(),
+                    ended: false,
+                };
+                let from = tag_offset(tag, html, span);
+                self.stack.push(Frame::new(kind, from..span.end));
+            }
+            ("details", true) => {
+                self.end_html_part(part);
+                self.end_details(tag_offset(tag, html, span) + tag.raw.len());
+            }
+            ("summary", false)
+                if part.is_none() && matches!(self.top().kind, FrameKind::Details { .. }) =>
+            {
+                self.open_html_part(part, true, span.clone());
+            }
+            ("summary", true) if *part == Some(true) => self.end_html_part(part),
+            _ => {
+                self.open_html_part(part, false, span.clone());
+                if !self.html_tag(tag, span.clone()) {
+                    self.text(tag.raw, self.style(), span.clone());
+                }
+            }
+        }
+    }
+
+    /// End at `end` the `<details>` on top of the stack, or the one around
+    /// the list on top. A `</details>` with neither does nothing.
+    fn end_details(&mut self, end: usize) {
+        if matches!(self.top().kind, FrameKind::Details { .. }) {
+            self.top().span.end = end;
+            self.close();
+        } else if let Some(frame) = self.details_around_list() {
+            // An indented `</details>` after a list is read as part of its
+            // last item.
+            frame.span.end = end;
+            if let FrameKind::Details { ended, .. } = &mut frame.kind {
+                *ended = true;
+            }
+        }
     }
 
     /// Push HTML kept as its source, if there is any.
@@ -1922,15 +1996,27 @@ impl<'a> Builder<'a> {
         if let Some((_, alt, _)) = &mut self.image {
             // An image left out of it leaves one space at most.
             let mut text = text;
-            if self.alt_gap && (alt.is_empty() || alt.ends_with(char::is_whitespace)) {
+            if self.gap && (alt.is_empty() || alt.ends_with(char::is_whitespace)) {
                 text = text.trim_start();
             }
             if !text.is_empty() {
-                self.alt_gap = false;
+                self.gap = false;
             }
             alt.push_str(text);
             return self.push_text(text, style, range);
-        } else if !text.trim().is_empty() {
+        }
+        // An image left out between words leaves one space. Code keeps its
+        // spaces.
+        let mut text = text;
+        if std::mem::take(&mut self.gap)
+            && !style.code
+            && let Some(Inline::Text { text: last, .. }) = self.top().inlines.last()
+            && last.ends_with(|c: char| c.is_ascii_whitespace())
+        {
+            // Not a no-break space, which keeps its words together.
+            text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        }
+        if !text.trim().is_empty() {
             self.top().other_inline = true;
         }
         self.push_text(text, style, range);
@@ -2993,6 +3079,38 @@ paragraph @23..37
         );
         // With no theme known, both logos stay.
         assert_eq!(parse_for(md, None).blocks, parse(md).blocks);
+    }
+
+    #[test]
+    fn a_logo_left_out_between_words_leaves_one_space() {
+        let md = "x ![b](b.png#gh-light-mode-only) y\n";
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..35\n  \"x y\"\n");
+        let md = "x <img src=\"b.png#gh-light-mode-only\"> y\n";
+        assert_eq!(themed(md, Theme::Dark), "paragraph @0..41\n  \"x y\"\n");
+        // Inside alt text, the gap is closed by the text after it.
+        let md = "![a ![b](b.png#gh-light-mode-only) c ` x`](l.png)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "image \"l.png\" alt=\"a c  x\" wiki=false @0..50\n"
+        );
+        // A no-break space after it stays.
+        let md = "x ![b](b.png#gh-light-mode-only)\u{a0}y\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..36\n  \"x \\u{a0}y\"\n"
+        );
+        // Code after it keeps its spaces.
+        let md = "x ![b](b.png#gh-light-mode-only)` a` y\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..39\n  \"x \"\n  \" a\" code\n  \" y\"\n"
+        );
+        // The alt text of an image after it keeps its space.
+        let md = "x ![b](b.png#gh-light-mode-only) ![ c](l.png)\n";
+        assert_eq!(
+            themed(md, Theme::Dark),
+            "paragraph @0..46\n  \"x [image:  c]\"\n"
+        );
     }
 
     #[test]
@@ -4354,5 +4472,75 @@ paragraph @51..57
             "<p>a</summary> b</p>\n",
             "paragraph @0..21\n  \"a</summary> b\"\n",
         );
+    }
+
+    /// The text of each paragraph in `blocks`, with how deep it is.
+    fn deep_texts(blocks: &[Block], depth: usize, out: &mut Vec<(usize, String)>) {
+        let words = |inlines: &[Inline]| {
+            let text = inlines.iter().map(|i| match i {
+                Inline::Text { text, .. } => text.as_str(),
+                _ => "",
+            });
+            text.collect::<String>()
+        };
+        for block in blocks {
+            match &block.kind {
+                BlockKind::Paragraph(inlines) => out.push((depth, words(inlines))),
+                BlockKind::Quote(inner) => deep_texts(inner, depth + 1, out),
+                BlockKind::Callout { callout, blocks } => {
+                    out.push((depth, words(&callout.title)));
+                    deep_texts(blocks, depth + 1, out);
+                }
+                BlockKind::Details {
+                    summary, blocks, ..
+                } => {
+                    out.push((depth, words(summary)));
+                    deep_texts(blocks, depth + 1, out);
+                }
+                BlockKind::Definition { term, definitions } => {
+                    out.push((depth, words(term)));
+                    for blocks in definitions {
+                        deep_texts(blocks, depth + 1, out);
+                    }
+                }
+                BlockKind::List { items, .. } => {
+                    for item in items {
+                        deep_texts(&item.blocks, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_nested_too_deep_join_the_deepest_level_after_their_titles() {
+        let n = 150;
+        let mut details = String::new();
+        for i in 0..n {
+            details.push_str(&format!("<details><summary>s{i}</summary>\n\n"));
+        }
+        details.push_str("deep\n\n");
+        details.push_str(&"</details>\n\n".repeat(n));
+        let mut defs = String::new();
+        for i in 0..n {
+            let pad = "  ".repeat(i);
+            defs.push_str(&format!("{pad}t{i}\n{pad}: d{i}\n\n"));
+        }
+        let callout = format!("{}[!note] title\n{}body\n", "> ".repeat(n), "> ".repeat(n));
+        let list = format!("{}a\n{}- b\n", "- ".repeat(n), "  ".repeat(n - 1));
+        let at = |d: usize, texts: &[&str]| -> Vec<(usize, String)> {
+            texts.iter().map(|t| (d, t.to_string())).collect()
+        };
+        for (md, want) in [
+            (details, at(99, &["s148", "s149", "deep"])),
+            (defs, at(49, &["d148", "t149", "d149"])),
+            (callout, at(99, &["title", "body"])),
+            (list, at(50, &["a", "b"])),
+        ] {
+            let mut out = Vec::new();
+            deep_texts(&parse(&md).blocks, 0, &mut out);
+            assert_eq!(out[out.len() - want.len()..], want);
+        }
     }
 }

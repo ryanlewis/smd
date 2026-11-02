@@ -1315,4 +1315,72 @@ mod tests {
         let dests: Vec<&str> = table.links.iter().map(|l| l.dest.as_str()).collect();
         assert_eq!(dests, ["y"]);
     }
+
+    #[test]
+    fn long_words_break_the_same_whatever_their_characters() {
+        let cases: &[(&str, usize, &[&str], usize)] = &[
+            (
+                "abcdefghijklmnopqrstuvwxyz0123456789",
+                10,
+                &["abcdefghij", "klmnopqrst", "uvwxyz0123", "456789"],
+                3,
+            ),
+            (
+                "日本語のテキストがとても長い単語です",
+                7,
+                &["日本語", "のテキ", "ストが", "とても", "長い単", "語です"],
+                5,
+            ),
+            (
+                "❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}",
+                3,
+                &["❤\u{fe0f}"; 5],
+                4,
+            ),
+            (
+                "👨\u{200d}👩\u{200d}👧👨\u{200d}👩\u{200d}👧👨\u{200d}👩\u{200d}👧",
+                3,
+                &["👨\u{200d}👩\u{200d}👧"; 3],
+                2,
+            ),
+            (
+                "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+                3,
+                &[
+                    "e\u{301}e\u{301}e\u{301}",
+                    "e\u{301}e\u{301}e\u{301}",
+                    "e\u{301}",
+                ],
+                2,
+            ),
+            (
+                "path/to/some/very/long/file_name.txt",
+                9,
+                &["path/to/", "some/", "very/", "long/", "file_", "name.txt"],
+                0,
+            ),
+            // Lam and alef together are one column, so the rest fits.
+            ("لالالالالالا", 3, &["لال", "الا", "لالالا"], 2),
+            ("a日b本c語d", 2, &["a", "日", "b", "本", "c", "語", "d"], 6),
+        ];
+        for &(word, width, lines, hard) in cases {
+            let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            assert_eq!(wrapped(word, width), (lines, hard), "{word:?}");
+        }
+        let table = Table::parse(
+            "| k | v |\n|-|-|\n| a | abcdefghijklmnopqrstuvwxyz日本語のテキスト0123456789 |\n",
+        );
+        assert_eq!(
+            plain(&table, 20),
+            [
+                "────────────────────",
+                "k: a",
+                "v: abcdefghijklmnopq",
+                "   rstuvwxyz日本語の",
+                "   テキスト012345678",
+                "   9",
+                "────────────────────"
+            ]
+        );
+    }
 }

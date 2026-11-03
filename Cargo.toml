@@ -28,7 +28,7 @@ png = { version = "=0.17.16", default-features = false }
 # already uses it, so it adds no crates.
 imagesize = { version = "=0.14.0", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 resvg = { version = "=0.47.0", default-features = false, features = ["text", "raster-images"] }
-pulldown-cmark = { version = "=0.13.5", default-features = false }
+pulldown-cmark = { version = "=0.13.6", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }

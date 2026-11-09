@@ -27,7 +27,7 @@ jobs:
       # This job holds signing keys and the tap token, so it may only reach
       # the hosts below. If a step fails on a blocked connection, the
       # harden-runner report linked from the run names the host.
-      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: block
           allowed-endpoints: >
@@ -75,7 +75,7 @@ jobs:
           mirror: https://pkg.machengine.org/zig
           use-cache: false
 
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cargo-zigbuild@0.24.0
 
@@ -92,10 +92,10 @@ jobs:
             exit 1
           fi
 
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
-          version: v2.18.3
+          version: v2.19.0
           # Notarization waits on Apple's queue, which can pass the 30m default.
           args: release --clean --timeout 60m
         # Secrets go to this step only, so other steps and what they download

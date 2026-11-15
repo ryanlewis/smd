@@ -2,6 +2,14 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["github>ryanlewis/renovate-config"],
   "enabledManagers": ["github-actions", "cargo", "custom.regex"],
+  "packageRules": [
+    {
+      "description": "merman in a PR of its own: a new merman can draw diagrams differently, so its PR must also bump VERSION in src/mermaid.rs, or cached diagrams from the old one stay in use.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["merman"],
+      "groupName": "merman"
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",

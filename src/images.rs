@@ -833,7 +833,7 @@ fn svg_fonts() -> &'static Arc<Database> {
                 .map(|(name, _)| name.clone())
         };
         if let Some((regular, bold)) = raster::sans_files() {
-            let _ = db.load_font_file(regular);
+            load_font(&mut db, regular);
             if let Some(sans) = family(&db) {
                 db.set_sans_serif_family(&sans);
                 db.set_serif_family(&sans);
@@ -841,17 +841,26 @@ fn svg_fonts() -> &'static Arc<Database> {
                 db.set_fantasy_family(&sans);
             }
             if let Some(bold) = bold {
-                let _ = db.load_font_file(bold);
+                load_font(&mut db, bold);
             }
         }
         if let Some(mono) = raster::mono_file() {
-            let _ = db.load_font_file(mono);
+            load_font(&mut db, mono);
             if let Some(mono) = family(&db) {
                 db.set_monospace_family(mono);
             }
         }
         Arc::new(db)
     })
+}
+
+/// Add the font file at `path` to `db`. A file that cannot be read is
+/// skipped. It is read here rather than by fontdb, whose file loading needs
+/// its `fs` feature, which smd would otherwise only get through another crate.
+fn load_font(db: &mut Database, path: &str) {
+    if let Ok(data) = std::fs::read(path) {
+        db.load_font_data(data);
+    }
 }
 
 /// A JPEG in the colours the decoder gives, refused before it is decoded

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use merman::svg::export::{NativeFontOptions, RasterOptions};
 use merman::{
-    Engine, MermaidConfig, OperationControl, PngRequest, RenderOutput, RenderRequest,
-    SvgEnvironment, SvgRequest,
+    MermaidConfig, MermaidEngine, OperationControl, PngRequest, RenderOutput, RenderRequest,
+    SourcePresentationConfig, SvgEnvironment, SvgRequest,
 };
 use serde::Deserialize;
 
@@ -31,7 +31,7 @@ const SCALE: u8 = 2;
 
 /// Part of every cache name. Change it when the way diagrams are drawn
 /// changes, so old files are not used.
-const VERSION: &str = "2";
+const VERSION: &str = "3";
 
 /// Default size cap of the disk cache.
 const CACHE_CAP: u64 = 100 * 1024 * 1024;
@@ -137,8 +137,7 @@ fn draw(
 /// Draw `source` with merman, in mermaid's own theme for `theme`, on a clear
 /// background.
 fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
-    let config = MermaidConfig::from_value(serde_json::json!({ "theme": mermaid_theme(theme) }));
-    let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
+    let renderer = merman_renderer(mermaid_theme(theme));
     let request = PngRequest {
         svg: SvgRequest {
             environment: environment().clone(),
@@ -148,10 +147,18 @@ fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
     };
     let control = OperationControl::new().with_deadline(TIMEOUT);
     match renderer.render(RenderRequest::png(source, control, request)) {
-        Ok(RenderOutput::Png(Some(png))) => Ok(png.bytes),
+        Ok(RenderOutput::Png(Some(png))) => Ok(png.into_bytes()),
         Ok(_) => Err("mermaid: not a diagram merman knows".to_string()),
         Err(e) => Err(format!("mermaid: {e}")),
     }
+}
+
+/// A merman renderer that draws in mermaid's theme named `theme`.
+fn merman_renderer(theme: &str) -> merman::Renderer {
+    let config = MermaidConfig::from_value(serde_json::json!({ "theme": theme }));
+    let engine =
+        MermaidEngine::new().with_site_config(SourcePresentationConfig::from_config(config));
+    merman::Renderer::new().with_presentation_engine(engine)
 }
 
 /// How merman measures text: in [`raster::sans_files`], read once. They are
@@ -737,9 +744,9 @@ mod tests {
         // Change VERSION, and these, when drawing changes on purpose.
         let source = "graph LR\n  A-->B\n";
         let dark = name_for(source, Theme::Dark, Renderer::Builtin);
-        assert_eq!(dark, "dark-c8e135bf1a48abef");
+        assert_eq!(dark, "dark-2efb365feb2fcf48");
         let light = name_for(source, Theme::Light, Renderer::Builtin);
-        assert_eq!(light, "light-9e650fbb3e2765e7");
+        assert_eq!(light, "light-6599728222352e2e");
         // Drawn by mmdc, a diagram has a cache file of its own.
         assert_ne!(name_for(source, Theme::Dark, Renderer::Mmdc), dark);
         // Nothing is set in tests, so diagrams are drawn by merman.
@@ -808,18 +815,16 @@ mod tests {
         assert_ne!(environment().text_measurement_routes(), estimates);
         // The same diagram measured with merman's estimates instead.
         let source = "flowchart LR\n  A[A label wide enough to measure] --> B[Done]\n";
-        let config = MermaidConfig::from_value(serde_json::json!({ "theme": "dark" }));
-        let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
+        let renderer = merman_renderer("dark");
         let request = PngRequest {
             svg: SvgRequest::default(),
             options: RasterOptions::default().with_scale(f32::from(SCALE)),
         };
         let control = OperationControl::new().with_deadline(TIMEOUT);
-        let Ok(RenderOutput::Png(Some(estimated))) =
-            renderer.render(RenderRequest::png(source, control, request))
-        else {
-            panic!("merman did not draw the diagram");
+        let got = renderer.render(RenderRequest::png(source, control, request));
+        let Ok(RenderOutput::Png(Some(estimated))) = got else {
+            panic!("merman did not draw the diagram: {got:?}");
         };
-        assert_ne!(merman(source, Theme::Dark).unwrap(), estimated.bytes);
+        assert_ne!(merman(source, Theme::Dark).unwrap(), estimated.into_bytes());
     }
 }

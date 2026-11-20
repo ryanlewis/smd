@@ -10,6 +10,7 @@ mod images;
 mod kitty;
 mod maths;
 mod mermaid;
+mod print;
 mod raster;
 mod remote;
 mod render;
@@ -46,6 +47,10 @@ struct Args {
     /// The widest the text gets, in columns, whatever the config says
     #[arg(long, value_name = "COLS", value_parser = clap::value_parser!(u16).range(1..))]
     max_width: Option<u16>,
+    /// When stdout is not a terminal, smd prints the note as text and exits;
+    /// `always` keeps its colours, as for `less -R`
+    #[arg(long, value_name = "WHEN", default_value = "auto")]
+    color: print::ColorChoice,
     /// The markdown file, or `-` for stdin; with none, stdin when markdown
     /// is piped in, else the `home` note from the config
     file: Option<PathBuf>,
@@ -294,6 +299,25 @@ fn set_panic_hook(uploaded: images::Uploaded, mouse: bool) {
     }));
 }
 
+/// Print the note at `path` to stdout as text, for `smd note.md | less -R`
+/// and the like, rather than showing it.
+fn print_note(
+    vault: &vault::Vault,
+    source: &str,
+    path: &Path,
+    config: &config::Config,
+    color: print::ColorChoice,
+) -> Result<(), Failure> {
+    apply(&Look::new(None, config.code_background));
+    heading::set_drawn(heading::Drawn::Plain);
+    remote::set_enabled(false);
+    // Loaded now, so code is coloured.
+    highlight::syntax_set();
+    let doc = app::parse(vault, source, path);
+    let width = print::width(print::terminal_width(), config.max_width);
+    print::write(&print::text(&doc, width, color.colors())).map_err(Failure::new)
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let result = smd(args);
@@ -335,6 +359,9 @@ fn smd(args: Args) -> Result<(), Failure> {
         source(&path, read)?
     };
     let vault = vault::Vault::for_file(&path);
+    if !io::stdout().is_terminal() {
+        return print_note(&vault, &source, &path, &config, args.color);
+    }
     app::stop_later();
     let probe_objects = images::Uploaded::default();
     app::remove_on_stop(probe_objects.clone());

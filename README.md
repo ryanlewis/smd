@@ -208,7 +208,7 @@ Diagram labels and text in SVG images use Trebuchet MS or Verdana on macOS, and 
 ## Usage
 
 ```sh
-smd [--no-graphics] [--remote-images | --no-remote-images] [--max-width COLS] [FILE]
+smd [--no-graphics] [--remote-images | --no-remote-images] [--max-width COLS] [--color WHEN] [FILE]
 ```
 
 With no file, smd opens the `home` note from the config, unless markdown is piped in. `--remote-images` and `--no-remote-images` turn [images from the web](#images-from-the-web) on or off for one run, whatever the config says, and `--max-width` sets [`max_width`](#config) for one run. `smd --help` lists the options and the main keys.
@@ -220,6 +220,13 @@ gh pr view --json body -q .body | smd
 ```
 
 If the command feeding smd is slow to start sending, smd shows `reading stdin…` while it waits. Ctrl-C then stops smd and clears the line. Keys and the mouse then come from the terminal. A document read from stdin is not reloaded and its checkboxes cannot be ticked. Its relative links and images are read from the current directory, and the toolbar calls it `stdin`.
+
+When its output is piped or redirected, smd does not open the browser. It prints the note as text and exits. It lays the note out as it would on screen, at the terminal's width (`$COLUMNS`, else 80) held to `max_width`. Diagrams, maths and images are printed as their markdown source. The text is plain unless `--color always` is given, which keeps the colours and styles for a pager that shows them:
+
+```sh
+pbpaste | smd | pbcopy
+smd --color always README.md | less -R
+```
 
 ### Keys
 

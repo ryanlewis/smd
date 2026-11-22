@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use merman::svg::export::{NativeFontOptions, RasterOptions};
 use merman::{
-    Engine, MermaidConfig, OperationControl, PngRequest, RenderOutput, RenderRequest,
+    MermaidConfig, OperationControl, PngRequest, RenderOutput, RenderRequest, SemanticParser,
     SvgEnvironment, SvgRequest,
 };
 use serde::Deserialize;
@@ -138,7 +138,8 @@ fn draw(
 /// background.
 fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
     let config = MermaidConfig::from_value(serde_json::json!({ "theme": mermaid_theme(theme) }));
-    let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
+    let renderer = merman::Renderer::new()
+        .with_semantic_parser(SemanticParser::new().with_site_config(config));
     let request = PngRequest {
         svg: SvgRequest {
             environment: environment().clone(),
@@ -148,7 +149,7 @@ fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
     };
     let control = OperationControl::new().with_deadline(TIMEOUT);
     match renderer.render(RenderRequest::png(source, control, request)) {
-        Ok(RenderOutput::Png(Some(png))) => Ok(png.bytes),
+        Ok(RenderOutput::Png(Some(png))) => Ok(png.into_bytes()),
         Ok(_) => Err("mermaid: not a diagram merman knows".to_string()),
         Err(e) => Err(format!("mermaid: {e}")),
     }
@@ -806,20 +807,25 @@ mod tests {
         }
         let estimates = SvgEnvironment::deterministic().text_measurement_routes();
         assert_ne!(environment().text_measurement_routes(), estimates);
-        // The same diagram measured with merman's estimates instead.
         let source = "flowchart LR\n  A[A label wide enough to measure] --> B[Done]\n";
-        let config = MermaidConfig::from_value(serde_json::json!({ "theme": "dark" }));
-        let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
-        let request = PngRequest {
-            svg: SvgRequest::default(),
-            options: RasterOptions::default().with_scale(f32::from(SCALE)),
+        merman(source, Theme::Dark).unwrap();
+        // The diagram laid out in the fonts found and with merman's
+        // estimates. merman cannot draw a PNG with no fonts, so the layouts
+        // are compared as SVG.
+        let svg = |environment: SvgEnvironment| {
+            let request = SvgRequest {
+                environment,
+                ..SvgRequest::default()
+            };
+            let control = OperationControl::new().with_deadline(TIMEOUT);
+            match merman::Renderer::new().render(RenderRequest::svg(source, control, request)) {
+                Ok(RenderOutput::Svg(Some(svg))) => svg.svg().to_string(),
+                _ => panic!("merman did not lay out the diagram"),
+            }
         };
-        let control = OperationControl::new().with_deadline(TIMEOUT);
-        let Ok(RenderOutput::Png(Some(estimated))) =
-            renderer.render(RenderRequest::png(source, control, request))
-        else {
-            panic!("merman did not draw the diagram");
-        };
-        assert_ne!(merman(source, Theme::Dark).unwrap(), estimated.bytes);
+        assert_ne!(
+            svg(environment().clone()),
+            svg(SvgEnvironment::deterministic())
+        );
     }
 }

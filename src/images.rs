@@ -826,6 +826,12 @@ fn svg_fonts() -> &'static Arc<Database> {
     static FONTS: OnceLock<Arc<Database>> = OnceLock::new();
     FONTS.get_or_init(|| {
         let mut db = Database::new();
+        // fontdb is built without its `fs` feature, so read the file here.
+        let load = |db: &mut Database, path: &str| {
+            if let Ok(data) = std::fs::read(path) {
+                db.load_font_data(data);
+            }
+        };
         let family = |db: &Database| {
             db.faces()
                 .last()
@@ -833,7 +839,7 @@ fn svg_fonts() -> &'static Arc<Database> {
                 .map(|(name, _)| name.clone())
         };
         if let Some((regular, bold)) = raster::sans_files() {
-            let _ = db.load_font_file(regular);
+            load(&mut db, regular);
             if let Some(sans) = family(&db) {
                 db.set_sans_serif_family(&sans);
                 db.set_serif_family(&sans);
@@ -841,11 +847,11 @@ fn svg_fonts() -> &'static Arc<Database> {
                 db.set_fantasy_family(&sans);
             }
             if let Some(bold) = bold {
-                let _ = db.load_font_file(bold);
+                load(&mut db, bold);
             }
         }
         if let Some(mono) = raster::mono_file() {
-            let _ = db.load_font_file(mono);
+            load(&mut db, mono);
             if let Some(mono) = family(&db) {
                 db.set_monospace_family(mono);
             }
@@ -1298,8 +1304,10 @@ pub mod tests {
 
     /// The RGBA pixel at `x`, `y` of an RGBA PNG.
     fn pixel(png: &Png, x: u32, y: u32) -> [u8; 4] {
-        let mut reader = png::Decoder::new(&png.data[..]).read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut reader = png::Decoder::new(io::Cursor::new(&png.data[..]))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut buf).unwrap();
         let at = ((y * png.width + x) * 4) as usize;
         buf[at..at + 4].try_into().unwrap()
@@ -1360,8 +1368,10 @@ pub mod tests {
 
     /// The first pixel of an RGB PNG.
     fn pixel_rgb(png: &Png) -> [u8; 3] {
-        let mut reader = png::Decoder::new(&png.data[..]).read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut reader = png::Decoder::new(io::Cursor::new(&png.data[..]))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut buf).unwrap();
         buf[..3].try_into().unwrap()
     }
@@ -1385,8 +1395,10 @@ pub mod tests {
 
     /// Every pixel of an RGBA PNG.
     fn pixels_rgba(png: &Png) -> Vec<[u8; 4]> {
-        let mut reader = png::Decoder::new(&png.data[..]).read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut reader = png::Decoder::new(io::Cursor::new(&png.data[..]))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut buf).unwrap();
         buf.as_chunks::<4>().0.to_vec()
     }

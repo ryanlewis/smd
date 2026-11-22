@@ -27,7 +27,7 @@ png = { version = "=0.18.1", default-features = false }
 # Reads the size of images inside web SVGs before they are decoded. resvg
 # already uses it, so it adds no crates.
 imagesize = { version = "=0.15.0", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-resvg = { version = "=0.50.0", default-features = false, features = ["text", "raster-images"] }
+resvg = { version = "=0.50.0", default-features = false, features = ["text", "raster-images", "svgz"] }
 pulldown-cmark = { version = "=0.13.6", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }

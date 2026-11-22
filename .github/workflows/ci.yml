@@ -17,7 +17,7 @@ env:
   # The toolchain the checks run on. The msrv job checks Cargo.toml's
   # rust-version on its own.
   # renovate: datasource=github-releases depName=rust-lang/rust
-  RUST_TOOLCHAIN: 1.99.1
+  RUST_TOOLCHAIN: 1.100.0
   CARGO_TERM_COLOR: always
 
 jobs:

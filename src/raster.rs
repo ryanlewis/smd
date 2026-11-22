@@ -234,10 +234,10 @@ pub struct Bitmap {
 impl Bitmap {
     /// Decode a PNG of any colour type to RGBA.
     pub fn decode(data: &[u8]) -> Option<Bitmap> {
-        let mut decoder = png::Decoder::new(data);
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
         decoder.set_transformations(png::Transformations::normalize_to_color8());
         let mut reader = decoder.read_info().ok()?;
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut buf = vec![0; reader.output_buffer_size()?];
         let info = reader.next_frame(&mut buf).ok()?;
         let bytes = &buf[..info.buffer_size()];
         let pixels: Vec<Rgba> = match info.color_type {

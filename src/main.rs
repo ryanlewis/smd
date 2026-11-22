@@ -639,7 +639,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "failed printing to stderr: ")]
     fn a_failure_whose_message_cannot_be_written_panics() {
-        exit_code(Err(Failure::new("gone")), &mut Broken);
+        let _ = exit_code(Err(Failure::new("gone")), &mut Broken);
     }
 
     #[test]

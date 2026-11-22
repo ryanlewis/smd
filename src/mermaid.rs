@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use merman::svg::export::{NativeFontOptions, RasterOptions};
 use merman::{
-    Engine, MermaidConfig, OperationControl, PngRequest, RenderOutput, RenderRequest,
+    MermaidConfig, OperationControl, PngRequest, RenderOutput, RenderRequest, SemanticParser,
     SvgEnvironment, SvgRequest,
 };
 use serde::Deserialize;
@@ -138,7 +138,8 @@ fn draw(
 /// background.
 fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
     let config = MermaidConfig::from_value(serde_json::json!({ "theme": mermaid_theme(theme) }));
-    let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
+    let renderer = merman::Renderer::new()
+        .with_semantic_parser(SemanticParser::new().with_site_config(config));
     let request = PngRequest {
         svg: SvgRequest {
             environment: environment().clone(),
@@ -148,7 +149,7 @@ fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
     };
     let control = OperationControl::new().with_deadline(TIMEOUT);
     match renderer.render(RenderRequest::png(source, control, request)) {
-        Ok(RenderOutput::Png(Some(png))) => Ok(png.bytes),
+        Ok(RenderOutput::Png(Some(png))) => Ok(png.into_bytes()),
         Ok(_) => Err("mermaid: not a diagram merman knows".to_string()),
         Err(e) => Err(format!("mermaid: {e}")),
     }
@@ -157,8 +158,8 @@ fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
 /// How merman measures text: in [`raster::sans_files`], read once. They are
 /// named rather than searched for: merman's search reads every font on the
 /// machine, and its platform lookup links CoreText, which the release's
-/// cross-build cannot. With none, it estimates widths, and long labels may be
-/// cut short.
+/// cross-build cannot. With none, merman cannot draw a PNG and the diagram
+/// fails with its error.
 fn environment() -> &'static SvgEnvironment {
     static ENVIRONMENT: OnceLock<SvgEnvironment> = OnceLock::new();
     ENVIRONMENT.get_or_init(|| {
@@ -806,20 +807,21 @@ mod tests {
         }
         let estimates = SvgEnvironment::deterministic().text_measurement_routes();
         assert_ne!(environment().text_measurement_routes(), estimates);
-        // The same diagram measured with merman's estimates instead.
         let source = "flowchart LR\n  A[A label wide enough to measure] --> B[Done]\n";
-        let config = MermaidConfig::from_value(serde_json::json!({ "theme": "dark" }));
-        let renderer = merman::Renderer::new().with_engine(Engine::new().with_site_config(config));
-        let request = PngRequest {
-            svg: SvgRequest::default(),
-            options: RasterOptions::default().with_scale(f32::from(SCALE)),
+        // merman says which faces it shaped the labels with. Comparing the
+        // drawing with one from its estimates would not do: on macOS the
+        // font found is Trebuchet MS, which the estimates are taken from.
+        let request = SvgRequest {
+            environment: environment().clone(),
+            ..SvgRequest::default()
         };
         let control = OperationControl::new().with_deadline(TIMEOUT);
-        let Ok(RenderOutput::Png(Some(estimated))) =
-            renderer.render(RenderRequest::png(source, control, request))
+        let Ok(RenderOutput::Svg(Some(svg))) =
+            merman::Renderer::new().render(RenderRequest::svg(source, control, request))
         else {
-            panic!("merman did not draw the diagram");
+            panic!("merman did not lay out the diagram");
         };
-        assert_ne!(merman(source, Theme::Dark).unwrap(), estimated.bytes);
+        let fonts = svg.evidence().native_font_diagnostics();
+        assert!(fonts.is_some_and(|fonts| !fonts.selected_faces().is_empty()));
     }
 }

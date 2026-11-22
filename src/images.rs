@@ -1302,15 +1302,20 @@ pub mod tests {
         data
     }
 
-    /// The RGBA pixel at `x`, `y` of an RGBA PNG.
-    fn pixel(png: &Png, x: u32, y: u32) -> [u8; 4] {
+    /// The decoded bytes of `png`, in its own colour type.
+    fn decoded(png: &Png) -> Vec<u8> {
         let mut reader = png::Decoder::new(io::Cursor::new(&png.data[..]))
             .read_info()
             .unwrap();
         let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut buf).unwrap();
+        buf
+    }
+
+    /// The RGBA pixel at `x`, `y` of an RGBA PNG.
+    fn pixel(png: &Png, x: u32, y: u32) -> [u8; 4] {
         let at = ((y * png.width + x) * 4) as usize;
-        buf[at..at + 4].try_into().unwrap()
+        decoded(png)[at..at + 4].try_into().unwrap()
     }
 
     const RED_GREEN: [u8; 6] = [255, 0, 0, 0, 255, 0];
@@ -1368,12 +1373,7 @@ pub mod tests {
 
     /// The first pixel of an RGB PNG.
     fn pixel_rgb(png: &Png) -> [u8; 3] {
-        let mut reader = png::Decoder::new(io::Cursor::new(&png.data[..]))
-            .read_info()
-            .unwrap();
-        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
-        reader.next_frame(&mut buf).unwrap();
-        buf[..3].try_into().unwrap()
+        decoded(png)[..3].try_into().unwrap()
     }
 
     #[test]
@@ -1395,12 +1395,7 @@ pub mod tests {
 
     /// Every pixel of an RGBA PNG.
     fn pixels_rgba(png: &Png) -> Vec<[u8; 4]> {
-        let mut reader = png::Decoder::new(io::Cursor::new(&png.data[..]))
-            .read_info()
-            .unwrap();
-        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
-        reader.next_frame(&mut buf).unwrap();
-        buf.as_chunks::<4>().0.to_vec()
+        decoded(png).as_chunks::<4>().0.to_vec()
     }
 
     #[test]

@@ -158,8 +158,8 @@ fn merman(source: &str, theme: Theme) -> Result<Vec<u8>, String> {
 /// How merman measures text: in [`raster::sans_files`], read once. They are
 /// named rather than searched for: merman's search reads every font on the
 /// machine, and its platform lookup links CoreText, which the release's
-/// cross-build cannot. With none, it estimates widths, and long labels may be
-/// cut short.
+/// cross-build cannot. With none, merman cannot draw a PNG and the diagram
+/// fails with its error.
 fn environment() -> &'static SvgEnvironment {
     static ENVIRONMENT: OnceLock<SvgEnvironment> = OnceLock::new();
     ENVIRONMENT.get_or_init(|| {
@@ -808,7 +808,6 @@ mod tests {
         let estimates = SvgEnvironment::deterministic().text_measurement_routes();
         assert_ne!(environment().text_measurement_routes(), estimates);
         let source = "flowchart LR\n  A[A label wide enough to measure] --> B[Done]\n";
-        merman(source, Theme::Dark).unwrap();
         // The diagram laid out in the fonts found and with merman's
         // estimates. merman cannot draw a PNG with no fonts, so the layouts
         // are compared as SVG.

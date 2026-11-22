@@ -808,23 +808,20 @@ mod tests {
         let estimates = SvgEnvironment::deterministic().text_measurement_routes();
         assert_ne!(environment().text_measurement_routes(), estimates);
         let source = "flowchart LR\n  A[A label wide enough to measure] --> B[Done]\n";
-        // The diagram laid out in the fonts found and with merman's
-        // estimates. merman cannot draw a PNG with no fonts, so the layouts
-        // are compared as SVG.
-        let svg = |environment: SvgEnvironment| {
-            let request = SvgRequest {
-                environment,
-                ..SvgRequest::default()
-            };
-            let control = OperationControl::new().with_deadline(TIMEOUT);
-            match merman::Renderer::new().render(RenderRequest::svg(source, control, request)) {
-                Ok(RenderOutput::Svg(Some(svg))) => svg.svg().to_string(),
-                _ => panic!("merman did not lay out the diagram"),
-            }
+        // merman says which faces it shaped the labels with. Comparing the
+        // drawing with one from its estimates would not do: on macOS the
+        // font found is Trebuchet MS, which the estimates are taken from.
+        let request = SvgRequest {
+            environment: environment().clone(),
+            ..SvgRequest::default()
         };
-        assert_ne!(
-            svg(environment().clone()),
-            svg(SvgEnvironment::deterministic())
-        );
+        let control = OperationControl::new().with_deadline(TIMEOUT);
+        let Ok(RenderOutput::Svg(Some(svg))) =
+            merman::Renderer::new().render(RenderRequest::svg(source, control, request))
+        else {
+            panic!("merman did not lay out the diagram");
+        };
+        let fonts = svg.evidence().native_font_diagnostics();
+        assert!(fonts.is_some_and(|fonts| !fonts.selected_faces().is_empty()));
     }
 }

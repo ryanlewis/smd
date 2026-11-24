@@ -27,7 +27,7 @@ jobs:
       # This job holds signing keys and the tap token, so it may only reach
       # the hosts below. If a step fails on a blocked connection, the
       # harden-runner report linked from the run names the host.
-      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
         with:
           egress-policy: block
           allowed-endpoints: >
@@ -75,7 +75,7 @@ jobs:
           mirror: https://pkg.machengine.org/zig
           use-cache: false
 
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-zigbuild@0.24.0
 

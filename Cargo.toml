@@ -22,7 +22,7 @@ gif = { version = "=0.14.2", default-features = false, features = ["std"] }
 latex-rust = { version = "=3.0.3", default-features = false, features = ["png"] }
 libc = "=0.2.191"
 # Draws mermaid diagrams. ELK layout is left out: it is EPL-2.0.
-merman = { version = "=0.10.0", default-features = false, features = ["all-diagrams", "png", "layout-cytoscape", "native-fonts"] }
+merman = { version = "=0.11.0", default-features = false, features = ["all-diagrams", "png", "layout-cytoscape", "native-fonts"] }
 png = { version = "=0.18.1", default-features = false }
 # Reads the size of images inside web SVGs before they are decoded. resvg
 # already uses it, so it adds no crates.
@@ -33,7 +33,7 @@ serde = { version = "=1.0.229", default-features = false, features = ["std", "de
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy"] }
-toml = { version = "=1.2.1", default-features = false, features = ["std", "serde", "parse"] }
+toml = { version = "=1.2.2", default-features = false, features = ["std", "serde", "parse"] }
 two-face = { version = "=0.5.2", default-features = false, features = ["syntect-fancy"] }
 unicode-width = "=0.2.3"
 # Fetches web images when `remote_images` is on. rustls with ring and the
